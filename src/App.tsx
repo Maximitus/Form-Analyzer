@@ -3,15 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useRef, useEffect, ChangeEvent, MouseEvent } from 'react';
+import {
+  useState,
+  useRef,
+  useEffect,
+  ChangeEvent,
+  PointerEvent as ReactPointerEvent,
+} from 'react';
 import { Upload, Play, Pause, ChevronLeft, ChevronRight, Ruler, Trash, Camera } from 'lucide-react';
-import { motion } from 'motion/react';
-
 export default function App() {
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const mediaWrapRef = useRef<HTMLDivElement>(null);
+  const [mediaLayoutVersion, setMediaLayoutVersion] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [angle, setAngle] = useState<number | null>(null);
   const [points, setPoints] = useState<{ x: number; y: number }[]>([]);
@@ -45,9 +52,19 @@ export default function App() {
   }, [isPlaying]);
 
   useEffect(() => {
+    const wrap = mediaWrapRef.current;
+    const target = videoRef.current ?? imageRef.current;
+    if (!wrap || !target) return;
+
+    const ro = new ResizeObserver(() => setMediaLayoutVersion((v) => v + 1));
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, [videoSrc, imageSrc]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
-    const image = canvas?.parentElement?.querySelector('img');
+    const image = imageRef.current;
     if (!canvas || (!video && !image)) return;
 
     const media = video || image;
@@ -84,7 +101,7 @@ export default function App() {
       }
       ctx.stroke();
     }
-  }, [points, videoSrc, imageSrc, angle]);
+  }, [points, videoSrc, imageSrc, angle, mediaLayoutVersion]);
 
   const [draggingPointIndex, setDraggingPointIndex] = useState<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -126,7 +143,8 @@ export default function App() {
     return points.findIndex(p => Math.hypot(p.x - x, p.y - y) < 15); // 15px hit radius
   };
 
-  const handleCanvasMouseDown = (e: MouseEvent<HTMLCanvasElement>) => {
+  const handleCanvasPointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (e.button !== 0) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -135,12 +153,14 @@ export default function App() {
 
     const pointIndex = getPointAt(x, y);
     if (pointIndex !== -1) {
+      e.currentTarget.setPointerCapture(e.pointerId);
       setDraggingPointIndex(pointIndex);
       return;
     }
 
     if (!isDrawing) return;
 
+    e.currentTarget.setPointerCapture(e.pointerId);
     setPoints(prev => {
       if (prev.length >= 3) return [{ x, y }];
       const newPoints = [...prev, { x, y }];
@@ -151,7 +171,7 @@ export default function App() {
     });
   };
 
-  const handleCanvasMouseMove = (e: MouseEvent<HTMLCanvasElement>) => {
+  const handleCanvasPointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
     if (draggingPointIndex === null) return;
 
     const canvas = canvasRef.current;
@@ -170,7 +190,12 @@ export default function App() {
     });
   };
 
-  const handleCanvasMouseUp = () => {
+  const handleCanvasPointerUp = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore if not captured */
+    }
     setDraggingPointIndex(null);
   };
 
@@ -208,48 +233,76 @@ export default function App() {
           </div>
 
           {videoSrc ? (
-            <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden border border-[#ff8800]/10">
-              <video 
-                ref={videoRef} 
-                src={videoSrc} 
-                className="w-full h-full object-contain" 
-              />
-              <canvas 
-                ref={canvasRef} 
-                className="absolute inset-0 w-full h-full cursor-crosshair" 
-                onMouseDown={handleCanvasMouseDown}
-                onMouseMove={handleCanvasMouseMove}
-                onMouseUp={handleCanvasMouseUp}
-                onMouseLeave={handleCanvasMouseUp}
-              />
-              
-              <div className="absolute bottom-4 left-4 right-4 flex flex-col gap-2 bg-[#2a3439]/80 backdrop-blur p-3 rounded-xl border border-[#ff8800]/10">
-                <input 
-                  type="range" 
-                  min="0" 
-                  max={duration} 
-                  value={currentTime} 
+            <div className="flex w-full min-w-0 flex-col gap-3">
+              {/* Tall phone media: no fixed 16:9 box; cap desktop height so the page fits the window */}
+              <div className="flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden rounded-xl border border-[#ff8800]/10 bg-black p-2 sm:p-3">
+                <div
+                  ref={mediaWrapRef}
+                  className="relative inline-block max-h-[min(82dvh,920px)] max-w-full md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]"
+                >
+                  <video
+                    ref={videoRef}
+                    src={videoSrc}
+                    className="block h-auto max-h-[min(82dvh,920px)] w-full max-w-full object-contain md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]"
+                  />
+                  <canvas
+                    ref={canvasRef}
+                    className="pointer-events-auto absolute inset-0 h-full w-full cursor-crosshair touch-none"
+                    style={{ touchAction: 'none' }}
+                    onPointerDown={handleCanvasPointerDown}
+                    onPointerMove={handleCanvasPointerMove}
+                    onPointerUp={handleCanvasPointerUp}
+                    onPointerCancel={handleCanvasPointerUp}
+                    onPointerLeave={handleCanvasPointerUp}
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
+                <input
+                  type="range"
+                  min="0"
+                  max={duration}
+                  value={currentTime}
                   onChange={handleSeek}
                   className="w-full accent-[#ff8800]"
                 />
-                <div className="flex items-center justify-between">
-                  <button onClick={() => setIsPlaying(!isPlaying)} className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsPlaying(!isPlaying)}
+                    className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                  >
                     {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
                   </button>
                   <div className="flex items-center gap-2">
-                    <button onClick={() => stepFrame(-1)} className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"><ChevronLeft /></button>
-                    <button onClick={() => stepFrame(1)} className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"><ChevronRight /></button>
+                    <button
+                      type="button"
+                      onClick={() => stepFrame(-1)}
+                      className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                    >
+                      <ChevronLeft />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => stepFrame(1)}
+                      className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                    >
+                      <ChevronRight />
+                    </button>
                   </div>
                   <div className="flex items-center gap-2">
-                    <button 
-                      onClick={handleDeleteMeasurements} 
+                    <button
+                      type="button"
+                      onClick={handleDeleteMeasurements}
                       disabled={points.length === 0}
                       className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${points.length === 0 ? 'opacity-50 cursor-not-allowed' : 'text-red-400'}`}
                     >
                       <Trash className="w-6 h-6" />
                     </button>
-                    <button 
-                      onClick={() => setIsDrawing(!isDrawing)} 
+                    <button
+                      type="button"
+                      onClick={() => setIsDrawing(!isDrawing)}
                       disabled={!isMediaLoaded}
                       className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${isDrawing ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
                     >
@@ -260,27 +313,44 @@ export default function App() {
               </div>
             </div>
           ) : imageSrc ? (
-            <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden border border-[#ff8800]/10">
-              <img src={imageSrc} className="w-full h-full object-contain" alt="Uploaded" onLoad={() => setPoints([])} />
-              <canvas 
-                ref={canvasRef} 
-                className="absolute inset-0 w-full h-full cursor-crosshair" 
-                onMouseDown={handleCanvasMouseDown}
-                onMouseMove={handleCanvasMouseMove}
-                onMouseUp={handleCanvasMouseUp}
-                onMouseLeave={handleCanvasMouseUp}
-              />
-              
-              <div className="absolute bottom-4 right-4 flex items-center justify-between bg-[#2a3439]/80 backdrop-blur p-3 rounded-xl border border-[#ff8800]/10 gap-2">
-                <button 
-                  onClick={handleDeleteMeasurements} 
+            <div className="flex w-full min-w-0 flex-col gap-3">
+              <div className="flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden rounded-xl border border-[#ff8800]/10 bg-black p-2 sm:p-3">
+                <div
+                  ref={mediaWrapRef}
+                  className="relative inline-block max-h-[min(82dvh,920px)] max-w-full md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]"
+                >
+                  <img
+                    ref={imageRef}
+                    src={imageSrc}
+                    className="block h-auto max-h-[min(82dvh,920px)] w-full max-w-full object-contain md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]"
+                    alt="Uploaded"
+                    onLoad={() => setPoints([])}
+                  />
+                  <canvas
+                    ref={canvasRef}
+                    className="pointer-events-auto absolute inset-0 h-full w-full cursor-crosshair touch-none"
+                    style={{ touchAction: 'none' }}
+                    onPointerDown={handleCanvasPointerDown}
+                    onPointerMove={handleCanvasPointerMove}
+                    onPointerUp={handleCanvasPointerUp}
+                    onPointerCancel={handleCanvasPointerUp}
+                    onPointerLeave={handleCanvasPointerUp}
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-end gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
+                <button
+                  type="button"
+                  onClick={handleDeleteMeasurements}
                   disabled={points.length === 0}
                   className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${points.length === 0 ? 'opacity-50 cursor-not-allowed' : 'text-red-400'}`}
                 >
                   <Trash className="w-6 h-6" />
                 </button>
-                <button 
-                  onClick={() => setIsDrawing(!isDrawing)} 
+                <button
+                  type="button"
+                  onClick={() => setIsDrawing(!isDrawing)}
                   disabled={!isMediaLoaded}
                   className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${isDrawing ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
                 >
