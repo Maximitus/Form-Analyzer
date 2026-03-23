@@ -11,10 +11,21 @@
   --color-bg-dark: #2a3439;
   --color-card-dark: #323d44;
   --color-surface: #252d33;
+  /* Deepest panels / insets (darker than header chrome) */
   --color-surface-deep: #1c2328;
+  /* Header & footer bars — use with .glass cards for layered toolbox UI */
+  --color-chrome-bar: var(--color-card-dark);
   --color-accent: #ff8800;
   --color-accent-hover: #e67a00;
   --color-text-light: #b3c0c9;
+  /* Control / inner-panel hover (matches Form Analyzer buttons) */
+  --color-panel-hover: #353e43;
+}
+
+html {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
@@ -29,7 +40,9 @@ h3,
 }
 
 .glass {
-  background: rgba(42, 52, 57, 0.85);
+  /* Lighter than raw #2a3439 glass — ties to --color-card-dark so cards match Macro-style panels */
+  background: color-mix(in srgb, var(--color-card-dark) 88%, transparent);
+  -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
   border: 1px solid rgba(255, 136, 0, 0.1);
 }

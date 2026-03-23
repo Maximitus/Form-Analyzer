@@ -184,21 +184,23 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#2a3439] text-white font-sans blueprint-bg">
-      <header className="bg-[var(--color-surface-deep)] p-4 mb-8 shadow-md border-b border-[var(--color-accent)]/20">
-        <h1 className="text-2xl font-bold text-[var(--color-accent)] brand-font">Form Analyzer</h1>
+    <div className="min-h-screen bg-[var(--color-bg-dark)] text-white font-sans blueprint-bg">
+      <header className="bg-[var(--color-chrome-bar)] px-4 py-4 md:px-8 mb-5 shadow-md border-b border-[var(--color-accent)]/20">
+        <h1 className="text-2xl font-semibold tracking-tight text-[var(--color-accent)] brand-font leading-tight">
+          Form Analyzer
+        </h1>
       </header>
-      <div className="p-4 md:p-8 grid gap-6">
-        {/* Video Player Card */}
-        <div className="glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow">
-          <div className="flex items-center justify-between mb-4">
+
+      <div className="grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5">
+        <section className="glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow">
+          <div className="flex justify-between items-center mb-6">
             <h2 className="text-xl font-semibold text-white brand-font">Media Analysis</h2>
             <div className="flex gap-2">
-              <label className="cursor-pointer bg-[#2a3439] p-2 rounded-full hover:bg-[#353e43] transition border border-[#ff8800]/20">
+              <label className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20">
                 <Upload className="w-6 h-6 text-[#ff8800]" />
                 <input type="file" accept="video/mp4,video/webm,video/ogg,video/quicktime,image/jpeg,image/png,image/webp" className="hidden" onChange={handleFileUpload} />
               </label>
-              <label className="cursor-pointer bg-[#2a3439] p-2 rounded-full hover:bg-[#353e43] transition border border-[#ff8800]/20">
+              <label className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20">
                 <Camera className="w-6 h-6 text-[#ff8800]" />
                 <input type="file" accept="video/*,image/*" capture="environment" className="hidden" onChange={handleFileUpload} />
               </label>
@@ -231,25 +233,25 @@ export default function App() {
                   className="w-full accent-[#ff8800]"
                 />
                 <div className="flex items-center justify-between">
-                  <button onClick={() => setIsPlaying(!isPlaying)} className="p-2 rounded-full hover:bg-[#353e43]">
+                  <button onClick={() => setIsPlaying(!isPlaying)} className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]">
                     {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
                   </button>
                   <div className="flex items-center gap-2">
-                    <button onClick={() => stepFrame(-1)} className="p-2 rounded-full hover:bg-[#353e43]"><ChevronLeft /></button>
-                    <button onClick={() => stepFrame(1)} className="p-2 rounded-full hover:bg-[#353e43]"><ChevronRight /></button>
+                    <button onClick={() => stepFrame(-1)} className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"><ChevronLeft /></button>
+                    <button onClick={() => stepFrame(1)} className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"><ChevronRight /></button>
                   </div>
                   <div className="flex items-center gap-2">
                     <button 
                       onClick={handleDeleteMeasurements} 
                       disabled={points.length === 0}
-                      className={`p-2 rounded-full hover:bg-[#353e43] ${points.length === 0 ? 'opacity-50 cursor-not-allowed' : 'text-red-400'}`}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${points.length === 0 ? 'opacity-50 cursor-not-allowed' : 'text-red-400'}`}
                     >
                       <Trash className="w-6 h-6" />
                     </button>
                     <button 
                       onClick={() => setIsDrawing(!isDrawing)} 
                       disabled={!isMediaLoaded}
-                      className={`p-2 rounded-full hover:bg-[#353e43] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${isDrawing ? 'text-[#ff8800] bg-[#353e43]' : 'text-white'}`}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${isDrawing ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
                     >
                       <Ruler className="w-6 h-6" />
                     </button>
@@ -273,34 +275,33 @@ export default function App() {
                 <button 
                   onClick={handleDeleteMeasurements} 
                   disabled={points.length === 0}
-                  className={`p-2 rounded-full hover:bg-[#353e43] ${points.length === 0 ? 'opacity-50 cursor-not-allowed' : 'text-red-400'}`}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${points.length === 0 ? 'opacity-50 cursor-not-allowed' : 'text-red-400'}`}
                 >
                   <Trash className="w-6 h-6" />
                 </button>
                 <button 
                   onClick={() => setIsDrawing(!isDrawing)} 
                   disabled={!isMediaLoaded}
-                  className={`p-2 rounded-full hover:bg-[#353e43] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${isDrawing ? 'text-[#ff8800] bg-[#353e43]' : 'text-white'}`}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${isDrawing ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
                 >
                   <Ruler className="w-6 h-6" />
                 </button>
               </div>
             </div>
           ) : (
-            <div className="flex flex-col items-center justify-center h-64 border-2 border-dashed border-[#ff8800]/20 rounded-xl p-8 text-center">
+            <div className="flex flex-col items-center justify-center h-64 rounded-xl border-2 border-dashed border-[#ff8800]/20 bg-[var(--color-bg-dark)] p-8 text-center">
               <Upload className="w-12 h-12 text-[#ff8800]/50 mb-4" />
-              <p className="text-white/70">Upload a video or image to start analysis</p>
+              <p className="text-[var(--color-text-light)]">Upload a video or image to start analysis</p>
             </div>
           )}
-        </div>
+        </section>
 
-        {/* Results Card */}
         {angle !== null && (
-          <div className="glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow">
+          <section className="glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow">
             <h2 className="text-xl font-semibold text-white brand-font mb-2">Analysis Result</h2>
             <p className="text-sm text-white/70 mb-1">Measured Angle</p>
             <p className="text-5xl font-bold text-[#ff8800]">{angle.toFixed(1)}°</p>
-          </div>
+          </section>
         )}
       </div>
     </div>
