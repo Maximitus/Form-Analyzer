@@ -788,9 +788,11 @@ export default function App() {
 
     if (!isDrawing || activeTool !== 'ruler') return;
 
+    /* Keep a completed 3-point angle until trash clears it — ignore extra taps (e.g. mobile pan). */
+    if (points.length >= 3) return;
+
     e.currentTarget.setPointerCapture(e.pointerId);
     setPoints(prev => {
-      if (prev.length >= 3) return [{ x, y }];
       const newPoints = [...prev, { x, y }];
       if (newPoints.length === 3) {
         calculateAngle(newPoints);
