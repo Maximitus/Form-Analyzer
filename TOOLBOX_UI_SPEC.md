@@ -272,3 +272,17 @@ When in doubt, **diff your shell classes** against `src/App.tsx` lines **187–1
 ## 9. Version
 
 Spec aligned with **Form Analyzer** repo layout as of the commit that introduced **`--color-chrome-bar`**, **`color-mix` glass**, and header spacing **`mb-5` / `pt-3` / `md:pt-5`**. If you change the reference apps, update **§2** and **§4** here to stay the single spec.
+
+---
+
+## 10. Sub-path deployment (`/formanalyzer/`)
+
+When deploying this app under a sub-folder (for example `https://maxmvs.com/formanalyzer/`), use these rules so JS/CSS/favicon paths do not resolve to the domain root:
+
+1. In `vite.config.ts`, set:
+   - `base: '/formanalyzer/'`
+2. Put static assets (like the favicon) in `public/`.
+3. In `index.html`, reference the favicon as:
+   - `<link rel="icon" type="image/svg+xml" href="/favicon.svg" />`
+
+Vite rewrites this correctly for production so generated assets are loaded from `/formanalyzer/...` instead of `/...`.
