@@ -1,0 +1,5 @@
+{
+  "name": "FormAngle Pro",
+  "description": "A mobile-optimized video analysis tool for personal trainers and PTs to measure body movement angles.",
+  "requestFramePermissions": ["camera"]
+}
