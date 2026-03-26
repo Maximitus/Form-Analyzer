@@ -15,6 +15,9 @@ import {
   Pause,
   ChevronLeft,
   ChevronRight,
+  Hand,
+  Maximize,
+  Minimize,
   Ruler,
   Trash,
   ZoomIn,
@@ -22,7 +25,10 @@ import {
   Camera,
   Image as ImageGalleryIcon,
   Video,
+  Link2,
+  Unlink2,
 } from 'lucide-react';
+import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
 
 function pickVideoRecorderMimeType(): string | undefined {
   if (typeof MediaRecorder === 'undefined') return undefined;
@@ -71,35 +77,22 @@ function getReliableVideoDuration(video: HTMLVideoElement): number {
   return 0;
 }
 
-function normalizeZoomRect(ax: number, ay: number, bx: number, by: number) {
-  const x = Math.min(ax, bx);
-  const y = Math.min(ay, by);
-  const w = Math.abs(bx - ax);
-  const h = Math.abs(by - ay);
-  return {x, y, w, h};
-}
+const ZOOM_MIN_SCALE = 1;
+const ZOOM_MAX_SCALE = 8;
+const ZOOM_BUTTON_FACTOR = 1.25;
+const FRAME_STEP_SECONDS = 1 / 30; // approx single frame at 30fps
+const SLIDER_SCRUB_STEP_SECONDS = 1 / 60; // smaller increments for smoother scrubbing
+const POSE_HIP_KNEE_ANKLE_IDS = [23, 24, 25, 26, 27, 28];
+const POSE_LEG_CONNECTIONS: [number, number][] = [
+  [23, 25],
+  [25, 27],
+  [24, 26],
+  [26, 28],
+  [23, 24],
+];
 
-const ZOOM_MIN_SIZE = 24;
-const ZOOM_HANDLE_RADIUS = 10;
-
-function getZoomCornerIndex(
-  px: number,
-  py: number,
-  r: {x: number; y: number; w: number; h: number},
-): number {
-  const corners: [number, number][] = [
-    [r.x, r.y],
-    [r.x + r.w, r.y],
-    [r.x + r.w, r.y + r.h],
-    [r.x, r.y + r.h],
-  ];
-  for (let i = 0; i < 4; i++) {
-    const [cx, cy] = corners[i]!;
-    if (Math.hypot(px - cx, py - cy) <= ZOOM_HANDLE_RADIUS + 4) {
-      return i;
-    }
-  }
-  return -1;
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
 }
 
 type AppliedZoomMap = {x: number; y: number; s: number};
@@ -116,54 +109,26 @@ function overlayToContent(ox: number, oy: number, applied: AppliedZoomMap | null
   return {x: ox / applied.s + applied.x, y: oy / applied.s + applied.y};
 }
 
-function adjustZoomRectByCorner(
-  corner: number,
-  px: number,
-  py: number,
-  r: {x: number; y: number; w: number; h: number},
-) {
-  const right = r.x + r.w;
-  const bottom = r.y + r.h;
-  if (corner === 0) {
-    return normalizeZoomRect(
-      Math.min(px, right - ZOOM_MIN_SIZE),
-      Math.min(py, bottom - ZOOM_MIN_SIZE),
-      right,
-      bottom,
-    );
-  }
-  if (corner === 1) {
-    return normalizeZoomRect(
-      r.x,
-      Math.min(py, bottom - ZOOM_MIN_SIZE),
-      Math.max(px, r.x + ZOOM_MIN_SIZE),
-      bottom,
-    );
-  }
-  if (corner === 2) {
-    return normalizeZoomRect(
-      r.x,
-      r.y,
-      Math.max(px, r.x + ZOOM_MIN_SIZE),
-      Math.max(py, r.y + ZOOM_MIN_SIZE),
-    );
-  }
-  return normalizeZoomRect(right, r.y, px, py);
-}
-
 export default function App() {
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
+  const [compareVideoSrc, setCompareVideoSrc] = useState<string | null>(null);
+  const [compareImageSrc, setCompareImageSrc] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
+  const compareVideoRef = useRef<HTMLVideoElement>(null);
+  const compareImageRef = useRef<HTMLImageElement>(null);
+  const compareCanvasRef = useRef<HTMLCanvasElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mediaWrapRef = useRef<HTMLDivElement>(null);
+  const compareMediaWrapRef = useRef<HTMLDivElement>(null);
   /** Gallery: images + videos from files — never use `capture` on this input. */
   const galleryPickInputRef = useRef<HTMLInputElement>(null);
   /** Native still-photo fallback only: `image/*` + `capture="environment"` via JS. */
   const imagePickInputRef = useRef<HTMLInputElement>(null);
   /** Native video-capture fallback only: `video/*` + `capture="environment"` via JS. */
   const videoPickInputRef = useRef<HTMLInputElement>(null);
+  const comparePickInputRef = useRef<HTMLInputElement>(null);
   const cameraPreviewRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const videoRecordPreviewRef = useRef<HTMLVideoElement>(null);
@@ -178,49 +143,81 @@ export default function App() {
   const [isRecordingVideo, setIsRecordingVideo] = useState(false);
   const [mediaLayoutVersion, setMediaLayoutVersion] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [compareIsPlaying, setCompareIsPlaying] = useState(false);
+  const [isLinkedPlayback, setIsLinkedPlayback] = useState(true);
   const [angle, setAngle] = useState<number | null>(null);
   const [points, setPoints] = useState<{ x: number; y: number }[]>([]);
   const [isDrawing, setIsDrawing] = useState(false);
+  const [poseEnabled, setPoseEnabled] = useState(false);
+  const [poseKeypoints, setPoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
+  const [comparePoseKeypoints, setComparePoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
+  const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
+  const poseRafRef = useRef<number | null>(null);
+  const [poseStatus, setPoseStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [compareMediaLayoutVersion, setCompareMediaLayoutVersion] = useState(0);
 
-  /** `ruler` = angle tool, `zoom` = marquee zoom */
-  type AnalysisTool = 'ruler' | 'zoom' | null;
+  const mapPoseNormToCanvasOverlayPx = (
+    xn: number,
+    yn: number,
+    media: HTMLVideoElement | HTMLImageElement | null,
+    canvas: HTMLCanvasElement | null,
+  ) => {
+    if (!media || !canvas) return {x: xn * (canvas?.width ?? 1), y: yn * (canvas?.height ?? 1)};
+
+    const canvasRect = canvas.getBoundingClientRect();
+    const mediaRect = media.getBoundingClientRect();
+    if (canvasRect.width <= 0 || canvasRect.height <= 0 || mediaRect.width <= 0 || mediaRect.height <= 0) {
+      return {x: xn * canvas.width, y: yn * canvas.height};
+    }
+
+    const sx = canvas.width / canvasRect.width;
+    const sy = canvas.height / canvasRect.height;
+
+    // Pose landmarks are normalized in the video/image pixel space, so scale them into
+    // the actual displayed media bounding box (including any transforms/letterboxing).
+    return {
+      x: (mediaRect.left - canvasRect.left) * sx + xn * mediaRect.width * sx,
+      y: (mediaRect.top - canvasRect.top) * sy + yn * mediaRect.height * sy,
+    };
+  };
+
+  /** `ruler` = angle tool, `pan` = drag viewport while zoomed */
+  type AnalysisTool = 'ruler' | 'pan' | null;
   const [activeTool, setActiveTool] = useState<AnalysisTool>(null);
-  type ZoomPhase = 'idle' | 'drawing' | 'confirm';
-  const [zoomPhase, setZoomPhase] = useState<ZoomPhase>('idle');
-  const [zoomDraft, setZoomDraft] = useState<{x: number; y: number; w: number; h: number} | null>(
-    null,
-  );
-  const [appliedZoom, setAppliedZoom] = useState<{
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-    vw: number;
-    vh: number;
-    s: number;
+  const [appliedZoom, setAppliedZoom] = useState<{x: number; y: number; s: number} | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const activePointersRef = useRef<Map<number, {clientX: number; clientY: number}>>(new Map());
+  const panDragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    startX: number;
+    startY: number;
   } | null>(null);
-  const zoomDrawStartRef = useRef<{x: number; y: number} | null>(null);
-  const [draggingZoomCorner, setDraggingZoomCorner] = useState<number | null>(null);
+  const pinchRef = useRef<{
+    initialDistance: number;
+    initialScale: number;
+    anchorX: number;
+    anchorY: number;
+    initialX: number;
+    initialY: number;
+  } | null>(null);
 
   const resetZoomAll = () => {
     setAppliedZoom(null);
-    setZoomPhase('idle');
-    setZoomDraft(null);
-    zoomDrawStartRef.current = null;
-    setDraggingZoomCorner(null);
-  };
-
-  const cancelZoomMarquee = () => {
-    setZoomPhase('idle');
-    setZoomDraft(null);
-    zoomDrawStartRef.current = null;
-    setDraggingZoomCorner(null);
+    setActiveTool((prev) => (prev === 'pan' ? null : prev));
+    setIsPanning(false);
+    panDragRef.current = null;
+    pinchRef.current = null;
+    activePointersRef.current.clear();
   };
 
   const handleFileUpload = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
       setPoints([]);
+      setPoseKeypoints([]);
+      setComparePoseKeypoints([]);
       resetZoomAll();
       if (file.type.startsWith('video/')) {
         setVideoSrc(URL.createObjectURL(file));
@@ -229,6 +226,22 @@ export default function App() {
         setImageSrc(URL.createObjectURL(file));
         setVideoSrc(null);
       }
+    }
+    event.target.value = '';
+  };
+
+  const handleCompareFileUpload = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      if (file.type.startsWith('video/')) {
+        setCompareVideoSrc(URL.createObjectURL(file));
+        setCompareImageSrc(null);
+      } else if (file.type.startsWith('image/')) {
+        setCompareImageSrc(URL.createObjectURL(file));
+        setCompareVideoSrc(null);
+      }
+      setCompareIsPlaying(false);
+      setComparePoseKeypoints([]);
     }
     event.target.value = '';
   };
@@ -255,6 +268,13 @@ export default function App() {
 
   const openGalleryPicker = () => {
     const el = galleryPickInputRef.current;
+    if (!el) return;
+    el.removeAttribute('capture');
+    el.click();
+  };
+
+  const openComparePicker = () => {
+    const el = comparePickInputRef.current;
     if (!el) return;
     el.removeAttribute('capture');
     el.click();
@@ -499,9 +519,22 @@ export default function App() {
     );
   };
 
-  const stepFrame = (direction: number) => {
-    if (videoRef.current) {
-      videoRef.current.currentTime += direction * 0.033; // Approx 30fps
+  const stepPrimaryFrame = (direction: number) => {
+    if (!videoRef.current) return;
+    const v = videoRef.current;
+    v.currentTime = Math.max(0, v.currentTime + direction * FRAME_STEP_SECONDS);
+  };
+
+  const stepCompareFrame = (direction: number) => {
+    if (!compareVideoRef.current) return;
+    const v = compareVideoRef.current;
+    v.currentTime = Math.max(0, v.currentTime + direction * FRAME_STEP_SECONDS);
+  };
+
+  const stepBothFrames = (direction: number) => {
+    if (videoRef.current) stepPrimaryFrame(direction);
+    if (compareVideoRef.current && compareVideoSrc) {
+      stepCompareFrame(direction);
     }
   };
 
@@ -513,6 +546,26 @@ export default function App() {
   }, [isPlaying]);
 
   useEffect(() => {
+    if (isLinkedPlayback) {
+      setCompareIsPlaying(isPlaying);
+      return;
+    }
+    if (compareVideoRef.current) {
+      if (compareIsPlaying) void compareVideoRef.current.play().catch(() => {});
+      else compareVideoRef.current.pause();
+    }
+  }, [compareIsPlaying, isLinkedPlayback, isPlaying]);
+
+  useEffect(() => {
+    if (!isLinkedPlayback || !compareVideoRef.current || !videoRef.current) return;
+    if (isPlaying) {
+      void compareVideoRef.current.play().catch(() => {});
+      return;
+    }
+    compareVideoRef.current.pause();
+  }, [isPlaying, isLinkedPlayback, compareVideoSrc]);
+
+  useEffect(() => {
     const wrap = mediaWrapRef.current;
     const target = videoRef.current ?? imageRef.current;
     if (!wrap || !target) return;
@@ -521,6 +574,173 @@ export default function App() {
     ro.observe(wrap);
     return () => ro.disconnect();
   }, [videoSrc, imageSrc]);
+
+  useEffect(() => {
+    const wrap = compareMediaWrapRef.current;
+    const target = compareVideoRef.current ?? compareImageRef.current;
+    if (!wrap || !target) return;
+
+    const ro = new ResizeObserver(() => setCompareMediaLayoutVersion((v) => v + 1));
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, [compareVideoSrc, compareImageSrc]);
+
+  useEffect(() => {
+    return () => {
+      if (poseRafRef.current !== null) {
+        cancelAnimationFrame(poseRafRef.current);
+        poseRafRef.current = null;
+      }
+      poseLandmarkerRef.current?.close();
+      poseLandmarkerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (scrubRafRef.current !== null) {
+        cancelAnimationFrame(scrubRafRef.current);
+        scrubRafRef.current = null;
+      }
+      if (compareScrubRafRef.current !== null) {
+        cancelAnimationFrame(compareScrubRafRef.current);
+        compareScrubRafRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!poseEnabled || (!videoSrc && !imageSrc && !compareVideoSrc && !compareImageSrc)) {
+      setPoseKeypoints([]);
+      setComparePoseKeypoints([]);
+      if (poseRafRef.current !== null) {
+        cancelAnimationFrame(poseRafRef.current);
+        poseRafRef.current = null;
+      }
+      return;
+    }
+
+    let cancelled = false;
+    let lastPrimaryVideoTime = -1;
+    let lastCompareVideoTime = -1;
+
+    const ensureLandmarker = async () => {
+      if (poseLandmarkerRef.current) return poseLandmarkerRef.current;
+      setPoseStatus('loading');
+      const vision = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm',
+      );
+      const landmarker = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',
+        },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+      });
+      poseLandmarkerRef.current = landmarker;
+      setPoseStatus('ready');
+      return landmarker;
+    };
+
+    const updatePoseFromResult = (
+      result: any,
+      setter: (next: {x: number; y: number; v: number}[]) => void,
+    ) => {
+      const landmarks = result?.landmarks?.[0];
+      if (!landmarks || landmarks.length === 0) {
+        setter([]);
+        return;
+      }
+      const selected = POSE_HIP_KNEE_ANKLE_IDS.map((id) => {
+        const p = landmarks[id];
+        return {x: p.x, y: p.y, v: p.visibility ?? 1};
+      });
+      setter(selected);
+    };
+
+    const run = async () => {
+      try {
+        const landmarker = await ensureLandmarker();
+        if (cancelled) return;
+
+        const primaryVideo = videoRef.current;
+        const compareVideo = compareVideoRef.current;
+        const primaryImage = imageRef.current;
+        const compareImage = compareImageRef.current;
+        const hasAnyVideo = (!!videoSrc && !!primaryVideo) || (!!compareVideoSrc && !!compareVideo);
+
+        // Handle images immediately (single detection), videos in a shared RAF loop.
+        if (!hasAnyVideo) {
+          if (imageSrc && primaryImage) {
+            await landmarker.setOptions({runningMode: 'IMAGE'});
+            const result = landmarker.detect(primaryImage);
+            if (!cancelled) updatePoseFromResult(result, setPoseKeypoints);
+          }
+          if (compareImageSrc && compareImage) {
+            await landmarker.setOptions({runningMode: 'IMAGE'});
+            const result = landmarker.detect(compareImage);
+            if (!cancelled) updatePoseFromResult(result, setComparePoseKeypoints);
+          }
+          return;
+        }
+
+        await landmarker.setOptions({runningMode: 'VIDEO'});
+
+        if (imageSrc && primaryImage) {
+          // Primary is an image: detect once and keep it.
+          await landmarker.setOptions({runningMode: 'IMAGE'});
+          const result = landmarker.detect(primaryImage);
+          if (!cancelled) updatePoseFromResult(result, setPoseKeypoints);
+          await landmarker.setOptions({runningMode: 'VIDEO'});
+        }
+        if (compareImageSrc && compareImage) {
+          await landmarker.setOptions({runningMode: 'IMAGE'});
+          const result = landmarker.detect(compareImage);
+          if (!cancelled) updatePoseFromResult(result, setComparePoseKeypoints);
+          await landmarker.setOptions({runningMode: 'VIDEO'});
+        }
+
+        const tick = () => {
+          if (cancelled) return;
+
+          if (videoSrc && primaryVideo) {
+            const v = primaryVideo;
+            if (v.readyState >= 2 && (v.currentTime !== lastPrimaryVideoTime || !v.paused)) {
+              lastPrimaryVideoTime = v.currentTime;
+              const result = landmarker.detectForVideo(v, performance.now());
+              updatePoseFromResult(result, setPoseKeypoints);
+            }
+          }
+
+          if (compareVideoSrc && compareVideo) {
+            const v = compareVideo;
+            if (v.readyState >= 2 && (v.currentTime !== lastCompareVideoTime || !v.paused)) {
+              lastCompareVideoTime = v.currentTime;
+              const result = landmarker.detectForVideo(v, performance.now());
+              updatePoseFromResult(result, setComparePoseKeypoints);
+            }
+          }
+
+          poseRafRef.current = requestAnimationFrame(tick);
+        };
+
+        tick();
+      } catch {
+        if (!cancelled) setPoseStatus('error');
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+      if (poseRafRef.current !== null) {
+        cancelAnimationFrame(poseRafRef.current);
+        poseRafRef.current = null;
+      }
+    };
+  }, [poseEnabled, videoSrc, imageSrc, compareVideoSrc, compareImageSrc]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -557,6 +777,38 @@ export default function App() {
       });
     }
 
+    if (poseEnabled && poseKeypoints.length === POSE_HIP_KNEE_ANKLE_IDS.length) {
+      const byId = new Map<number, {x: number; y: number; v: number}>();
+      POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+        const p = poseKeypoints[i];
+        if (p) byId.set(id, p);
+      });
+
+      ctx.save();
+      ctx.strokeStyle = '#00d2ff';
+      ctx.fillStyle = '#00d2ff';
+      ctx.lineWidth = 2.5;
+      for (const [aId, bId] of POSE_LEG_CONNECTIONS) {
+        const a = byId.get(aId);
+        const b = byId.get(bId);
+        if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+        const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, videoRef.current ?? imageRef.current, canvasRef.current);
+        const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, videoRef.current ?? imageRef.current, canvasRef.current);
+        ctx.beginPath();
+        ctx.moveTo(aPx.x, aPx.y);
+        ctx.lineTo(bPx.x, bPx.y);
+        ctx.stroke();
+      }
+      for (const p of poseKeypoints) {
+        if (p.v < 0.25) continue;
+        const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, videoRef.current ?? imageRef.current, canvasRef.current);
+        ctx.beginPath();
+        ctx.arc(o.x, o.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
     if (points.length >= 2) {
       const o0 = contentToOverlay(points[0].x, points[0].y, zMap);
       const o1 = contentToOverlay(points[1].x, points[1].y, zMap);
@@ -575,43 +827,104 @@ export default function App() {
       ctx.stroke();
     }
 
-    if (activeTool === 'zoom' && zoomDraft && (zoomPhase === 'drawing' || zoomPhase === 'confirm')) {
-      const {x: zx, y: zy, w: zw, h: zh} = zoomDraft;
-      const tl = contentToOverlay(zx, zy, zMap);
-      const br = contentToOverlay(zx + zw, zy + zh, zMap);
-      const ow = br.x - tl.x;
-      const oh = br.y - tl.y;
-      ctx.save();
-      ctx.strokeStyle = '#ff8800';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([8, 5]);
-      ctx.strokeRect(tl.x, tl.y, ow, oh);
-      ctx.setLineDash([]);
-      if (zoomPhase === 'confirm') {
-        const corners: [number, number][] = [
-          [zx, zy],
-          [zx + zw, zy],
-          [zx + zw, zy + zh],
-          [zx, zy + zh],
-        ];
-        for (const [ccx, ccy] of corners) {
-          const co = contentToOverlay(ccx, ccy, zMap);
-          ctx.beginPath();
-          ctx.arc(co.x, co.y, ZOOM_HANDLE_RADIUS, 0, Math.PI * 2);
-          ctx.fillStyle = '#ff8800';
-          ctx.fill();
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 2;
-          ctx.stroke();
-        }
-      }
-      ctx.restore();
+  }, [points, videoSrc, imageSrc, angle, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints]);
+
+  // Compare panel pose overlay (independent from primary zoom/pan)
+  useEffect(() => {
+    const canvas = compareCanvasRef.current;
+    const video = compareVideoRef.current;
+    const image = compareImageRef.current;
+    if (!canvas || (!video && !image)) return;
+
+    const wrap = canvas.parentElement;
+    if (!wrap) return;
+
+    const vw = wrap.clientWidth;
+    const vh = wrap.clientHeight;
+    canvas.width = Math.max(1, Math.round(vw));
+    canvas.height = Math.max(1, Math.round(vh));
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!poseEnabled) return;
+    if (comparePoseKeypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return;
+
+    const media = (video ?? image) as HTMLVideoElement | HTMLImageElement;
+
+    const byId = new Map<number, {x: number; y: number; v: number}>();
+    POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+      const p = comparePoseKeypoints[i];
+      if (p) byId.set(id, p);
+    });
+
+    ctx.save();
+    ctx.strokeStyle = '#00d2ff';
+    ctx.fillStyle = '#00d2ff';
+    ctx.lineWidth = 2.5;
+
+    for (const [aId, bId] of POSE_LEG_CONNECTIONS) {
+      const a = byId.get(aId);
+      const b = byId.get(bId);
+      if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+      const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, media, canvas);
+      const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, media, canvas);
+      ctx.beginPath();
+      ctx.moveTo(aPx.x, aPx.y);
+      ctx.lineTo(bPx.x, bPx.y);
+      ctx.stroke();
     }
-  }, [points, videoSrc, imageSrc, angle, mediaLayoutVersion, activeTool, zoomPhase, zoomDraft, appliedZoom]);
+
+    for (const p of comparePoseKeypoints) {
+      if (p.v < 0.25) continue;
+      const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, media, canvas);
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }, [comparePoseKeypoints, compareVideoSrc, compareImageSrc, compareMediaLayoutVersion, poseEnabled]);
 
   const [draggingPointIndex, setDraggingPointIndex] = useState<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [compareCurrentTime, setCompareCurrentTime] = useState(0);
+  const [compareDuration, setCompareDuration] = useState(0);
+  const scrubRafRef = useRef<number | null>(null);
+  const scrubTargetRef = useRef<number | null>(null);
+  const compareScrubRafRef = useRef<number | null>(null);
+  const compareScrubTargetRef = useRef<number | null>(null);
+
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const fullscreenTargetRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const syncFullscreenState = () => {
+      setIsFullscreen(document.fullscreenElement === fullscreenTargetRef.current);
+    };
+    document.addEventListener('fullscreenchange', syncFullscreenState);
+    return () => document.removeEventListener('fullscreenchange', syncFullscreenState);
+  }, []);
+
+  const toggleFullscreen = async () => {
+    const target = fullscreenTargetRef.current;
+    if (!target) return;
+    try {
+      if (document.fullscreenElement === target) {
+        await document.exitFullscreen();
+      } else if (!document.fullscreenElement) {
+        await target.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+        await target.requestFullscreen();
+      }
+    } catch {
+      /* Fullscreen may be blocked by browser policy or unsupported context */
+    }
+  };
 
   useEffect(() => {
     setCurrentTime(0);
@@ -663,6 +976,41 @@ export default function App() {
     };
   }, [videoSrc]);
 
+  useEffect(() => {
+    setCompareCurrentTime(0);
+    setCompareDuration(0);
+    const video = compareVideoRef.current;
+    if (!video) return;
+    let lastSyncedDuration = 0;
+    const syncDuration = () => {
+      const d = getReliableVideoDuration(video);
+      if (d > 0 && Math.abs(d - lastSyncedDuration) > 0.02) {
+        lastSyncedDuration = d;
+        setCompareDuration(d);
+      }
+    };
+    const handleTimeUpdate = () => setCompareCurrentTime(video.currentTime);
+    const handleLoadedMetadata = () => syncDuration();
+    const handleDurationChange = () => syncDuration();
+    const handleProgress = () => syncDuration();
+    const handleLoadedData = () => syncDuration();
+    const handleCanPlay = () => syncDuration();
+    video.addEventListener('timeupdate', handleTimeUpdate);
+    video.addEventListener('loadedmetadata', handleLoadedMetadata);
+    video.addEventListener('durationchange', handleDurationChange);
+    video.addEventListener('progress', handleProgress);
+    video.addEventListener('loadeddata', handleLoadedData);
+    video.addEventListener('canplay', handleCanPlay);
+    return () => {
+      video.removeEventListener('timeupdate', handleTimeUpdate);
+      video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      video.removeEventListener('durationchange', handleDurationChange);
+      video.removeEventListener('progress', handleProgress);
+      video.removeEventListener('loadeddata', handleLoadedData);
+      video.removeEventListener('canplay', handleCanPlay);
+    };
+  }, [compareVideoSrc]);
+
   const handleSeek = (e: ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
     if (videoRef.current) {
@@ -670,9 +1018,54 @@ export default function App() {
       const cap =
         duration > 0 ? duration : getReliableVideoDuration(v) || v.duration || time;
       const clamped = Number.isFinite(cap) && cap > 0 ? Math.min(Math.max(0, time), cap) : time;
-      v.currentTime = clamped;
-      setCurrentTime(v.currentTime);
+      scrubTargetRef.current = clamped;
+      if (scrubRafRef.current === null) {
+        scrubRafRef.current = requestAnimationFrame(() => {
+          scrubRafRef.current = null;
+          if (!videoRef.current) return;
+          const target = scrubTargetRef.current ?? 0;
+          videoRef.current.currentTime = target;
+          setCurrentTime(videoRef.current.currentTime);
+        });
+      }
     }
+  };
+
+  const handleCompareSeek = (e: ChangeEvent<HTMLInputElement>) => {
+    const time = parseFloat(e.target.value);
+    if (!compareVideoRef.current) return;
+    const v = compareVideoRef.current;
+    const cap =
+      compareDuration > 0 ? compareDuration : getReliableVideoDuration(v) || v.duration || time;
+    const clamped = Number.isFinite(cap) && cap > 0 ? Math.min(Math.max(0, time), cap) : time;
+    compareScrubTargetRef.current = clamped;
+    if (compareScrubRafRef.current === null) {
+      compareScrubRafRef.current = requestAnimationFrame(() => {
+        compareScrubRafRef.current = null;
+        if (!compareVideoRef.current) return;
+        const target = compareScrubTargetRef.current ?? 0;
+        compareVideoRef.current.currentTime = target;
+        setCompareCurrentTime(compareVideoRef.current.currentTime);
+      });
+    }
+  };
+
+  const toggleLinkedPlayback = () => {
+    setIsLinkedPlayback((prev) => {
+      const next = !prev;
+      if (next) {
+        const compare = compareVideoRef.current;
+        if (compare) {
+          setCompareIsPlaying(isPlaying);
+          if (isPlaying) {
+            void compare.play().catch(() => {});
+          } else {
+            compare.pause();
+          }
+        }
+      }
+      return next;
+    });
   };
 
   const handleDeleteMeasurements = () => {
@@ -683,6 +1076,8 @@ export default function App() {
   };
 
   const isMediaLoaded = !!videoSrc || !!imageSrc;
+  const hasCompareMedia = !!compareVideoSrc || !!compareImageSrc;
+  const currentScale = appliedZoom?.s ?? 1;
 
   const pointerToOverlayPx = (clientX: number, clientY: number, canvas: HTMLCanvasElement) => {
     const rect = canvas.getBoundingClientRect();
@@ -712,17 +1107,54 @@ export default function App() {
     });
   };
 
-  const applyZoomConfirm = () => {
-    if (!zoomDraft || !mediaWrapRef.current) return;
-    const wrap = mediaWrapRef.current;
-    const vw = wrap.clientWidth;
-    const vh = wrap.clientHeight;
-    const {x, y, w, h} = zoomDraft;
-    if (w < ZOOM_MIN_SIZE || h < ZOOM_MIN_SIZE) return;
-    const s = Math.min(vw / w, vh / h);
-    setAppliedZoom({x, y, w, h, vw, vh, s});
-    cancelZoomMarquee();
-    setActiveTool(null);
+  const getContentSize = () => {
+    const media = (videoRef.current ?? imageRef.current) as HTMLElement | null;
+    if (!media) return null;
+    const w = media.clientWidth;
+    const h = media.clientHeight;
+    if (w <= 0 || h <= 0) return null;
+    return {w, h};
+  };
+
+  const clampZoomViewport = (x: number, y: number, s: number, contentW: number, contentH: number) => {
+    if (s <= ZOOM_MIN_SCALE) return {x: 0, y: 0, s: ZOOM_MIN_SCALE};
+    const visibleW = contentW / s;
+    const visibleH = contentH / s;
+    const maxX = Math.max(0, contentW - visibleW);
+    const maxY = Math.max(0, contentH - visibleH);
+    return {x: clamp(x, 0, maxX), y: clamp(y, 0, maxY), s};
+  };
+
+  const zoomAt = (factor: number, anchorContentX: number, anchorContentY: number) => {
+    const size = getContentSize();
+    if (!size) return;
+    const prevS = appliedZoom?.s ?? ZOOM_MIN_SCALE;
+    const prevX = appliedZoom?.x ?? 0;
+    const prevY = appliedZoom?.y ?? 0;
+    const nextS = clamp(prevS * factor, ZOOM_MIN_SCALE, ZOOM_MAX_SCALE);
+    if (Math.abs(nextS - ZOOM_MIN_SCALE) < 0.001) {
+      setAppliedZoom(null);
+      setActiveTool((prev) => (prev === 'pan' ? null : prev));
+      return;
+    }
+    const nextX = anchorContentX - ((anchorContentX - prevX) * prevS) / nextS;
+    const nextY = anchorContentY - ((anchorContentY - prevY) * prevS) / nextS;
+    setAppliedZoom(clampZoomViewport(nextX, nextY, nextS, size.w, size.h));
+  };
+
+  const zoomByButton = (factor: number) => {
+    const size = getContentSize();
+    if (!size) return;
+    const centerOverlay = {
+      ox: size.w / 2,
+      oy: size.h / 2,
+    };
+    const anchor = overlayToContent(
+      centerOverlay.ox,
+      centerOverlay.oy,
+      appliedZoom ? {x: appliedZoom.x, y: appliedZoom.y, s: appliedZoom.s} : null,
+    );
+    zoomAt(factor, anchor.x, anchor.y);
   };
 
   const toggleRulerTool = () => {
@@ -731,21 +1163,16 @@ export default function App() {
         setIsDrawing(false);
         return null;
       }
-      cancelZoomMarquee();
       setIsDrawing(true);
       return 'ruler';
     });
   };
 
-  const toggleZoomTool = () => {
+  const togglePanTool = () => {
     setActiveTool((prev) => {
-      if (prev === 'zoom') {
-        cancelZoomMarquee();
-        return null;
-      }
-      setIsDrawing(false);
-      cancelZoomMarquee();
-      return 'zoom';
+      const next = prev === 'pan' ? null : 'pan';
+      if (next === 'pan') setIsDrawing(false);
+      return next;
     });
   };
 
@@ -756,27 +1183,40 @@ export default function App() {
     const {ox, oy} = pointerToOverlayPx(e.clientX, e.clientY, canvas);
     const {x, y} = pointerToContent(e.clientX, e.clientY, canvas);
 
-    if (activeTool === 'zoom' && !appliedZoom) {
-      if (zoomPhase === 'confirm' && zoomDraft) {
-        const ci = getZoomCornerIndex(x, y, zoomDraft);
-        if (ci >= 0) {
-          e.currentTarget.setPointerCapture(e.pointerId);
-          setDraggingZoomCorner(ci);
-          return;
-        }
-        return;
-      }
-      if (zoomPhase === 'idle') {
-        zoomDrawStartRef.current = {x, y};
-        setZoomPhase('drawing');
-        setZoomDraft({x, y, w: 0, h: 0});
-        e.currentTarget.setPointerCapture(e.pointerId);
-        return;
-      }
-      if (zoomPhase === 'drawing') {
-        e.currentTarget.setPointerCapture(e.pointerId);
-        return;
-      }
+    activePointersRef.current.set(e.pointerId, {clientX: e.clientX, clientY: e.clientY});
+    const pointers = Array.from(activePointersRef.current.values());
+    if (e.pointerType === 'touch' && pointers.length >= 2) {
+      const p0 = pointers[0]!;
+      const p1 = pointers[1]!;
+      const midClientX = (p0.clientX + p1.clientX) / 2;
+      const midClientY = (p0.clientY + p1.clientY) / 2;
+      const anchor = pointerToContent(midClientX, midClientY, canvas);
+      const start = appliedZoom ?? {x: 0, y: 0, s: ZOOM_MIN_SCALE};
+      pinchRef.current = {
+        initialDistance: Math.hypot(p1.clientX - p0.clientX, p1.clientY - p0.clientY),
+        initialScale: start.s,
+        anchorX: anchor.x,
+        anchorY: anchor.y,
+        initialX: start.x,
+        initialY: start.y,
+      };
+      panDragRef.current = null;
+      setIsPanning(false);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if (activeTool === 'pan' && currentScale > ZOOM_MIN_SCALE) {
+      panDragRef.current = {
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startX: appliedZoom?.x ?? 0,
+        startY: appliedZoom?.y ?? 0,
+      };
+      setIsPanning(true);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
     }
 
     const pointIndex = getPointAtOverlay(ox, oy);
@@ -804,16 +1244,49 @@ export default function App() {
   const handleCanvasPointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const {x, y} = pointerToContent(e.clientX, e.clientY, canvas);
+    if (activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, {clientX: e.clientX, clientY: e.clientY});
+    }
 
-    if (draggingZoomCorner !== null && zoomDraft) {
-      setZoomDraft(adjustZoomRectByCorner(draggingZoomCorner, x, y, zoomDraft));
+    if (pinchRef.current) {
+      const pointers = Array.from(activePointersRef.current.values());
+      if (pointers.length >= 2) {
+        const p0 = pointers[0]!;
+        const p1 = pointers[1]!;
+        const distance = Math.hypot(p1.clientX - p0.clientX, p1.clientY - p0.clientY);
+        if (distance > 1) {
+          const size = getContentSize();
+          if (!size) return;
+          const pinch = pinchRef.current;
+          const nextS = clamp(
+            pinch.initialScale * (distance / Math.max(1, pinch.initialDistance)),
+            ZOOM_MIN_SCALE,
+            ZOOM_MAX_SCALE,
+          );
+          if (Math.abs(nextS - ZOOM_MIN_SCALE) < 0.001) {
+            setAppliedZoom(null);
+            setActiveTool((prev) => (prev === 'pan' ? null : prev));
+            return;
+          }
+          const nextX = pinch.anchorX - ((pinch.anchorX - pinch.initialX) * pinch.initialScale) / nextS;
+          const nextY = pinch.anchorY - ((pinch.anchorY - pinch.initialY) * pinch.initialScale) / nextS;
+          setAppliedZoom(clampZoomViewport(nextX, nextY, nextS, size.w, size.h));
+        }
+      }
       return;
     }
 
-    if (zoomPhase === 'drawing' && zoomDrawStartRef.current) {
-      const st = zoomDrawStartRef.current;
-      setZoomDraft(normalizeZoomRect(st.x, st.y, x, y));
+    const {x, y} = pointerToContent(e.clientX, e.clientY, canvas);
+
+    if (panDragRef.current && panDragRef.current.pointerId === e.pointerId && currentScale > ZOOM_MIN_SCALE) {
+      const size = getContentSize();
+      if (!size) return;
+      const drag = panDragRef.current;
+      const dx = e.clientX - drag.startClientX;
+      const dy = e.clientY - drag.startClientY;
+      setAppliedZoom(
+        clampZoomViewport(drag.startX - dx / currentScale, drag.startY - dy / currentScale, currentScale, size.w, size.h),
+      );
       return;
     }
 
@@ -830,19 +1303,13 @@ export default function App() {
   };
 
   const handleCanvasPointerUp = (e: ReactPointerEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (canvas && activeTool === 'zoom' && zoomPhase === 'drawing' && zoomDrawStartRef.current) {
-      const {x, y} = pointerToContent(e.clientX, e.clientY, canvas);
-      const st = zoomDrawStartRef.current;
-      zoomDrawStartRef.current = null;
-      const r = normalizeZoomRect(st.x, st.y, x, y);
-      if (r.w >= ZOOM_MIN_SIZE && r.h >= ZOOM_MIN_SIZE) {
-        setZoomDraft(r);
-        setZoomPhase('confirm');
-      } else {
-        setZoomDraft(null);
-        setZoomPhase('idle');
-      }
+    activePointersRef.current.delete(e.pointerId);
+    if (panDragRef.current?.pointerId === e.pointerId) {
+      panDragRef.current = null;
+      setIsPanning(false);
+    }
+    if (pinchRef.current && activePointersRef.current.size < 2) {
+      pinchRef.current = null;
     }
 
     try {
@@ -850,7 +1317,6 @@ export default function App() {
     } catch {
       /* ignore if not captured */
     }
-    setDraggingZoomCorner(null);
     setDraggingPointIndex(null);
   };
 
@@ -885,6 +1351,30 @@ export default function App() {
               >
                 <ImageGalleryIcon className="w-6 h-6 text-[#ff8800]" />
               </button>
+              <button
+                type="button"
+                onClick={openComparePicker}
+                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20"
+                title="Add compare media"
+                aria-label="Add compare media"
+              >
+                <ImageGalleryIcon className="w-6 h-6 text-white" />
+              </button>
+              {hasCompareMedia ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCompareVideoSrc(null);
+                    setCompareImageSrc(null);
+                    setCompareIsPlaying(false);
+                  }}
+                  className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20 text-red-400"
+                  title="Remove compare media"
+                  aria-label="Remove compare media"
+                >
+                  <Trash className="w-6 h-6" />
+                </button>
+              ) : null}
               <input
                 ref={galleryPickInputRef}
                 type="file"
@@ -893,6 +1383,15 @@ export default function App() {
                 aria-hidden
                 tabIndex={-1}
                 onChange={handleFileUpload}
+              />
+              <input
+                ref={comparePickInputRef}
+                type="file"
+                accept="image/*,video/mp4,video/webm,video/ogg,video/quicktime,video/*"
+                className="sr-only"
+                aria-hidden
+                tabIndex={-1}
+                onChange={handleCompareFileUpload}
               />
               <input
                 ref={imagePickInputRef}
@@ -936,112 +1435,210 @@ export default function App() {
           {videoSrc ? (
             <div className="flex w-full min-w-0 flex-col gap-3">
               {/* Tall phone media: no fixed 16:9 box; cap desktop height so the page fits the window */}
-              <div className="flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden rounded-xl border border-[#ff8800]/10 bg-black p-2 sm:p-3">
-                <div
-                  ref={mediaWrapRef}
-                  className={`relative overflow-hidden ${appliedZoom ? 'mx-auto shrink-0' : 'inline-block max-h-[min(82dvh,920px)] max-w-full md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
-                  style={
-                    appliedZoom
-                      ? {width: appliedZoom.vw, height: appliedZoom.vh}
-                      : undefined
-                  }
-                >
-                  <div
-                    className={
-                      appliedZoom
-                        ? 'relative inline-block'
-                        : 'relative inline-block max-h-[min(82dvh,920px)] max-w-full md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'
-                    }
-                    style={
-                      appliedZoom
-                        ? {
-                            transform: `translate(${-appliedZoom.x * appliedZoom.s}px, ${-appliedZoom.y * appliedZoom.s}px) scale(${appliedZoom.s})`,
-                            transformOrigin: '0 0',
-                          }
-                        : undefined
-                    }
-                  >
-                    <video
-                      ref={videoRef}
-                      src={videoSrc}
-                      className="block h-auto max-h-[min(82dvh,920px)] w-full max-w-full object-contain md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]"
-                    />
+              <div
+                ref={fullscreenTargetRef}
+                className={`flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden bg-black ${isFullscreen ? 'h-[100dvh] rounded-none border-0 p-0' : 'rounded-xl border border-[#ff8800]/10 p-2 sm:p-3'}`}
+              >
+                <div className={`grid w-full items-center justify-items-center gap-3 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+                  <div className="flex min-w-0 flex-col gap-2">
+                    <div
+                      ref={mediaWrapRef}
+                      className={`relative inline-block max-w-full overflow-hidden ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                    >
+                      <div
+                        className={
+                          appliedZoom
+                            ? 'relative inline-block'
+                            : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`
+                        }
+                        style={
+                          appliedZoom
+                            ? {
+                                transform: `translate(${-appliedZoom.x * appliedZoom.s}px, ${-appliedZoom.y * appliedZoom.s}px) scale(${appliedZoom.s})`,
+                                transformOrigin: '0 0',
+                              }
+                            : undefined
+                        }
+                      >
+                        <video
+                          ref={videoRef}
+                          src={videoSrc}
+                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                        />
+                      </div>
+                      <canvas
+                        ref={canvasRef}
+                        className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
+                        style={{
+                          touchAction: 'none',
+                          cursor: isPanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : 'crosshair',
+                        }}
+                        onPointerDown={handleCanvasPointerDown}
+                        onPointerMove={handleCanvasPointerMove}
+                        onPointerUp={handleCanvasPointerUp}
+                        onPointerCancel={handleCanvasPointerUp}
+                        onPointerLeave={handleCanvasPointerUp}
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setIsPlaying(!isPlaying)}
+                        className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                        title="Play or pause primary video"
+                        aria-label="Play or pause primary video"
+                      >
+                        {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
+                      </button>
+                      <input
+                        type="range"
+                        min="0"
+                        max={Math.max(duration, currentTime, 0.0001)}
+                        value={Math.min(currentTime, Math.max(duration, currentTime, 0.0001))}
+                        onChange={handleSeek}
+                        step={SLIDER_SCRUB_STEP_SECONDS}
+                        className="w-full accent-[#ff8800]"
+                      />
+                    </div>
+                    <div className="flex items-center justify-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => stepPrimaryFrame(-1)}
+                        disabled={!videoSrc}
+                        className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
+                        title="Step back one frame"
+                        aria-label="Step back one frame"
+                      >
+                        <ChevronLeft className="w-5 h-5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => stepPrimaryFrame(1)}
+                        disabled={!videoSrc}
+                        className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
+                        title="Step forward one frame"
+                        aria-label="Step forward one frame"
+                      >
+                        <ChevronRight className="w-5 h-5" />
+                      </button>
+                    </div>
                   </div>
-                  <canvas
-                    ref={canvasRef}
-                    className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
-                    style={{
-                      touchAction: 'none',
-                      cursor:
-                        draggingZoomCorner !== null
-                          ? 'grabbing'
-                          : activeTool === 'zoom' && !appliedZoom
-                            ? zoomPhase === 'confirm'
-                              ? 'default'
-                              : 'crosshair'
-                            : 'crosshair',
-                    }}
-                    onPointerDown={handleCanvasPointerDown}
-                    onPointerMove={handleCanvasPointerMove}
-                    onPointerUp={handleCanvasPointerUp}
-                    onPointerCancel={handleCanvasPointerUp}
-                    onPointerLeave={handleCanvasPointerUp}
-                  />
+                  {hasCompareMedia ? (
+                    <div className="flex min-w-0 flex-col gap-2">
+                      <div
+                        ref={compareMediaWrapRef}
+                        className="relative inline-block max-w-full overflow-hidden"
+                      >
+                        {compareVideoSrc ? (
+                          <video
+                            ref={compareVideoRef}
+                            src={compareVideoSrc}
+                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                          />
+                        ) : compareImageSrc ? (
+                          <img
+                            ref={compareImageRef}
+                            src={compareImageSrc}
+                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                            alt="Compare media"
+                          />
+                        ) : null}
+                        <canvas
+                          ref={compareCanvasRef}
+                          className="pointer-events-none absolute inset-0 z-10 h-full w-full touch-none"
+                          style={{touchAction: 'none'}}
+                        />
+                      </div>
+                      {compareVideoSrc ? (
+                        <div className="flex flex-col gap-2">
+                          <div className="flex items-center gap-2">
+                            {!isLinkedPlayback ? (
+                              <button
+                                type="button"
+                                onClick={() => setCompareIsPlaying((v) => !v)}
+                                className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                                title="Play or pause compare video"
+                                aria-label="Play or pause compare video"
+                              >
+                                {compareIsPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
+                              </button>
+                            ) : null}
+                            <input
+                              type="range"
+                              min="0"
+                              max={Math.max(compareDuration, compareCurrentTime, 0.0001)}
+                              value={Math.min(compareCurrentTime, Math.max(compareDuration, compareCurrentTime, 0.0001))}
+                              onChange={handleCompareSeek}
+                              step={SLIDER_SCRUB_STEP_SECONDS}
+                              className="w-full accent-[#ff8800]"
+                            />
+                          </div>
+                          <div className="flex items-center justify-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => stepCompareFrame(-1)}
+                              className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
+                              title="Step back one frame"
+                              aria-label="Step back one frame"
+                            >
+                              <ChevronLeft className="w-5 h-5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => stepCompareFrame(1)}
+                              className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
+                              title="Step forward one frame"
+                              aria-label="Step forward one frame"
+                            >
+                              <ChevronRight className="w-5 h-5" />
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               </div>
 
-              {zoomPhase === 'confirm' && (
-                <div className="flex flex-col gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
-                  <p className="text-sm text-[var(--color-text-light)]">
-                    Drag any corner to adjust the zoom area, then confirm to enlarge for analysis.
-                  </p>
-                  <div className="flex flex-wrap justify-end gap-2">
-                    <button
-                      type="button"
-                      onClick={cancelZoomMarquee}
-                      className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-bg-dark)] px-4 py-2 text-sm hover:bg-[var(--color-panel-hover)]"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="button"
-                      onClick={applyZoomConfirm}
-                      className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-[var(--color-bg-dark)] hover:bg-[var(--color-accent-hover)]"
-                    >
-                      Confirm zoom
-                    </button>
-                  </div>
-                </div>
-              )}
-
               <div className="flex flex-col gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
-                <input
-                  type="range"
-                  min="0"
-                  max={Math.max(duration, currentTime, 0.0001)}
-                  value={Math.min(currentTime, Math.max(duration, currentTime, 0.0001))}
-                  onChange={handleSeek}
-                  className="w-full accent-[#ff8800]"
-                />
+                {compareVideoSrc ? (
+                  <>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-[var(--color-text-light)]">Compare video timeline</span>
+                      <button
+                        type="button"
+                        onClick={toggleLinkedPlayback}
+                        className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs ${isLinkedPlayback ? 'bg-[#ff8800] text-[var(--color-bg-dark)]' : 'bg-[var(--color-bg-dark)] text-white border border-[#ff8800]/20'}`}
+                        title={isLinkedPlayback ? 'Unlink playback' : 'Link playback'}
+                        aria-label={isLinkedPlayback ? 'Unlink playback' : 'Link playback'}
+                      >
+                        {isLinkedPlayback ? <Link2 className="h-3.5 w-3.5" /> : <Unlink2 className="h-3.5 w-3.5" />}
+                        {isLinkedPlayback ? 'Linked' : 'Unlinked'}
+                      </button>
+                    </div>
+                  </>
+                ) : null}
+                {poseEnabled ? (
+                  <p className="text-xs text-[var(--color-text-light)]">
+                    {poseStatus === 'loading'
+                      ? 'Loading pose model...'
+                      : poseStatus === 'error'
+                        ? 'Pose model failed to load.'
+                        : 'Pose map active: hips, knees, ankles'}
+                  </p>
+                ) : null}
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setIsPlaying(!isPlaying)}
-                    className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
-                  >
-                    {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
-                  </button>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => stepFrame(-1)}
+                      onClick={() => stepBothFrames(-1)}
                       className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
                     >
                       <ChevronLeft />
                     </button>
                     <button
                       type="button"
-                      onClick={() => stepFrame(1)}
+                      onClick={() => stepBothFrames(1)}
                       className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
                     >
                       <ChevronRight />
@@ -1068,13 +1665,53 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      onClick={toggleZoomTool}
-                      disabled={!isMediaLoaded || !!appliedZoom}
-                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || appliedZoom ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'zoom' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
-                      title={appliedZoom ? 'Reset zoom to use marquee again' : 'Zoom — drag a rectangle'}
-                      aria-label="Zoom tool"
+                      onClick={() => setPoseEnabled((v) => !v)}
+                      disabled={!isMediaLoaded}
+                      className={`rounded-lg border border-[#ff8800]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[#ff8800]' : 'text-white'}`}
+                      title="Toggle BlazePose joints"
+                      aria-label="Toggle BlazePose joints"
+                    >
+                      Pose
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => zoomByButton(ZOOM_BUTTON_FACTOR)}
+                      disabled={!isMediaLoaded}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                      title="Zoom in"
+                      aria-label="Zoom in"
                     >
                       <ZoomIn className="w-6 h-6" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => zoomByButton(1 / ZOOM_BUTTON_FACTOR)}
+                      disabled={!isMediaLoaded}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                      title="Zoom out"
+                      aria-label="Zoom out"
+                    >
+                      <ZoomOut className="w-6 h-6" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={togglePanTool}
+                      disabled={!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'pan' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
+                      title="Pan tool"
+                      aria-label="Pan tool"
+                    >
+                      <Hand className="w-6 h-6" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void toggleFullscreen()}
+                      disabled={!isMediaLoaded}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : 'text-white'}`}
+                      title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+                      aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+                    >
+                      {isFullscreen ? <Minimize className="w-6 h-6" /> : <Maximize className="w-6 h-6" />}
                     </button>
                     {appliedZoom ? (
                       <button
@@ -1093,85 +1730,80 @@ export default function App() {
             </div>
           ) : imageSrc ? (
             <div className="flex w-full min-w-0 flex-col gap-3">
-              <div className="flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden rounded-xl border border-[#ff8800]/10 bg-black p-2 sm:p-3">
-                <div
-                  ref={mediaWrapRef}
-                  className={`relative overflow-hidden ${appliedZoom ? 'mx-auto shrink-0' : 'inline-block max-h-[min(82dvh,920px)] max-w-full md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
-                  style={
-                    appliedZoom
-                      ? {width: appliedZoom.vw, height: appliedZoom.vh}
-                      : undefined
-                  }
-                >
+              <div
+                ref={fullscreenTargetRef}
+                className={`flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden bg-black ${isFullscreen ? 'h-[100dvh] rounded-none border-0 p-0' : 'rounded-xl border border-[#ff8800]/10 p-2 sm:p-3'}`}
+              >
+                <div className={`grid w-full items-center justify-items-center gap-3 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
                   <div
-                    className={
-                      appliedZoom
-                        ? 'relative inline-block'
-                        : 'relative inline-block max-h-[min(82dvh,920px)] max-w-full md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'
-                    }
-                    style={
-                      appliedZoom
-                        ? {
-                            transform: `translate(${-appliedZoom.x * appliedZoom.s}px, ${-appliedZoom.y * appliedZoom.s}px) scale(${appliedZoom.s})`,
-                            transformOrigin: '0 0',
-                          }
-                        : undefined
-                    }
+                    ref={mediaWrapRef}
+                    className={`relative inline-block max-w-full overflow-hidden ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
                   >
-                    <img
-                      ref={imageRef}
-                      src={imageSrc}
-                      className="block h-auto max-h-[min(82dvh,920px)] w-full max-w-full object-contain md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]"
-                      alt="Uploaded"
-                      onLoad={() => setPoints([])}
+                    <div
+                      className={
+                        appliedZoom
+                          ? 'relative inline-block'
+                          : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`
+                      }
+                      style={
+                        appliedZoom
+                          ? {
+                              transform: `translate(${-appliedZoom.x * appliedZoom.s}px, ${-appliedZoom.y * appliedZoom.s}px) scale(${appliedZoom.s})`,
+                              transformOrigin: '0 0',
+                            }
+                          : undefined
+                      }
+                    >
+                      <img
+                        ref={imageRef}
+                        src={imageSrc}
+                        className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                        alt="Uploaded"
+                        onLoad={() => setPoints([])}
+                      />
+                    </div>
+                    <canvas
+                      ref={canvasRef}
+                      className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
+                      style={{
+                        touchAction: 'none',
+                        cursor: isPanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : 'crosshair',
+                      }}
+                      onPointerDown={handleCanvasPointerDown}
+                      onPointerMove={handleCanvasPointerMove}
+                      onPointerUp={handleCanvasPointerUp}
+                      onPointerCancel={handleCanvasPointerUp}
+                      onPointerLeave={handleCanvasPointerUp}
                     />
                   </div>
-                  <canvas
-                    ref={canvasRef}
-                    className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
-                    style={{
-                      touchAction: 'none',
-                      cursor:
-                        draggingZoomCorner !== null
-                          ? 'grabbing'
-                          : activeTool === 'zoom' && !appliedZoom
-                            ? zoomPhase === 'confirm'
-                              ? 'default'
-                              : 'crosshair'
-                            : 'crosshair',
-                    }}
-                    onPointerDown={handleCanvasPointerDown}
-                    onPointerMove={handleCanvasPointerMove}
-                    onPointerUp={handleCanvasPointerUp}
-                    onPointerCancel={handleCanvasPointerUp}
-                    onPointerLeave={handleCanvasPointerUp}
-                  />
+                  {hasCompareMedia ? (
+                    <div
+                      ref={compareMediaWrapRef}
+                      className="relative inline-block max-w-full overflow-hidden"
+                    >
+                      {compareVideoSrc ? (
+                        <video
+                          ref={compareVideoRef}
+                          src={compareVideoSrc}
+                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                        />
+                      ) : compareImageSrc ? (
+                        <img
+                          ref={compareImageRef}
+                          src={compareImageSrc}
+                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                          alt="Compare media"
+                        />
+                      ) : null}
+                      <canvas
+                        ref={compareCanvasRef}
+                        className="pointer-events-none absolute inset-0 z-10 h-full w-full touch-none"
+                        style={{touchAction: 'none'}}
+                      />
+                    </div>
+                  ) : null}
                 </div>
               </div>
-
-              {zoomPhase === 'confirm' && (
-                <div className="flex flex-col gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
-                  <p className="text-sm text-[var(--color-text-light)]">
-                    Drag any corner to adjust the zoom area, then confirm to enlarge for analysis.
-                  </p>
-                  <div className="flex flex-wrap justify-end gap-2">
-                    <button
-                      type="button"
-                      onClick={cancelZoomMarquee}
-                      className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-bg-dark)] px-4 py-2 text-sm hover:bg-[var(--color-panel-hover)]"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="button"
-                      onClick={applyZoomConfirm}
-                      className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-[var(--color-bg-dark)] hover:bg-[var(--color-accent-hover)]"
-                    >
-                      Confirm zoom
-                    </button>
-                  </div>
-                </div>
-              )}
 
               <div className="flex flex-wrap items-center justify-end gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
                 <button
@@ -1194,13 +1826,53 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={toggleZoomTool}
-                  disabled={!isMediaLoaded || !!appliedZoom}
-                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || appliedZoom ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'zoom' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
-                  title="Zoom — drag a rectangle"
-                  aria-label="Zoom tool"
+                  onClick={() => setPoseEnabled((v) => !v)}
+                  disabled={!isMediaLoaded}
+                  className={`rounded-lg border border-[#ff8800]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[#ff8800]' : 'text-white'}`}
+                  title="Toggle BlazePose joints"
+                  aria-label="Toggle BlazePose joints"
+                >
+                  Pose
+                </button>
+                <button
+                  type="button"
+                  onClick={() => zoomByButton(ZOOM_BUTTON_FACTOR)}
+                  disabled={!isMediaLoaded}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                  title="Zoom in"
+                  aria-label="Zoom in"
                 >
                   <ZoomIn className="w-6 h-6" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => zoomByButton(1 / ZOOM_BUTTON_FACTOR)}
+                  disabled={!isMediaLoaded}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                  title="Zoom out"
+                  aria-label="Zoom out"
+                >
+                  <ZoomOut className="w-6 h-6" />
+                </button>
+                <button
+                  type="button"
+                  onClick={togglePanTool}
+                  disabled={!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'pan' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
+                  title="Pan tool"
+                  aria-label="Pan tool"
+                >
+                  <Hand className="w-6 h-6" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void toggleFullscreen()}
+                  disabled={!isMediaLoaded}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : 'text-white'}`}
+                  title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+                  aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+                >
+                  {isFullscreen ? <Minimize className="w-6 h-6" /> : <Maximize className="w-6 h-6" />}
                 </button>
                 {appliedZoom ? (
                   <button
