@@ -1,6 +1,6 @@
-# Toolbox app shell — UI spec for new tools
+# Toolbox app shell — UI spec (“same belt”)
 
-Use this document when you start a **new project** (or a new route) so it matches **Form Analyzer** and **Macro Counter**: same header size, page colors, glass cards, and grid background.
+Use this document when you start or refactor a **tool** so it matches **Form Analyzer**, **Macro Counter**, and siblings: same header chrome, blueprint grid, glass cards, **theme** (dark/light), **accent palette**, and **settings** affordance. The goal is **one visual language**—tools from the **same belt**—not one-off styling per app.
 
 ---
 
@@ -10,230 +10,228 @@ Use this document when you start a **new project** (or a new route) so it matche
 |--------|------------------|
 | **Tailwind CSS** | v4 with `@import "tailwindcss"` in CSS and **`@tailwindcss/vite`** in Vite |
 | **Fonts** | Google Fonts: **Inter** (body) + **Space Grotesk** (headings / `.brand-font`) |
-| **Framework** | React is what the reference apps use; the **CSS + HTML structure** is portable to other stacks if you map `className` to your templating |
+| **Framework** | React in reference apps; **CSS tokens + `data-theme` + CSS variables** are portable to other stacks |
 
-`vite.config.ts` must include the Tailwind Vite plugin (see Form Analyzer repo).
-
----
-
-## 2. Single source of truth: `index.css`
-
-Copy the block below into **`src/index.css`** (or global styles) **verbatim**. All toolbox tokens and utilities live here.
-
-```css
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;600;700&display=swap");
-
-@import "tailwindcss";
-
-@theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-heading: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-
-  /* Blueprint / glass palette (accent rgb(255,136,0), base #2a3439) */
-  --color-bg-dark: #2a3439;
-  --color-card-dark: #323d44;
-  --color-surface: #252d33;
-  /* Deepest panels / insets (modals, scroll track) */
-  --color-surface-deep: #1c2328;
-  /* Top header bar + footer bar — same as card-dark for layered toolbox UI */
-  --color-chrome-bar: var(--color-card-dark);
-  --color-accent: #ff8800;
-  --color-accent-hover: #e67a00;
-  --color-text-light: #b3c0c9;
-  --color-panel-hover: #353e43;
-}
-
-html {
-  font-family: var(--font-sans);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-body {
-  @apply bg-[var(--color-bg-dark)] text-white font-sans overflow-x-hidden;
-}
-
-h1,
-h2,
-h3,
-.brand-font {
-  font-family: var(--font-heading), ui-sans-serif, system-ui, sans-serif;
-}
-
-.glass {
-  background: color-mix(in srgb, var(--color-card-dark) 88%, transparent);
-  -webkit-backdrop-filter: blur(16px);
-  backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 136, 0, 0.1);
-}
-
-.orange-glow {
-  box-shadow: 0 0 30px rgba(255, 136, 0, 0.15);
-}
-
-.blueprint-bg {
-  background-color: var(--color-bg-dark);
-  background-image: linear-gradient(rgba(255, 136, 0, 0.05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 136, 0, 0.05) 1px, transparent 1px);
-  background-size: 40px 40px;
-}
-
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--color-accent) var(--color-surface-deep);
-}
-
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-::-webkit-scrollbar-track {
-  background: var(--color-surface-deep);
-}
-
-::-webkit-scrollbar-thumb {
-  background: var(--color-accent);
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: var(--color-accent-hover);
-}
-```
-
-Import this file once from your app entry (e.g. `import './index.css'` in `main.tsx`).
+`vite.config.ts` must include the Tailwind Vite plugin (see reference repos).
 
 ---
 
-## 3. Color tokens — when to use what
+## 2. Design rules (belt identity)
+
+1. **Never hard-code the accent hex** in component classes for borders or glows. Use **`var(--color-accent)`** so the user’s accent choice applies everywhere. Prefer Tailwind arbitrary forms such as `border-[var(--color-accent)]/10` and `border-[var(--color-accent)]/20`.
+2. **Primary text** on surfaces uses **`text-fg`** (token `--color-fg`), not raw `text-white`, so **light mode** stays readable. Reserve **`text-white`** for **primary buttons** that sit on **`bg-[var(--color-accent)]`** (white on saturated fill).
+3. **Glass cards** use class **`glass`**; outer glow uses **`accent-glow`** (not `orange-glow`). Both derive tint from **`--color-accent`** via `color-mix`.
+4. **Theme** is `html[data-theme="light"]` vs default (dark). Light mode **redefines** the same token names under `html[data-theme="light"] { ... }`—do not fork separate stylesheets per theme in components.
+5. **Accent** at runtime: `--color-accent` and `--color-accent-hover` are set on **`document.documentElement`** from a small preset table (see §6). Defaults in `@theme` match the **orange** preset until JS runs.
+6. **Settings** live behind a **raised cog** in the header (§7)—not a floating theme toggle outside the chrome.
+
+---
+
+## 3. Single source of truth: `index.css`
+
+Copy the **entire** global stylesheet from a reference app’s **`src/index.css`** when bootstrapping a new tool. Below is the **canonical structure** Macro Counter uses; keep it in sync when the reference changes.
+
+**Must include:**
+
+- `@theme { ... }` with **`--color-fg`** and all surface tokens; default accent = orange.
+- **`html[data-theme="light"] { ... }`** overrides for surfaces + `--color-fg` + light accent fallbacks.
+- **`html[data-theme="light"] .glass`** and **`html[data-theme="light"] .blueprint-bg`** overrides (grid + glass borders track accent).
+- **`body`**: `bg-[var(--color-bg-dark)] text-[var(--color-fg)]`.
+- **`.settings-cog-trigger` / `.settings-cog`** (and light variants) for the header gear (§7).
+- **`.glass`**, **`.accent-glow`**, **`.blueprint-bg`** using **`color-mix(..., var(--color-accent), ...)`**—not fixed `#ff8800` / `rgba(255,136,0,...)`.
+- Scrollbar rules using **`var(--color-accent)`** and **`var(--color-accent-hover)`**.
+
+**Do not** paste a shortened “legacy” block that still uses `orange-glow`, `text-white` on `body`, or hard-coded orange RGBA in `.glass` / `.blueprint-bg`.
+
+---
+
+## 4. Color tokens — when to use what
 
 | Token | Role |
 |--------|------|
-| **`--color-bg-dark`** | Full page background + **inner wells** inside cards (nested panels, empty states) |
-| **`--color-chrome-bar`** | **`<header>`** and optional **footer** strip (same hex family as card-dark) |
-| **`--color-card-dark`** | Used inside `.glass` mix; don’t hard-code `#323d44` in new code — use tokens |
-| **`--color-surface-deep`** | Scrollbar track, deepest modal / inset areas |
-| **`--color-accent`** / **`--color-accent-hover`** | Primary actions, links, focus rings |
+| **`--color-bg-dark`** | Full page background + **inner wells** inside cards (nested panels, empty states). In light theme this is still the variable name but holds the **light** page fill. |
+| **`--color-chrome-bar`** | **`<header>`** and **footer** strip |
+| **`--color-card-dark`** | Mixed into `.glass`; avoid hard-coding `#323d44` |
+| **`--color-surface`**, **`--color-surface-deep`** | Inputs, secondary buttons, scroll track, deep insets |
+| **`--color-accent`**, **`--color-accent-hover`** | Primary actions, links, focus rings, scrollbar thumb; **set at runtime** from accent preset + theme (§6) |
 | **`--color-text-light`** | Secondary labels, helper text |
-| **`--color-panel-hover`** | Hover state for controls sitting on `bg-dark` |
+| **`--color-panel-hover`** | Hover for controls on surfaces |
+| **`--color-fg`** | Primary text and icons on backgrounds (use **`text-fg`** in Tailwind where `@theme` exposes it) |
 
-**Borders:** prefer `border-[#ff8800]/10` on outer glass, `border-[#ff8800]/20` on interactive chips/buttons (matches reference apps).
+**Borders:** `border-[var(--color-accent)]/10` on outer glass and nested wells; `border-[var(--color-accent)]/20` on interactive chips and inputs.
 
-**Canvas / SVG accents:** `#ff8800` is the same as `--color-accent`.
+**SVG / charts:** use `var(--color-accent)` (or the macro ring pattern in Macro Counter) so accents follow the preset.
 
 ---
 
-## 4. Page structure (required DOM shape)
+## 5. Theme & accent (behavior)
 
-This is the **canonical shell**. Numbers map to the checklist in §7.
+### 5.1 DOM contract
+
+- **Light mode:** `document.documentElement.setAttribute('data-theme', 'light')`. Omit or use dark as default for **dark** UI.
+- **Accent:** `document.documentElement.style.setProperty('--color-accent', '<hex>')` and same for `--color-accent-hover`, chosen from the active preset and current theme (each preset defines **dark** and **light** hex pairs for contrast).
+
+### 5.2 Presets (fixed set)
+
+All toolbox apps should expose the **same** five presets with the **same ids** so UX and copy stay predictable:
+
+| `id` | Label | Purpose |
+|------|--------|---------|
+| `orange` | Orange | Default belt look |
+| `cyan` | Cyan | |
+| `violet` | Violet | |
+| `green` | Green | |
+| `rose` | Rose | |
+
+Each preset row in code holds **four** hex values: **`darkAccent`**, **`darkHover`**, **`lightAccent`**, **`lightHover`**. Light theme uses the latter two; dark uses the former two.
+
+### 5.3 localStorage (cross-app consistency)
+
+Reference implementation (Macro Counter) uses:
+
+| Key | Values |
+|-----|--------|
+| `macrocounter-theme` | `light` \| `dark` |
+| `macrocounter-accent` | preset `id` (e.g. `orange`) |
+
+For a **shared belt** across multiple apps in the same product, **prefer one pair of keys** everywhere (e.g. `toolbox-theme` / `toolbox-accent`) so preferences survive as users move between tools. If you keep app-prefixed keys, document them per repo and accept that settings won’t transfer.
+
+### 5.4 React shell (reference pattern)
+
+- **`ThemeProvider`** wraps the router (or root). It:
+  - Reads / writes theme + accent id from `localStorage`.
+  - On change, calls **`applyDomTheme`** + **`applyAccentCssVars(theme, accentId)`** (set `data-theme` and `--color-accent*` on `document.documentElement`).
+- **`useTheme()`** returns `{ theme, setTheme, toggleTheme, accentId, setAccentId }`.
+- Export **`ACCENT_PRESETS`**, **`getAccentPreset`**, and the small **`apply*`** helpers from a single module (e.g. `theme.tsx`) so **Settings** and tests stay aligned.
+
+### 5.5 First paint (no flash)
+
+Add a **synchronous** inline script in **`index.html`** `<head>` **before** CSS/JS loads that:
+
+1. Reads stored theme; if `light`, sets `data-theme="light"`.
+2. Reads stored accent id; maps id → four hex values; sets `--color-accent` and `--color-accent-hover` for the current theme branch.
+
+The hex map in the script **must** stay in lockstep with **`ACCENT_PRESETS`** in TypeScript. When you add a preset, update **both**.
+
+---
+
+## 6. Settings UI (raised cog + modal)
+
+### 6.1 Header placement
+
+- **Primary shell:** `header` is **`flex items-center justify-between gap-4`** with the **tool title** on the left and **`SettingsMenu`** on the right. Same horizontal padding as before (`px-4 md:px-8`, `py-4`, `mb-5`, chrome bar, bottom border).
+- **Secondary pages** (e.g. terms): left group = back link + title; **right** = **`SettingsMenu`** (same justify-between row).
+
+Do **not** use a fixed-position theme control outside the header; it breaks alignment with the belt.
+
+### 6.2 Raised cog (markup + CSS)
+
+- Trigger is a **round** hit target (`h-11 w-11`, `rounded-full`), **no** filled tile, **no** border box.
+- Icon: Lucide **`Settings`**, class **`settings-cog`**, larger than default (`h-7 w-7` / `sm:h-8 sm:w-8`), **`strokeWidth` ~ 1.85**.
+- Parent button class **`settings-cog-trigger`**; CSS in `index.css` applies:
+  - Stacked **drop-shadows** (top highlight + bottom shadow) for a **dimensional** gear.
+  - **Hover:** color → `var(--color-accent)`, slightly stronger shadow.
+  - **Active:** slight press + flatter shadow.
+  - **`html[data-theme="light"]`** overrides for shadows (lighter UI chrome).
+
+Focus: **`focus-visible:ring-2`** on accent with **`ring-offset-[var(--color-bg-dark)]`** (offset follows page background in both themes).
+
+### 6.3 Modal contents
+
+- **Backdrop** `z-[70]` (below app disclaimer if present at `z-[100]`).
+- Sections: **Theme** (Dark / Light, two large buttons; selected uses `bg-[var(--color-accent)] text-white`).
+- **Accent color:** one control per preset (swatch + label); selected state uses **ring** on `var(--color-accent)`.
+- **Done** closes; backdrop click + **Escape** close; lock **body** scroll while open.
+
+Copy **`SettingsMenu.tsx`** (or equivalent) from the reference app and only change strings if needed.
+
+---
+
+## 7. Page structure (required DOM shape)
 
 ```
-┌─────────────────────────────────────────────┐
-│ ① Root: min-h-screen + bg-dark + blueprint-bg │
-│ ┌─────────────────────────────────────────┐ │
-│ │ ② Header: chrome-bar, px/py, mb-5, shadow │ │
-│ │    h1: accent, brand-font, text-2xl …    │ │
-│ └─────────────────────────────────────────┘ │
-│ ┌─────────────────────────────────────────┐ │
-│ │ ③ Main: grid gap-6, px/pt/pb (see below) │ │
-│ │ ┌─────────────────────────────────────┐ │ │
-│ │ │ ④ Section.card (glass + orange-glow) │ │ │
-│ │ │   row: title mb-6 + optional actions │ │ │
-│ │ │   …your tool content…                │ │ │
-│ │ └─────────────────────────────────────┘ │ │
-│ │   (repeat ④ for more cards)              │ │
-│ └─────────────────────────────────────────┘ │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ ① Root: min-h-screen + bg-dark + text-fg + blueprint-bg      │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ ② Header: chrome-bar, flex justify-between, title | ⚙    │ │
+│ └─────────────────────────────────────────────────────────┘ │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ ③ Main: grid gap-6, px/pt/pb                            │ │
+│ │ ┌───────────────────────────────────────────────────┐ │ │
+│ │ │ ④ Section: glass + accent-glow + border accent/10 │ │ │
+│ │ └───────────────────────────────────────────────────┘ │ │
+│ └─────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### ① Root wrapper
 
 ```tsx
-<div className="min-h-screen bg-[var(--color-bg-dark)] text-white font-sans blueprint-bg">
+<div className="min-h-screen bg-[var(--color-bg-dark)] text-fg font-sans blueprint-bg">
 ```
 
-### ② App header (tool title)
-
-Must match **horizontal padding** of the main column so the title lines up with cards.
+### ② App header (tool title + settings)
 
 ```tsx
-<header className="bg-[var(--color-chrome-bar)] px-4 py-4 md:px-8 mb-5 shadow-md border-b border-[var(--color-accent)]/20">
-  <h1 className="text-2xl font-semibold tracking-tight text-[var(--color-accent)] brand-font leading-tight">
+<header className="mb-5 flex items-center justify-between gap-4 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
+  <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
     Your Tool Name
   </h1>
+  <SettingsMenu />
 </header>
 ```
-
-- **`py-4`**: vertical size of the bar (not `py-2` — too shallow).
-- **`mb-5`**: space before main content (do **not** use `mb-8` unless you intentionally want a looser toolbox).
-- **`md:px-8`**: must match main content `md:px-8`.
 
 ### ③ Main content column
 
 ```tsx
-<div className="grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5">
+<main className="grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5">
   {/* sections */}
-</div>
+</main>
 ```
 
-- **`gap-6`**: vertical rhythm between stacked cards.
-- **`pt-3` / `md:pt-5`**: tight band under header (paired with `mb-5` on header).
-
-### ④ Primary card (one feature block)
+### ④ Primary card
 
 ```tsx
-<section className="glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow">
-  <div className="flex justify-between items-center mb-6">
-    <h2 className="text-xl font-semibold text-white brand-font">Panel title</h2>
-    {/* optional right-side actions */}
+<section className="glass rounded-2xl border border-[var(--color-accent)]/10 p-6 shadow-lg accent-glow">
+  <div className="mb-6 flex items-center justify-between">
+    <h2 className="text-xl font-semibold text-fg brand-font">Panel title</h2>
   </div>
-  {/* body: use bg-[var(--color-bg-dark)] for nested wells */}
+  {/* nested wells: bg-[var(--color-bg-dark)] border-[var(--color-accent)]/10 */}
 </section>
 ```
 
-- Use **`<section>`** for each major card (semantics + consistency).
-- **Section title row:** `mb-6` below the title row before the first body control.
-
-### Nested panels inside a card (wells)
-
-Same pattern as Macro “Daily Totals” inner tiles:
+### Nested wells
 
 ```tsx
-<div className="rounded-xl border border-[#ff8800]/10 bg-[var(--color-bg-dark)] p-4 sm:p-5">
-```
-
-### Icon / circular controls (Form Analyzer pattern)
-
-```tsx
-<label className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20">
+<div className="rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-4 sm:p-5">
 ```
 
 ---
 
-## 5. Typography rules
+## 8. Typography
 
 | Element | Classes |
 |---------|---------|
 | App title (`h1`) | `text-2xl font-semibold tracking-tight leading-tight text-[var(--color-accent)] brand-font` |
-| Card title (`h2`) | `text-xl font-semibold text-white brand-font` |
-| Subheading (`h3`) | `text-base font-semibold text-white brand-font` (if needed) |
-| Body on dark | default `text-white`; muted → `text-[var(--color-text-light)]` |
+| Card title (`h2`) | `text-xl font-semibold text-fg brand-font` |
+| Subheading (`h3`) | `text-base font-semibold text-fg brand-font` |
+| Muted | `text-[var(--color-text-light)]` |
+| Primary buttons on accent fill | `bg-[var(--color-accent)] text-white` (and `hover:bg-[var(--color-accent-hover)]`) |
 
 ---
 
-## 6. Optional: secondary header (e.g. terms / back link)
-
-Same chrome bar; often **`mb-0`** when the page is full-height with its own `main`:
+## 9. Optional: secondary header (terms / back)
 
 ```tsx
-<header className="flex flex-wrap items-center gap-4 bg-[var(--color-chrome-bar)] px-4 py-4 md:px-8 mb-0 shadow-md border-b border-[var(--color-accent)]/20">
-  {/* back link + h1 */}
+<header className="mb-0 flex flex-wrap items-center justify-between gap-4 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
+  <div className="flex min-w-0 flex-wrap items-center gap-4">
+    {/* back link + h1 */}
+  </div>
+  <SettingsMenu />
 </header>
 ```
 
-Footer strip (disclaimer, etc.):
+Footer:
 
 ```tsx
 <footer className="border-t border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-6 py-4">
@@ -241,48 +239,40 @@ Footer strip (disclaimer, etc.):
 
 ---
 
-## 7. New project checklist
+## 10. New project checklist (belt-aligned)
 
-1. [ ] Add **Tailwind v4** + **`@tailwindcss/vite`**, wire plugin in `vite.config.ts`.
-2. [ ] Paste **§2** into global CSS and import from entry.
-3. [ ] Root div: **`min-h-screen bg-[var(--color-bg-dark)] text-white font-sans blueprint-bg`**.
-4. [ ] Header: **`bg-[var(--color-chrome-bar)] px-4 py-4 md:px-8 mb-5 shadow-md border-b border-[var(--color-accent)]/20`** + **`h1`** classes from **§5**.
-5. [ ] Main: **`grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5`**.
-6. [ ] Each tool panel: **`glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow`** with title row **`mb-6`**.
-7. [ ] Nested content blocks: **`bg-[var(--color-bg-dark)]`** + **`border-[#ff8800]/10`** (or `/20` for controls).
-8. [ ] Do **not** invent new greys — use **§3** tokens only.
-9. [ ] `index.html`: viewport meta + `lang="en"` (match reference `index.html`).
+1. [ ] Tailwind v4 + `@tailwindcss/vite`, plugin in `vite.config.ts`.
+2. [ ] Copy **`src/index.css`** from reference (full file: theme, light overrides, `.settings-cog*`, `.glass`, `.accent-glow`, `.blueprint-bg`, scrollbars).
+3. [ ] Copy **`theme.tsx`** (or merge `ThemeProvider`, `ACCENT_PRESETS`, `applyAccentCssVars`, `applyDomTheme`).
+4. [ ] Copy **`SettingsMenu.tsx`**; wrap app with **`ThemeProvider`** in `main.tsx`.
+5. [ ] Add **`index.html`** inline script for theme + accent (§5.5); keep hex map in sync with **`ACCENT_PRESETS`**.
+6. [ ] Root: **`min-h-screen bg-[var(--color-bg-dark)] text-fg font-sans blueprint-bg`**.
+7. [ ] Header: **flex justify-between** + **`SettingsMenu`** + classes from §7.
+8. [ ] Cards: **`glass`**, **`accent-glow`**, **`border-[var(--color-accent)]/10`**; no **`orange-glow`** or **`#ff8800`** in new code.
+9. [ ] Use **`text-fg`** for primary copy; **`text-white`** only on accent-filled buttons.
+10. [ ] Prefer **`toolbox-theme` / `toolbox-accent`** (or document shared keys) if multiple apps should share one user preference.
 
 ---
 
-## 8. Reference implementation in this repo
+## 11. Reference files (Macro Counter)
 
 | File | What to mirror |
 |------|----------------|
-| `src/index.css` | Canonical tokens + `.glass` / `.blueprint-bg` |
-| `src/App.tsx` | Shell + first card structure |
-| `desired_format/src/App.tsx` | Multi-card layout, inner wells, modals |
-| `desired_format/src/TermsPage.tsx` | Secondary header + glass sections |
-| `desired_format/src/Disclaimer.tsx` | Footer chrome + modal framing |
+| `src/index.css` | Tokens, light theme, glass/accent-glow/blueprint, settings cog CSS |
+| `src/theme.tsx` | `ACCENT_PRESETS`, storage keys, `ThemeProvider`, `applyAccentCssVars` |
+| `src/SettingsMenu.tsx` | Raised cog + modal (theme + accent) |
+| `src/main.tsx` | `ThemeProvider` wrapping router |
+| `index.html` | Inline first-paint script |
+| `src/App.tsx` | Shell: root, header with `SettingsMenu`, main grid, cards |
+| `src/TermsPage.tsx` | Secondary header + `SettingsMenu` |
+| `src/Disclaimer.tsx` | Modal framing uses `accent-glow`, `border-[var(--color-accent)]/...` |
 
-When in doubt, **diff your shell classes** against `src/App.tsx` lines **187–195** (root + header + main opener).
-
----
-
-## 9. Version
-
-Spec aligned with **Form Analyzer** repo layout as of the commit that introduced **`--color-chrome-bar`**, **`color-mix` glass**, and header spacing **`mb-5` / `pt-3` / `md:pt-5`**. If you change the reference apps, update **§2** and **§4** here to stay the single spec.
+When in doubt, **diff class names** against `App.tsx` shell and **`index.css`** tokens.
 
 ---
 
-## 10. Sub-path deployment (`/formanalyzer/`)
+## 12. Version
 
-When deploying this app under a sub-folder (for example `https://maxmvs.com/formanalyzer/`), use these rules so JS/CSS/favicon paths do not resolve to the domain root:
+Spec updated for **belt identity**: dynamic **accent** (`--color-accent`), **light theme** (`data-theme="light"`, `--color-fg`), **`accent-glow`** + **`color-mix`** glass/grid, **settings** (raised cog + modal), and **no hard-coded orange** in component borders. Aligns with Macro Counter as of the commit that introduced **`SettingsMenu`**, **`theme.tsx`**, and the expanded **`index.css`**.
 
-1. In `vite.config.ts`, set:
-   - `base: '/formanalyzer/'`
-2. Put static assets (like the favicon) in `public/`.
-3. In `index.html`, reference the favicon as:
-   - `<link rel="icon" type="image/svg+xml" href="/favicon.svg" />`
-
-Vite rewrites this correctly for production so generated assets are loaded from `/formanalyzer/...` instead of `/...`.
+When reference apps change, update **§3**, **§11**, and the **checklist** so this file stays the single spec.

@@ -5,10 +5,42 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Form Analyzer</title>
+    <script>
+      (function () {
+        var THEME_KEY = 'toolbox-theme';
+        var ACCENT_KEY = 'toolbox-accent';
+        var presets = {
+          orange: { d: '#ff8800', dh: '#e67a00', l: '#ea5800', lh: '#c2410c' },
+          cyan: { d: '#22d3ee', dh: '#06b6d4', l: '#0891b2', lh: '#0e7490' },
+          violet: { d: '#a78bfa', dh: '#8b5cf6', l: '#7c3aed', lh: '#6d28d9' },
+          green: { d: '#34d399', dh: '#10b981', l: '#059669', lh: '#047857' },
+          rose: { d: '#fb7185', dh: '#f43f5e', l: '#e11d48', lh: '#be123c' },
+        };
+        try {
+          if (localStorage.getItem(THEME_KEY) === 'light') {
+            document.documentElement.setAttribute('data-theme', 'light');
+          }
+        } catch (e) {}
+        var id = 'orange';
+        try {
+          var stored = localStorage.getItem(ACCENT_KEY);
+          if (stored && presets[stored]) id = stored;
+        } catch (e) {}
+        var p = presets[id];
+        var light = false;
+        try {
+          light = localStorage.getItem(THEME_KEY) === 'light';
+        } catch (e) {}
+        var root = document.documentElement;
+        if (p) {
+          root.style.setProperty('--color-accent', light ? p.l : p.d);
+          root.style.setProperty('--color-accent-hover', light ? p.lh : p.dh);
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

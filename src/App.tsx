@@ -7,6 +7,7 @@ import {
   useState,
   useRef,
   useEffect,
+  useLayoutEffect,
   ChangeEvent,
   PointerEvent as ReactPointerEvent,
 } from 'react';
@@ -24,11 +25,12 @@ import {
   ZoomOut,
   Camera,
   Image as ImageGalleryIcon,
+  Images,
   Video,
-  Link2,
-  Unlink2,
 } from 'lucide-react';
 import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
+import SettingsMenu from './SettingsMenu';
+import { useTheme } from './theme';
 
 function pickVideoRecorderMimeType(): string | undefined {
   if (typeof MediaRecorder === 'undefined') return undefined;
@@ -96,6 +98,7 @@ function clamp(value: number, min: number, max: number) {
 }
 
 type AppliedZoomMap = {x: number; y: number; s: number};
+type ViewportTarget = 'primary' | 'compare';
 
 /** Media/content coordinates → overlay (viewport) pixels — identity when not zoomed. */
 function contentToOverlay(px: number, py: number, applied: AppliedZoomMap | null) {
@@ -110,6 +113,7 @@ function overlayToContent(ox: number, oy: number, applied: AppliedZoomMap | null
 }
 
 export default function App() {
+  const { accentId } = useTheme();
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [compareVideoSrc, setCompareVideoSrc] = useState<string | null>(null);
@@ -143,8 +147,6 @@ export default function App() {
   const [isRecordingVideo, setIsRecordingVideo] = useState(false);
   const [mediaLayoutVersion, setMediaLayoutVersion] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [compareIsPlaying, setCompareIsPlaying] = useState(false);
-  const [isLinkedPlayback, setIsLinkedPlayback] = useState(true);
   const [angle, setAngle] = useState<number | null>(null);
   const [points, setPoints] = useState<{ x: number; y: number }[]>([]);
   const [isDrawing, setIsDrawing] = useState(false);
@@ -184,10 +186,21 @@ export default function App() {
   /** `ruler` = angle tool, `pan` = drag viewport while zoomed */
   type AnalysisTool = 'ruler' | 'pan' | null;
   const [activeTool, setActiveTool] = useState<AnalysisTool>(null);
+  const [activeViewport, setActiveViewport] = useState<ViewportTarget>('primary');
   const [appliedZoom, setAppliedZoom] = useState<{x: number; y: number; s: number} | null>(null);
+  const [compareAppliedZoom, setCompareAppliedZoom] = useState<{x: number; y: number; s: number} | null>(null);
   const [isPanning, setIsPanning] = useState(false);
+  const [isComparePanning, setIsComparePanning] = useState(false);
   const activePointersRef = useRef<Map<number, {clientX: number; clientY: number}>>(new Map());
+  const compareActivePointersRef = useRef<Map<number, {clientX: number; clientY: number}>>(new Map());
   const panDragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    startX: number;
+    startY: number;
+  } | null>(null);
+  const comparePanDragRef = useRef<{
     pointerId: number;
     startClientX: number;
     startClientY: number;
@@ -202,14 +215,27 @@ export default function App() {
     initialX: number;
     initialY: number;
   } | null>(null);
+  const comparePinchRef = useRef<{
+    initialDistance: number;
+    initialScale: number;
+    anchorX: number;
+    anchorY: number;
+    initialX: number;
+    initialY: number;
+  } | null>(null);
 
   const resetZoomAll = () => {
     setAppliedZoom(null);
+    setCompareAppliedZoom(null);
     setActiveTool((prev) => (prev === 'pan' ? null : prev));
     setIsPanning(false);
+    setIsComparePanning(false);
     panDragRef.current = null;
+    comparePanDragRef.current = null;
     pinchRef.current = null;
+    comparePinchRef.current = null;
     activePointersRef.current.clear();
+    compareActivePointersRef.current.clear();
   };
 
   const handleFileUpload = (event: ChangeEvent<HTMLInputElement>) => {
@@ -240,7 +266,8 @@ export default function App() {
         setCompareImageSrc(URL.createObjectURL(file));
         setCompareVideoSrc(null);
       }
-      setCompareIsPlaying(false);
+      setCompareAppliedZoom(null);
+      setIsComparePanning(false);
       setComparePoseKeypoints([]);
     }
     event.target.value = '';
@@ -538,32 +565,25 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    if (videoRef.current) {
-      if (isPlaying) videoRef.current.play();
-      else videoRef.current.pause();
-    }
-  }, [isPlaying]);
+  /** Pause/play in layout phase + parallel play() so both videos begin decoding together. */
+  useLayoutEffect(() => {
+    const primary = videoRef.current;
+    const compare = compareVideoRef.current;
 
-  useEffect(() => {
-    if (isLinkedPlayback) {
-      setCompareIsPlaying(isPlaying);
+    if (!isPlaying) {
+      primary?.pause();
+      if (compareVideoSrc) compare?.pause();
       return;
     }
-    if (compareVideoRef.current) {
-      if (compareIsPlaying) void compareVideoRef.current.play().catch(() => {});
-      else compareVideoRef.current.pause();
-    }
-  }, [compareIsPlaying, isLinkedPlayback, isPlaying]);
 
-  useEffect(() => {
-    if (!isLinkedPlayback || !compareVideoRef.current || !videoRef.current) return;
-    if (isPlaying) {
-      void compareVideoRef.current.play().catch(() => {});
-      return;
+    if (!primary) return;
+
+    if (compareVideoSrc && compare) {
+      void Promise.all([primary.play(), compare.play()]).catch(() => {});
+    } else {
+      void primary.play().catch(() => {});
     }
-    compareVideoRef.current.pause();
-  }, [isPlaying, isLinkedPlayback, compareVideoSrc]);
+  }, [isPlaying, compareVideoSrc]);
 
   useEffect(() => {
     const wrap = mediaWrapRef.current;
@@ -763,9 +783,13 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    const accent =
+      getComputedStyle(document.documentElement).getPropertyValue('--color-accent').trim() ||
+      '#ff8800';
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = '#ff8800'; // Accent color
-    ctx.fillStyle = '#ff8800';
+    ctx.strokeStyle = accent;
+    ctx.fillStyle = accent;
     ctx.lineWidth = 3;
 
     if (points.length > 0) {
@@ -821,13 +845,13 @@ export default function App() {
         
         // Draw angle text
         ctx.font = '20px Space Grotesk';
-        ctx.fillStyle = '#ff8800';
+        ctx.fillStyle = accent;
         ctx.fillText(`${angle?.toFixed(1)}°`, o1.x + 10, o1.y - 10);
       }
       ctx.stroke();
     }
 
-  }, [points, videoSrc, imageSrc, angle, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints]);
+  }, [points, videoSrc, imageSrc, angle, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints, accentId]);
 
   // Compare panel pose overlay (independent from primary zoom/pan)
   useEffect(() => {
@@ -1050,24 +1074,6 @@ export default function App() {
     }
   };
 
-  const toggleLinkedPlayback = () => {
-    setIsLinkedPlayback((prev) => {
-      const next = !prev;
-      if (next) {
-        const compare = compareVideoRef.current;
-        if (compare) {
-          setCompareIsPlaying(isPlaying);
-          if (isPlaying) {
-            void compare.play().catch(() => {});
-          } else {
-            compare.pause();
-          }
-        }
-      }
-      return next;
-    });
-  };
-
   const handleDeleteMeasurements = () => {
     setPoints([]);
     setAngle(null);
@@ -1078,6 +1084,8 @@ export default function App() {
   const isMediaLoaded = !!videoSrc || !!imageSrc;
   const hasCompareMedia = !!compareVideoSrc || !!compareImageSrc;
   const currentScale = appliedZoom?.s ?? 1;
+  const compareScale = compareAppliedZoom?.s ?? 1;
+  const activeScale = activeViewport === 'compare' && hasCompareMedia ? compareScale : currentScale;
 
   const pointerToOverlayPx = (clientX: number, clientY: number, canvas: HTMLCanvasElement) => {
     const rect = canvas.getBoundingClientRect();
@@ -1107,8 +1115,12 @@ export default function App() {
     });
   };
 
-  const getContentSize = () => {
-    const media = (videoRef.current ?? imageRef.current) as HTMLElement | null;
+  const getContentSize = (target: ViewportTarget = 'primary') => {
+    const media = (
+      target === 'primary'
+        ? (videoRef.current ?? imageRef.current)
+        : (compareVideoRef.current ?? compareImageRef.current)
+    ) as HTMLElement | null;
     if (!media) return null;
     const w = media.clientWidth;
     const h = media.clientHeight;
@@ -1125,25 +1137,41 @@ export default function App() {
     return {x: clamp(x, 0, maxX), y: clamp(y, 0, maxY), s};
   };
 
-  const zoomAt = (factor: number, anchorContentX: number, anchorContentY: number) => {
-    const size = getContentSize();
+  const zoomAt = (
+    target: ViewportTarget,
+    factor: number,
+    anchorContentX: number,
+    anchorContentY: number,
+  ) => {
+    const size = getContentSize(target);
     if (!size) return;
-    const prevS = appliedZoom?.s ?? ZOOM_MIN_SCALE;
-    const prevX = appliedZoom?.x ?? 0;
-    const prevY = appliedZoom?.y ?? 0;
+    const zoomState = target === 'primary' ? appliedZoom : compareAppliedZoom;
+    const prevS = zoomState?.s ?? ZOOM_MIN_SCALE;
+    const prevX = zoomState?.x ?? 0;
+    const prevY = zoomState?.y ?? 0;
     const nextS = clamp(prevS * factor, ZOOM_MIN_SCALE, ZOOM_MAX_SCALE);
     if (Math.abs(nextS - ZOOM_MIN_SCALE) < 0.001) {
-      setAppliedZoom(null);
+      if (target === 'primary') {
+        setAppliedZoom(null);
+      } else {
+        setCompareAppliedZoom(null);
+      }
       setActiveTool((prev) => (prev === 'pan' ? null : prev));
       return;
     }
     const nextX = anchorContentX - ((anchorContentX - prevX) * prevS) / nextS;
     const nextY = anchorContentY - ((anchorContentY - prevY) * prevS) / nextS;
-    setAppliedZoom(clampZoomViewport(nextX, nextY, nextS, size.w, size.h));
+    const clamped = clampZoomViewport(nextX, nextY, nextS, size.w, size.h);
+    if (target === 'primary') {
+      setAppliedZoom(clamped);
+    } else {
+      setCompareAppliedZoom(clamped);
+    }
   };
 
   const zoomByButton = (factor: number) => {
-    const size = getContentSize();
+    const target: ViewportTarget = activeViewport === 'compare' && hasCompareMedia ? 'compare' : 'primary';
+    const size = getContentSize(target);
     if (!size) return;
     const centerOverlay = {
       ox: size.w / 2,
@@ -1152,9 +1180,13 @@ export default function App() {
     const anchor = overlayToContent(
       centerOverlay.ox,
       centerOverlay.oy,
-      appliedZoom ? {x: appliedZoom.x, y: appliedZoom.y, s: appliedZoom.s} : null,
+      target === 'primary'
+        ? (appliedZoom ? {x: appliedZoom.x, y: appliedZoom.y, s: appliedZoom.s} : null)
+        : (compareAppliedZoom
+            ? {x: compareAppliedZoom.x, y: compareAppliedZoom.y, s: compareAppliedZoom.s}
+            : null),
     );
-    zoomAt(factor, anchor.x, anchor.y);
+    zoomAt(target, factor, anchor.x, anchor.y);
   };
 
   const toggleRulerTool = () => {
@@ -1178,13 +1210,14 @@ export default function App() {
 
   const handleCanvasPointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
+    setActiveViewport('primary');
     const canvas = canvasRef.current;
     if (!canvas) return;
     const {ox, oy} = pointerToOverlayPx(e.clientX, e.clientY, canvas);
     const {x, y} = pointerToContent(e.clientX, e.clientY, canvas);
 
     activePointersRef.current.set(e.pointerId, {clientX: e.clientX, clientY: e.clientY});
-    const pointers = Array.from(activePointersRef.current.values());
+    const pointers = Array.from(activePointersRef.current.values()) as {clientX: number; clientY: number}[];
     if (e.pointerType === 'touch' && pointers.length >= 2) {
       const p0 = pointers[0]!;
       const p1 = pointers[1]!;
@@ -1249,7 +1282,7 @@ export default function App() {
     }
 
     if (pinchRef.current) {
-      const pointers = Array.from(activePointersRef.current.values());
+      const pointers = Array.from(activePointersRef.current.values()) as {clientX: number; clientY: number}[];
       if (pointers.length >= 2) {
         const p0 = pointers[0]!;
         const p1 = pointers[1]!;
@@ -1320,6 +1353,116 @@ export default function App() {
     setDraggingPointIndex(null);
   };
 
+  const handleCompareCanvasPointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (e.button !== 0) return;
+    setActiveViewport('compare');
+    const canvas = compareCanvasRef.current;
+    if (!canvas) return;
+
+    const pointerToCompareContent = (clientX: number, clientY: number) => {
+      const {ox, oy} = pointerToOverlayPx(clientX, clientY, canvas);
+      const zMap: AppliedZoomMap | null = compareAppliedZoom
+        ? {x: compareAppliedZoom.x, y: compareAppliedZoom.y, s: compareAppliedZoom.s}
+        : null;
+      return overlayToContent(ox, oy, zMap);
+    };
+
+    compareActivePointersRef.current.set(e.pointerId, {clientX: e.clientX, clientY: e.clientY});
+    const pointers = Array.from(compareActivePointersRef.current.values()) as {clientX: number; clientY: number}[];
+    if (e.pointerType === 'touch' && pointers.length >= 2) {
+      const p0 = pointers[0]!;
+      const p1 = pointers[1]!;
+      const anchor = pointerToCompareContent((p0.clientX + p1.clientX) / 2, (p0.clientY + p1.clientY) / 2);
+      const start = compareAppliedZoom ?? {x: 0, y: 0, s: ZOOM_MIN_SCALE};
+      comparePinchRef.current = {
+        initialDistance: Math.hypot(p1.clientX - p0.clientX, p1.clientY - p0.clientY),
+        initialScale: start.s,
+        anchorX: anchor.x,
+        anchorY: anchor.y,
+        initialX: start.x,
+        initialY: start.y,
+      };
+      comparePanDragRef.current = null;
+      setIsComparePanning(false);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if (activeTool === 'pan' && compareScale > ZOOM_MIN_SCALE) {
+      comparePanDragRef.current = {
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startX: compareAppliedZoom?.x ?? 0,
+        startY: compareAppliedZoom?.y ?? 0,
+      };
+      setIsComparePanning(true);
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+  };
+
+  const handleCompareCanvasPointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    const canvas = compareCanvasRef.current;
+    if (!canvas) return;
+    if (compareActivePointersRef.current.has(e.pointerId)) {
+      compareActivePointersRef.current.set(e.pointerId, {clientX: e.clientX, clientY: e.clientY});
+    }
+
+    if (comparePinchRef.current) {
+      const pointers = Array.from(compareActivePointersRef.current.values()) as {clientX: number; clientY: number}[];
+      if (pointers.length >= 2) {
+        const p0 = pointers[0]!;
+        const p1 = pointers[1]!;
+        const distance = Math.hypot(p1.clientX - p0.clientX, p1.clientY - p0.clientY);
+        if (distance > 1) {
+          const size = getContentSize('compare');
+          if (!size) return;
+          const pinch = comparePinchRef.current;
+          const nextS = clamp(
+            pinch.initialScale * (distance / Math.max(1, pinch.initialDistance)),
+            ZOOM_MIN_SCALE,
+            ZOOM_MAX_SCALE,
+          );
+          if (Math.abs(nextS - ZOOM_MIN_SCALE) < 0.001) {
+            setCompareAppliedZoom(null);
+            return;
+          }
+          const nextX = pinch.anchorX - ((pinch.anchorX - pinch.initialX) * pinch.initialScale) / nextS;
+          const nextY = pinch.anchorY - ((pinch.anchorY - pinch.initialY) * pinch.initialScale) / nextS;
+          setCompareAppliedZoom(clampZoomViewport(nextX, nextY, nextS, size.w, size.h));
+        }
+      }
+      return;
+    }
+
+    if (comparePanDragRef.current && comparePanDragRef.current.pointerId === e.pointerId && compareScale > ZOOM_MIN_SCALE) {
+      const size = getContentSize('compare');
+      if (!size) return;
+      const drag = comparePanDragRef.current;
+      const dx = e.clientX - drag.startClientX;
+      const dy = e.clientY - drag.startClientY;
+      setCompareAppliedZoom(
+        clampZoomViewport(drag.startX - dx / compareScale, drag.startY - dy / compareScale, compareScale, size.w, size.h),
+      );
+    }
+  };
+
+  const handleCompareCanvasPointerUp = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    compareActivePointersRef.current.delete(e.pointerId);
+    if (comparePanDragRef.current?.pointerId === e.pointerId) {
+      comparePanDragRef.current = null;
+      setIsComparePanning(false);
+    }
+    if (comparePinchRef.current && compareActivePointersRef.current.size < 2) {
+      comparePinchRef.current = null;
+    }
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore if not captured */
+    }
+  };
+
   const calculateAngle = (pts: { x: number; y: number }[]) => {
     const [p1, p2, p3] = pts;
     const angle1 = Math.atan2(p1.y - p2.y, p1.x - p2.x);
@@ -1329,36 +1472,42 @@ export default function App() {
     setAngle(angle);
   };
 
+  /** Letterboxed media: tall single view; slightly shorter when two-up compare. */
+  const mediaMaxClass = hasCompareMedia
+    ? 'max-h-[min(52dvh,800px)] md:max-h-[min(58dvh,960px)] lg:max-h-[min(56dvh,1040px)]'
+    : 'max-h-[min(82dvh,1200px)] md:max-h-[min(78dvh,1200px)] lg:max-h-[min(76dvh,1280px)]';
+
   return (
-    <div className="min-h-screen bg-[var(--color-bg-dark)] text-white font-sans blueprint-bg">
-      <header className="bg-[var(--color-chrome-bar)] px-4 py-4 md:px-8 mb-5 shadow-md border-b border-[var(--color-accent)]/20">
-        <h1 className="text-2xl font-semibold tracking-tight text-[var(--color-accent)] brand-font leading-tight">
+    <div className="min-h-screen bg-[var(--color-bg-dark)] text-fg font-sans blueprint-bg">
+      <header className="mb-5 flex items-center justify-between gap-4 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
+        <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
           Form Analyzer
         </h1>
+        <SettingsMenu />
       </header>
 
-      <div className="grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5">
-        <section className="glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow">
+      <main className="grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5">
+        <section className="glass p-6 rounded-2xl border border-[var(--color-accent)]/10 shadow-lg accent-glow">
           <div className="flex justify-between items-center mb-6">
-            <h2 className="text-xl font-semibold text-white brand-font">Media Analysis</h2>
+            <h2 className="text-xl font-semibold text-fg brand-font">Media Analysis</h2>
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
                 onClick={openGalleryPicker}
-                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20"
+                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[var(--color-accent)]/20"
                 title="Pick image or video from gallery"
                 aria-label="Pick image or video from gallery"
               >
-                <ImageGalleryIcon className="w-6 h-6 text-[#ff8800]" />
+                <ImageGalleryIcon className="w-6 h-6 text-[var(--color-accent)]" />
               </button>
               <button
                 type="button"
                 onClick={openComparePicker}
-                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20"
+                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[var(--color-accent)]/20"
                 title="Add compare media"
                 aria-label="Add compare media"
               >
-                <ImageGalleryIcon className="w-6 h-6 text-white" />
+                <Images className="w-6 h-6 text-[var(--color-accent)]" />
               </button>
               {hasCompareMedia ? (
                 <button
@@ -1366,9 +1515,10 @@ export default function App() {
                   onClick={() => {
                     setCompareVideoSrc(null);
                     setCompareImageSrc(null);
-                    setCompareIsPlaying(false);
+                    setCompareAppliedZoom(null);
+                    setIsComparePanning(false);
                   }}
-                  className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20 text-red-400"
+                  className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[var(--color-accent)]/20 text-red-400"
                   title="Remove compare media"
                   aria-label="Remove compare media"
                 >
@@ -1414,42 +1564,49 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => void openDeviceCamera()}
-                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20"
+                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[var(--color-accent)]/20"
                 title="Take a photo"
                 aria-label="Take a photo with the camera"
               >
-                <Camera className="w-6 h-6 text-[#ff8800]" />
+                <Camera className="w-6 h-6 text-[var(--color-accent)]" />
               </button>
               <button
                 type="button"
                 onClick={() => void openDeviceVideoRecord()}
-                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[#ff8800]/20"
+                className="cursor-pointer bg-[var(--color-bg-dark)] p-2 rounded-full hover:bg-[var(--color-panel-hover)] transition border border-[var(--color-accent)]/20"
                 title="Record video with the camera"
                 aria-label="Record video with the camera"
               >
-                <Video className="w-6 h-6 text-[#ff8800]" />
+                <Video className="w-6 h-6 text-[var(--color-accent)]" />
               </button>
             </div>
           </div>
 
           {videoSrc ? (
-            <div className="flex w-full min-w-0 flex-col gap-3">
+            <div
+              ref={fullscreenTargetRef}
+              className={`flex w-full min-w-0 flex-col gap-3 ${isFullscreen ? 'h-[100dvh] rounded-none p-2 md:p-3' : ''}`}
+            >
               {/* Tall phone media: no fixed 16:9 box; cap desktop height so the page fits the window */}
               <div
-                ref={fullscreenTargetRef}
-                className={`flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden bg-black ${isFullscreen ? 'h-[100dvh] rounded-none border-0 p-0' : 'rounded-xl border border-[#ff8800]/10 p-2 sm:p-3'}`}
+                className={`flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'min-h-0 flex-1 rounded-none border-0 p-0' : 'min-h-[min(52dvh,560px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
-                <div className={`grid w-full items-center justify-items-center gap-3 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
-                  <div className="flex min-w-0 flex-col gap-2">
+                <div
+                  className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'md:grid-cols-2 md:gap-0' : 'grid-cols-1 gap-0'}`}
+                >
+                  {/* Side-by-side: align portrait media to the inner seam (object-contain letterboxing otherwise sits in the middle). */}
+                  <div
+                    className={`flex min-w-0 flex-col gap-2 ${hasCompareMedia ? 'md:items-end' : 'items-center'}`}
+                  >
                     <div
                       ref={mediaWrapRef}
-                      className={`relative inline-block max-w-full overflow-hidden ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                      className={`relative inline-block min-w-0 max-w-full overflow-hidden ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
                     >
                       <div
                         className={
                           appliedZoom
                             ? 'relative inline-block'
-                            : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`
+                            : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`
                         }
                         style={
                           appliedZoom
@@ -1463,7 +1620,9 @@ export default function App() {
                         <video
                           ref={videoRef}
                           src={videoSrc}
-                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                          preload="auto"
+                          playsInline
+                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
                         />
                       </div>
                       <canvas
@@ -1480,168 +1639,136 @@ export default function App() {
                         onPointerLeave={handleCanvasPointerUp}
                       />
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setIsPlaying(!isPlaying)}
-                        className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
-                        title="Play or pause primary video"
-                        aria-label="Play or pause primary video"
-                      >
-                        {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
-                      </button>
-                      <input
-                        type="range"
-                        min="0"
-                        max={Math.max(duration, currentTime, 0.0001)}
-                        value={Math.min(currentTime, Math.max(duration, currentTime, 0.0001))}
-                        onChange={handleSeek}
-                        step={SLIDER_SCRUB_STEP_SECONDS}
-                        className="w-full accent-[#ff8800]"
-                      />
-                    </div>
-                    <div className="flex items-center justify-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => stepPrimaryFrame(-1)}
-                        disabled={!videoSrc}
-                        className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
-                        title="Step back one frame"
-                        aria-label="Step back one frame"
-                      >
-                        <ChevronLeft className="w-5 h-5" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => stepPrimaryFrame(1)}
-                        disabled={!videoSrc}
-                        className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
-                        title="Step forward one frame"
-                        aria-label="Step forward one frame"
-                      >
-                        <ChevronRight className="w-5 h-5" />
-                      </button>
-                    </div>
                   </div>
                   {hasCompareMedia ? (
-                    <div className="flex min-w-0 flex-col gap-2">
+                    <div className="flex min-w-0 flex-col gap-2 md:items-start">
                       <div
                         ref={compareMediaWrapRef}
-                        className="relative inline-block max-w-full overflow-hidden"
+                        className="relative inline-block min-w-0 max-w-full overflow-hidden"
                       >
-                        {compareVideoSrc ? (
-                          <video
-                            ref={compareVideoRef}
-                            src={compareVideoSrc}
-                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
-                          />
-                        ) : compareImageSrc ? (
-                          <img
-                            ref={compareImageRef}
-                            src={compareImageSrc}
-                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
-                            alt="Compare media"
-                          />
-                        ) : null}
+                        <div
+                          className={
+                            compareAppliedZoom
+                              ? 'relative inline-block'
+                              : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`
+                          }
+                          style={
+                            compareAppliedZoom
+                              ? {
+                                  transform: `translate(${-compareAppliedZoom.x * compareAppliedZoom.s}px, ${-compareAppliedZoom.y * compareAppliedZoom.s}px) scale(${compareAppliedZoom.s})`,
+                                  transformOrigin: '0 0',
+                                }
+                              : undefined
+                          }
+                        >
+                          {compareVideoSrc ? (
+                            <video
+                              ref={compareVideoRef}
+                              src={compareVideoSrc}
+                              preload="auto"
+                              playsInline
+                              className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
+                            />
+                          ) : compareImageSrc ? (
+                            <img
+                              ref={compareImageRef}
+                              src={compareImageSrc}
+                              className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
+                              alt="Compare media"
+                            />
+                          ) : null}
+                        </div>
                         <canvas
                           ref={compareCanvasRef}
-                          className="pointer-events-none absolute inset-0 z-10 h-full w-full touch-none"
-                          style={{touchAction: 'none'}}
+                          className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
+                          style={{
+                            touchAction: 'none',
+                            cursor: isComparePanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : 'default',
+                          }}
+                          onPointerDown={handleCompareCanvasPointerDown}
+                          onPointerMove={handleCompareCanvasPointerMove}
+                          onPointerUp={handleCompareCanvasPointerUp}
+                          onPointerCancel={handleCompareCanvasPointerUp}
+                          onPointerLeave={handleCompareCanvasPointerUp}
                         />
                       </div>
-                      {compareVideoSrc ? (
-                        <div className="flex flex-col gap-2">
-                          <div className="flex items-center gap-2">
-                            {!isLinkedPlayback ? (
-                              <button
-                                type="button"
-                                onClick={() => setCompareIsPlaying((v) => !v)}
-                                className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
-                                title="Play or pause compare video"
-                                aria-label="Play or pause compare video"
-                              >
-                                {compareIsPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
-                              </button>
-                            ) : null}
-                            <input
-                              type="range"
-                              min="0"
-                              max={Math.max(compareDuration, compareCurrentTime, 0.0001)}
-                              value={Math.min(compareCurrentTime, Math.max(compareDuration, compareCurrentTime, 0.0001))}
-                              onChange={handleCompareSeek}
-                              step={SLIDER_SCRUB_STEP_SECONDS}
-                              className="w-full accent-[#ff8800]"
-                            />
-                          </div>
-                          <div className="flex items-center justify-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => stepCompareFrame(-1)}
-                              className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
-                              title="Step back one frame"
-                              aria-label="Step back one frame"
-                            >
-                              <ChevronLeft className="w-5 h-5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => stepCompareFrame(1)}
-                              className="p-1.5 rounded-full hover:bg-[var(--color-panel-hover)]"
-                              title="Step forward one frame"
-                              aria-label="Step forward one frame"
-                            >
-                              <ChevronRight className="w-5 h-5" />
-                            </button>
-                          </div>
-                        </div>
-                      ) : null}
                     </div>
                   ) : null}
                 </div>
               </div>
 
-              <div className="flex flex-col gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
-                {compareVideoSrc ? (
-                  <>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-[var(--color-text-light)]">Compare video timeline</span>
-                      <button
-                        type="button"
-                        onClick={toggleLinkedPlayback}
-                        className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs ${isLinkedPlayback ? 'bg-[#ff8800] text-[var(--color-bg-dark)]' : 'bg-[var(--color-bg-dark)] text-white border border-[#ff8800]/20'}`}
-                        title={isLinkedPlayback ? 'Unlink playback' : 'Link playback'}
-                        aria-label={isLinkedPlayback ? 'Unlink playback' : 'Link playback'}
-                      >
-                        {isLinkedPlayback ? <Link2 className="h-3.5 w-3.5" /> : <Unlink2 className="h-3.5 w-3.5" />}
-                        {isLinkedPlayback ? 'Linked' : 'Unlinked'}
-                      </button>
-                    </div>
-                  </>
-                ) : null}
-                {poseEnabled ? (
-                  <p className="text-xs text-[var(--color-text-light)]">
-                    {poseStatus === 'loading'
-                      ? 'Loading pose model...'
-                      : poseStatus === 'error'
-                        ? 'Pose model failed to load.'
-                        : 'Pose map active: hips, knees, ankles'}
-                  </p>
-                ) : null}
+              <div className="flex flex-col gap-2 rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4">
+                <div className={`grid gap-2 ${compareVideoSrc ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+                  <input
+                    type="range"
+                    min="0"
+                    max={Math.max(duration, currentTime, 0.0001)}
+                    value={Math.min(currentTime, Math.max(duration, currentTime, 0.0001))}
+                    onChange={handleSeek}
+                    step={SLIDER_SCRUB_STEP_SECONDS}
+                    className="w-full accent-[var(--color-accent)]"
+                    aria-label="Primary video position"
+                  />
+                  {compareVideoSrc ? (
+                    <input
+                      type="range"
+                      min="0"
+                      max={Math.max(compareDuration, compareCurrentTime, 0.0001)}
+                      value={Math.min(
+                        compareCurrentTime,
+                        Math.max(compareDuration, compareCurrentTime, 0.0001),
+                      )}
+                      onChange={handleCompareSeek}
+                      step={SLIDER_SCRUB_STEP_SECONDS}
+                      className="w-full accent-[var(--color-accent)]"
+                      aria-label="Compare video position"
+                    />
+                  ) : null}
+                </div>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
+                      onClick={() => setIsPlaying((v) => !v)}
+                      className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                      title={
+                        compareVideoSrc
+                          ? isPlaying
+                            ? 'Pause both videos'
+                            : 'Play both videos'
+                          : isPlaying
+                            ? 'Pause'
+                            : 'Play'
+                      }
+                      aria-label={
+                        compareVideoSrc
+                          ? isPlaying
+                            ? 'Pause both videos'
+                            : 'Play both videos'
+                          : isPlaying
+                            ? 'Pause video'
+                            : 'Play video'
+                      }
+                    >
+                      {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => stepBothFrames(-1)}
                       className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                      title="Step both videos back one frame"
+                      aria-label="Step both videos back one frame"
                     >
-                      <ChevronLeft />
+                      <ChevronLeft className="w-6 h-6" />
                     </button>
                     <button
                       type="button"
                       onClick={() => stepBothFrames(1)}
                       className="p-2 rounded-full hover:bg-[var(--color-panel-hover)]"
+                      title="Step both videos forward one frame"
+                      aria-label="Step both videos forward one frame"
                     >
-                      <ChevronRight />
+                      <ChevronRight className="w-6 h-6" />
                     </button>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -1657,7 +1784,7 @@ export default function App() {
                       type="button"
                       onClick={toggleRulerTool}
                       disabled={!isMediaLoaded}
-                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'ruler' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'ruler' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
                       title="Angle ruler"
                       aria-label="Angle ruler"
                     >
@@ -1667,7 +1794,7 @@ export default function App() {
                       type="button"
                       onClick={() => setPoseEnabled((v) => !v)}
                       disabled={!isMediaLoaded}
-                      className={`rounded-lg border border-[#ff8800]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[#ff8800]' : 'text-white'}`}
+                      className={`rounded-lg border border-[var(--color-accent)]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[var(--color-accent)]' : 'text-fg'}`}
                       title="Toggle BlazePose joints"
                       aria-label="Toggle BlazePose joints"
                     >
@@ -1677,7 +1804,7 @@ export default function App() {
                       type="button"
                       onClick={() => zoomByButton(ZOOM_BUTTON_FACTOR)}
                       disabled={!isMediaLoaded}
-                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-fg`}
                       title="Zoom in"
                       aria-label="Zoom in"
                     >
@@ -1687,7 +1814,7 @@ export default function App() {
                       type="button"
                       onClick={() => zoomByButton(1 / ZOOM_BUTTON_FACTOR)}
                       disabled={!isMediaLoaded}
-                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-fg`}
                       title="Zoom out"
                       aria-label="Zoom out"
                     >
@@ -1696,8 +1823,8 @@ export default function App() {
                     <button
                       type="button"
                       onClick={togglePanTool}
-                      disabled={!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE}
-                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'pan' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
+                      disabled={!isMediaLoaded || activeScale <= ZOOM_MIN_SCALE}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || activeScale <= ZOOM_MIN_SCALE ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'pan' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
                       title="Pan tool"
                       aria-label="Pan tool"
                     >
@@ -1707,48 +1834,42 @@ export default function App() {
                       type="button"
                       onClick={() => void toggleFullscreen()}
                       disabled={!isMediaLoaded}
-                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : 'text-white'}`}
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : 'text-fg'}`}
                       title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
                       aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
                     >
                       {isFullscreen ? <Minimize className="w-6 h-6" /> : <Maximize className="w-6 h-6" />}
                     </button>
-                    {appliedZoom ? (
-                      <button
-                        type="button"
-                        onClick={resetZoomAll}
-                        className="p-2 rounded-full hover:bg-[var(--color-panel-hover)] text-[#ff8800]"
-                        title="Reset zoom"
-                        aria-label="Reset zoom"
-                      >
-                        <ZoomOut className="w-6 h-6" />
-                      </button>
-                    ) : null}
                   </div>
                 </div>
               </div>
             </div>
           ) : imageSrc ? (
-            <div className="flex w-full min-w-0 flex-col gap-3">
+            <div
+              ref={fullscreenTargetRef}
+              className={`flex w-full min-w-0 flex-col gap-3 ${isFullscreen ? 'h-[100dvh] rounded-none p-2 md:p-3' : ''}`}
+            >
               <div
-                ref={fullscreenTargetRef}
-                className={`flex w-full min-h-[12rem] min-w-0 items-center justify-center overflow-hidden bg-black ${isFullscreen ? 'h-[100dvh] rounded-none border-0 p-0' : 'rounded-xl border border-[#ff8800]/10 p-2 sm:p-3'}`}
+                className={`flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'min-h-0 flex-1 rounded-none border-0 p-0' : 'min-h-[min(52dvh,560px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
-                <div className={`grid w-full items-center justify-items-center gap-3 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
-                  <div
-                    ref={mediaWrapRef}
-                    className={`relative inline-block max-w-full overflow-hidden ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
-                  >
+                <div
+                  className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'md:grid-cols-2 md:gap-0' : 'grid-cols-1 gap-0'}`}
+                >
+                  <div className={`min-w-0 ${hasCompareMedia ? 'md:flex md:flex-col md:items-end' : 'flex flex-col items-center'}`}>
+                    <div
+                      ref={mediaWrapRef}
+                      className={`relative inline-block min-w-0 max-w-full overflow-hidden ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
+                    >
                     <div
                       className={
-                        appliedZoom
+                          compareAppliedZoom
                           ? 'relative inline-block'
-                          : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`
+                          : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`
                       }
                       style={
-                        appliedZoom
+                          compareAppliedZoom
                           ? {
-                              transform: `translate(${-appliedZoom.x * appliedZoom.s}px, ${-appliedZoom.y * appliedZoom.s}px) scale(${appliedZoom.s})`,
+                                transform: `translate(${-compareAppliedZoom.x * compareAppliedZoom.s}px, ${-compareAppliedZoom.y * compareAppliedZoom.s}px) scale(${compareAppliedZoom.s})`,
                               transformOrigin: '0 0',
                             }
                           : undefined
@@ -1757,7 +1878,7 @@ export default function App() {
                       <img
                         ref={imageRef}
                         src={imageSrc}
-                        className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
+                        className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
                         alt="Uploaded"
                         onLoad={() => setPoints([])}
                       />
@@ -1776,36 +1897,65 @@ export default function App() {
                       onPointerLeave={handleCanvasPointerUp}
                     />
                   </div>
+                  </div>
                   {hasCompareMedia ? (
+                    <div className={`min-w-0 ${hasCompareMedia ? 'md:flex md:flex-col md:items-start' : ''}`}>
                     <div
                       ref={compareMediaWrapRef}
-                      className="relative inline-block max-w-full overflow-hidden"
+                      className="relative inline-block min-w-0 max-w-full overflow-hidden"
                     >
-                      {compareVideoSrc ? (
-                        <video
-                          ref={compareVideoRef}
-                          src={compareVideoSrc}
-                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
-                        />
-                      ) : compareImageSrc ? (
-                        <img
-                          ref={compareImageRef}
-                          src={compareImageSrc}
-                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : 'max-h-[min(82dvh,920px)] md:max-h-[min(60vh,680px)] lg:max-h-[min(64vh,740px)]'}`}
-                          alt="Compare media"
-                        />
-                      ) : null}
+                      <div
+                        className={
+                          appliedZoom
+                            ? 'relative inline-block'
+                            : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`
+                        }
+                        style={
+                          appliedZoom
+                            ? {
+                                transform: `translate(${-appliedZoom.x * appliedZoom.s}px, ${-appliedZoom.y * appliedZoom.s}px) scale(${appliedZoom.s})`,
+                                transformOrigin: '0 0',
+                              }
+                            : undefined
+                        }
+                      >
+                        {compareVideoSrc ? (
+                          <video
+                            ref={compareVideoRef}
+                            src={compareVideoSrc}
+                            preload="auto"
+                            playsInline
+                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
+                          />
+                        ) : compareImageSrc ? (
+                          <img
+                            ref={compareImageRef}
+                            src={compareImageSrc}
+                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[calc(100dvh-12rem)]' : mediaMaxClass}`}
+                            alt="Compare media"
+                          />
+                        ) : null}
+                      </div>
                       <canvas
                         ref={compareCanvasRef}
-                        className="pointer-events-none absolute inset-0 z-10 h-full w-full touch-none"
-                        style={{touchAction: 'none'}}
+                        className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
+                        style={{
+                          touchAction: 'none',
+                          cursor: isComparePanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : 'default',
+                        }}
+                        onPointerDown={handleCompareCanvasPointerDown}
+                        onPointerMove={handleCompareCanvasPointerMove}
+                        onPointerUp={handleCompareCanvasPointerUp}
+                        onPointerCancel={handleCompareCanvasPointerUp}
+                        onPointerLeave={handleCompareCanvasPointerUp}
                       />
+                    </div>
                     </div>
                   ) : null}
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center justify-end gap-2 rounded-xl border border-[#ff8800]/10 bg-[var(--color-surface-deep)] p-3 sm:p-4">
+              <div className="flex flex-wrap items-center justify-end gap-2 rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4">
                 <button
                   type="button"
                   onClick={handleDeleteMeasurements}
@@ -1818,7 +1968,7 @@ export default function App() {
                   type="button"
                   onClick={toggleRulerTool}
                   disabled={!isMediaLoaded}
-                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'ruler' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'ruler' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
                   title="Angle ruler"
                   aria-label="Angle ruler"
                 >
@@ -1828,7 +1978,7 @@ export default function App() {
                   type="button"
                   onClick={() => setPoseEnabled((v) => !v)}
                   disabled={!isMediaLoaded}
-                  className={`rounded-lg border border-[#ff8800]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[#ff8800]' : 'text-white'}`}
+                  className={`rounded-lg border border-[var(--color-accent)]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[var(--color-accent)]' : 'text-fg'}`}
                   title="Toggle BlazePose joints"
                   aria-label="Toggle BlazePose joints"
                 >
@@ -1838,7 +1988,7 @@ export default function App() {
                   type="button"
                   onClick={() => zoomByButton(ZOOM_BUTTON_FACTOR)}
                   disabled={!isMediaLoaded}
-                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-fg`}
                   title="Zoom in"
                   aria-label="Zoom in"
                 >
@@ -1848,7 +1998,7 @@ export default function App() {
                   type="button"
                   onClick={() => zoomByButton(1 / ZOOM_BUTTON_FACTOR)}
                   disabled={!isMediaLoaded}
-                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-white`}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-fg`}
                   title="Zoom out"
                   aria-label="Zoom out"
                 >
@@ -1857,8 +2007,8 @@ export default function App() {
                 <button
                   type="button"
                   onClick={togglePanTool}
-                  disabled={!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE}
-                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || currentScale <= ZOOM_MIN_SCALE ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'pan' ? 'text-[#ff8800] bg-[var(--color-panel-hover)]' : 'text-white'}`}
+                  disabled={!isMediaLoaded || activeScale <= ZOOM_MIN_SCALE}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded || activeScale <= ZOOM_MIN_SCALE ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'pan' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
                   title="Pan tool"
                   aria-label="Pan tool"
                 >
@@ -1868,28 +2018,17 @@ export default function App() {
                   type="button"
                   onClick={() => void toggleFullscreen()}
                   disabled={!isMediaLoaded}
-                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : 'text-white'}`}
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : 'text-fg'}`}
                   title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
                   aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
                 >
                   {isFullscreen ? <Minimize className="w-6 h-6" /> : <Maximize className="w-6 h-6" />}
                 </button>
-                {appliedZoom ? (
-                  <button
-                    type="button"
-                    onClick={resetZoomAll}
-                    className="p-2 rounded-full hover:bg-[var(--color-panel-hover)] text-[#ff8800]"
-                    title="Reset zoom"
-                    aria-label="Reset zoom"
-                  >
-                    <ZoomOut className="w-6 h-6" />
-                  </button>
-                ) : null}
               </div>
             </div>
           ) : (
-            <div className="flex flex-col items-center justify-center h-64 rounded-xl border-2 border-dashed border-[#ff8800]/20 bg-[var(--color-bg-dark)] p-8 text-center">
-              <div className="mb-4 flex gap-3 text-[#ff8800]/50">
+            <div className="flex flex-col items-center justify-center h-64 rounded-xl border-2 border-dashed border-[var(--color-accent)]/20 bg-[var(--color-bg-dark)] p-8 text-center">
+              <div className="mb-4 flex gap-3 text-[var(--color-accent)]/50">
                 <ImageGalleryIcon className="h-10 w-10" />
                 <Camera className="h-10 w-10" />
                 <Video className="h-10 w-10" />
@@ -1902,13 +2041,13 @@ export default function App() {
         </section>
 
         {angle !== null && (
-          <section className="glass p-6 rounded-2xl border border-[#ff8800]/10 shadow-lg orange-glow">
-            <h2 className="text-xl font-semibold text-white brand-font mb-2">Analysis Result</h2>
-            <p className="text-sm text-white/70 mb-1">Measured Angle</p>
-            <p className="text-5xl font-bold text-[#ff8800]">{angle.toFixed(1)}°</p>
+          <section className="glass p-6 rounded-2xl border border-[var(--color-accent)]/10 shadow-lg accent-glow">
+            <h2 className="mb-2 text-xl font-semibold text-fg brand-font">Analysis Result</h2>
+            <p className="mb-1 text-sm text-[var(--color-text-light)]">Measured Angle</p>
+            <p className="text-5xl font-bold text-[var(--color-accent)]">{angle.toFixed(1)}°</p>
           </section>
         )}
-      </div>
+      </main>
 
       {cameraModalOpen && (
         <div
@@ -1917,11 +2056,11 @@ export default function App() {
           aria-modal="true"
           aria-labelledby="camera-dialog-title"
         >
-          <div className="glass orange-glow w-full max-w-lg rounded-2xl border border-[#ff8800]/10 p-4 shadow-xl">
-            <h3 id="camera-dialog-title" className="mb-3 text-lg font-semibold text-white brand-font">
+          <div className="glass accent-glow w-full max-w-lg rounded-2xl border border-[var(--color-accent)]/10 p-4 shadow-xl">
+            <h3 id="camera-dialog-title" className="mb-3 text-lg font-semibold text-fg brand-font">
               Camera
             </h3>
-            <div className="overflow-hidden rounded-xl border border-[#ff8800]/10 bg-black">
+            <div className="overflow-hidden rounded-xl border border-[var(--color-accent)]/10 bg-black">
               <video
                 ref={cameraPreviewRef}
                 autoPlay
@@ -1939,14 +2078,14 @@ export default function App() {
               <button
                 type="button"
                 onClick={closeCameraModal}
-                className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-bg-dark)] px-4 py-2 text-sm hover:bg-[var(--color-panel-hover)]"
+                className="rounded-lg border border-[var(--color-accent)]/20 bg-[var(--color-bg-dark)] px-4 py-2 text-sm hover:bg-[var(--color-panel-hover)]"
               >
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={capturePhotoFromCamera}
-                className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-[var(--color-bg-dark)] hover:bg-[var(--color-accent-hover)]"
+                className="rounded-lg border border-[var(--color-accent)]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white hover:bg-[var(--color-accent-hover)]"
               >
                 Capture photo
               </button>
@@ -1962,11 +2101,11 @@ export default function App() {
           aria-modal="true"
           aria-labelledby="video-record-dialog-title"
         >
-          <div className="glass orange-glow w-full max-w-lg rounded-2xl border border-[#ff8800]/10 p-4 shadow-xl">
-            <h3 id="video-record-dialog-title" className="mb-3 text-lg font-semibold text-white brand-font">
+          <div className="glass accent-glow w-full max-w-lg rounded-2xl border border-[var(--color-accent)]/10 p-4 shadow-xl">
+            <h3 id="video-record-dialog-title" className="mb-3 text-lg font-semibold text-fg brand-font">
               Record video
             </h3>
-            <div className="overflow-hidden rounded-xl border border-[#ff8800]/10 bg-black">
+            <div className="overflow-hidden rounded-xl border border-[var(--color-accent)]/10 bg-black">
               <video
                 ref={videoRecordPreviewRef}
                 autoPlay
@@ -1987,7 +2126,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={closeVideoRecordModal}
-                className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-bg-dark)] px-4 py-2 text-sm hover:bg-[var(--color-panel-hover)]"
+                className="rounded-lg border border-[var(--color-accent)]/20 bg-[var(--color-bg-dark)] px-4 py-2 text-sm hover:bg-[var(--color-panel-hover)]"
               >
                 Cancel
               </button>
@@ -1995,7 +2134,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={startVideoRecording}
-                  className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-[var(--color-bg-dark)] hover:bg-[var(--color-accent-hover)]"
+                  className="rounded-lg border border-[var(--color-accent)]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white hover:bg-[var(--color-accent-hover)]"
                 >
                   Start recording
                 </button>
@@ -2003,7 +2142,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={stopVideoRecordingAndSave}
-                  className="rounded-lg border border-[#ff8800]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-[var(--color-bg-dark)] hover:bg-[var(--color-accent-hover)]"
+                  className="rounded-lg border border-[var(--color-accent)]/20 bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white hover:bg-[var(--color-accent-hover)]"
                 >
                   Stop and use clip
                 </button>
@@ -2015,3 +2154,5 @@ export default function App() {
     </div>
   );
 }
+
+

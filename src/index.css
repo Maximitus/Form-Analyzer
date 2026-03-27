@@ -7,19 +7,16 @@
     Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-heading: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
 
-  /* Aligned with blueprint / glass palette (255,136,0 accent, #2a3439 base) */
   --color-bg-dark: #2a3439;
   --color-card-dark: #323d44;
   --color-surface: #252d33;
-  /* Deepest panels / insets (darker than header chrome) */
   --color-surface-deep: #1c2328;
-  /* Header & footer bars — use with .glass cards for layered toolbox UI */
   --color-chrome-bar: var(--color-card-dark);
   --color-accent: #ff8800;
   --color-accent-hover: #e67a00;
   --color-text-light: #b3c0c9;
-  /* Control / inner-panel hover (matches Form Analyzer buttons) */
   --color-panel-hover: #353e43;
+  --color-fg: #e8eef2;
 }
 
 html {
@@ -28,8 +25,19 @@ html {
   -moz-osx-font-smoothing: grayscale;
 }
 
+html[data-theme="light"] {
+  --color-bg-dark: #eef1f4;
+  --color-card-dark: #ffffff;
+  --color-surface: #e8ecf0;
+  --color-surface-deep: #dce2e8;
+  --color-chrome-bar: #e4e9ee;
+  --color-text-light: #5c6b78;
+  --color-panel-hover: #dde3e9;
+  --color-fg: #1a2229;
+}
+
 body {
-  @apply bg-[var(--color-bg-dark)] text-white font-sans overflow-x-hidden;
+  @apply bg-[var(--color-bg-dark)] text-fg font-sans overflow-x-hidden;
 }
 
 h1,
@@ -40,22 +48,72 @@ h3,
 }
 
 .glass {
-  /* Lighter than raw #2a3439 glass — ties to --color-card-dark so cards match Macro-style panels */
   background: color-mix(in srgb, var(--color-card-dark) 88%, transparent);
   -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 136, 0, 0.1);
+  border: 1px solid color-mix(in srgb, var(--color-accent) 10%, transparent);
 }
 
-.orange-glow {
-  box-shadow: 0 0 30px rgba(255, 136, 0, 0.15);
+html[data-theme="light"] .glass {
+  border-color: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+
+.accent-glow {
+  box-shadow: 0 0 30px color-mix(in srgb, var(--color-accent) 15%, transparent);
 }
 
 .blueprint-bg {
   background-color: var(--color-bg-dark);
-  background-image: linear-gradient(rgba(255, 136, 0, 0.05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 136, 0, 0.05) 1px, transparent 1px);
+  background-image: linear-gradient(
+      color-mix(in srgb, var(--color-accent) 5%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--color-accent) 5%, transparent) 1px,
+      transparent 1px
+    );
   background-size: 40px 40px;
+}
+
+html[data-theme="light"] .blueprint-bg {
+  background-image: linear-gradient(
+      color-mix(in srgb, var(--color-accent) 8%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--color-accent) 8%, transparent) 1px,
+      transparent 1px
+    );
+}
+
+.settings-cog {
+  color: var(--color-fg);
+  filter: drop-shadow(0 1px 0 color-mix(in srgb, var(--color-fg) 25%, transparent))
+    drop-shadow(0 -1px 0 color-mix(in srgb, var(--color-bg-dark) 80%, transparent));
+  transition: color 0.15s ease, filter 0.15s ease;
+}
+
+.settings-cog-trigger:hover .settings-cog {
+  color: var(--color-accent);
+  filter: drop-shadow(0 1px 0 color-mix(in srgb, var(--color-accent) 45%, transparent))
+    drop-shadow(0 2px 4px color-mix(in srgb, var(--color-bg-dark) 60%, transparent));
+}
+
+.settings-cog-trigger:active .settings-cog {
+  transform: translateY(1px);
+  filter: drop-shadow(0 0 0 color-mix(in srgb, var(--color-accent) 30%, transparent));
+}
+
+html[data-theme="light"] .settings-cog {
+  filter: drop-shadow(0 1px 0 color-mix(in srgb, var(--color-fg) 15%, transparent))
+    drop-shadow(0 -1px 0 color-mix(in srgb, #fff 50%, transparent));
+}
+
+html[data-theme="light"] .settings-cog-trigger:hover .settings-cog {
+  filter: drop-shadow(0 1px 0 color-mix(in srgb, var(--color-accent) 35%, transparent))
+    drop-shadow(0 2px 3px rgba(0, 0, 0, 0.12));
 }
 
 * {
