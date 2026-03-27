@@ -27,6 +27,8 @@ import {
   Image as ImageGalleryIcon,
   Images,
   Video,
+  Activity,
+  LineChart,
 } from 'lucide-react';
 import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
 import SettingsMenu from './SettingsMenu';
@@ -92,13 +94,128 @@ const POSE_LEG_CONNECTIONS: [number, number][] = [
   [26, 28],
   [23, 24],
 ];
+const MIN_POSE_VISIBILITY = 0.25;
+const KNEE_SAMPLE_EPSILON_SECONDS = 1 / 1000;
+const POSE_ANALYSIS_PLAYBACK_RATE = 0.15;
+const POSE_INFERENCE_HZ = 24;
+const POSE_EMA_ALPHA = 0.3;
+// Peak detection intentionally omitted for now; focus is smooth graphing.
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function calculateJointAngle(a: {x: number; y: number}, b: {x: number; y: number}, c: {x: number; y: number}) {
+  const angle1 = Math.atan2(a.y - b.y, a.x - b.x);
+  const angle2 = Math.atan2(c.y - b.y, c.x - b.x);
+  let angle = Math.abs((angle1 - angle2) * (180 / Math.PI));
+  if (angle > 180) angle = 360 - angle;
+  return angle;
+}
+
+function getKneeAngleFromPose(
+  keypoints: {x: number; y: number; v: number}[],
+  side: KneeSide,
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+) {
+  if (keypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+
+  const leftHip = byId.get(23);
+  const leftKnee = byId.get(25);
+  const leftAnkle = byId.get(27);
+  const rightHip = byId.get(24);
+  const rightKnee = byId.get(26);
+  const rightAnkle = byId.get(28);
+
+  if (side === 'left') {
+    const leftVisible =
+      !!leftHip &&
+      !!leftKnee &&
+      !!leftAnkle &&
+      Math.min(leftHip.v, leftKnee.v, leftAnkle.v) >= visibilityThreshold;
+    if (!leftVisible) return null;
+    return calculateJointAngle(leftHip!, leftKnee!, leftAnkle!);
+  }
+
+  const rightVisible =
+    !!rightHip &&
+    !!rightKnee &&
+    !!rightAnkle &&
+    Math.min(rightHip.v, rightKnee.v, rightAnkle.v) >= visibilityThreshold;
+  if (!rightVisible) return null;
+  return calculateJointAngle(rightHip!, rightKnee!, rightAnkle!);
+}
+
+function pickKneeTrackingSide(
+  keypoints: {x: number; y: number; v: number}[],
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+): KneeSide | null {
+  if (keypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+
+  const leftHip = byId.get(23);
+  const leftKnee = byId.get(25);
+  const leftAnkle = byId.get(27);
+  const rightHip = byId.get(24);
+  const rightKnee = byId.get(26);
+  const rightAnkle = byId.get(28);
+
+  const leftScore =
+    leftHip && leftKnee && leftAnkle ? Math.min(leftHip.v, leftKnee.v, leftAnkle.v) : 0;
+  const rightScore =
+    rightHip && rightKnee && rightAnkle ? Math.min(rightHip.v, rightKnee.v, rightAnkle.v) : 0;
+  if (leftScore < visibilityThreshold && rightScore < visibilityThreshold) return null;
+  return leftScore >= rightScore ? 'left' : 'right';
+}
+
+function smoothPosePoints(
+  next: {x: number; y: number; v: number}[],
+  previous: {x: number; y: number; v: number}[] | null,
+  alpha = POSE_EMA_ALPHA,
+) {
+  if (!previous || previous.length !== next.length) return next;
+  return next.map((p, i) => {
+    const prev = previous[i]!;
+    return {
+      x: prev.x + (p.x - prev.x) * alpha,
+      y: prev.y + (p.y - prev.y) * alpha,
+      v: prev.v + (p.v - prev.v) * alpha,
+    };
+  });
+}
+
+
+function getTrackedLegAnchors(
+  keypoints: {x: number; y: number; v: number}[],
+  side: KneeSide,
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+) {
+  if (keypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const hip = side === 'left' ? byId.get(23) : byId.get(24);
+  const ankle = side === 'left' ? byId.get(27) : byId.get(28);
+  if (!hip || !ankle) return null;
+  if (Math.min(hip.v, ankle.v) < visibilityThreshold) return null;
+  return {hipX: hip.x, ankleX: ankle.x};
+}
+
+
 type AppliedZoomMap = {x: number; y: number; s: number};
 type ViewportTarget = 'primary' | 'compare';
+type KneeSide = 'left' | 'right';
 
 /** Media/content coordinates → overlay (viewport) pixels — identity when not zoomed. */
 function contentToOverlay(px: number, py: number, applied: AppliedZoomMap | null) {
@@ -153,8 +270,17 @@ export default function App() {
   const [poseEnabled, setPoseEnabled] = useState(false);
   const [poseKeypoints, setPoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
   const [comparePoseKeypoints, setComparePoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
+  const [currentKneeAngle, setCurrentKneeAngle] = useState<number | null>(null);
+  const [kneeAngleSeries, setKneeAngleSeries] = useState<{time: number; angle: number; hipX: number; ankleX: number}[]>([]);
+  const [kneeTrackingSide, setKneeTrackingSide] = useState<KneeSide | null>(null);
+  const [isPoseAnalyzing, setIsPoseAnalyzing] = useState(false);
+  const [isKneeGraphLocked, setIsKneeGraphLocked] = useState(false);
+  const [graphAnalysisRequested, setGraphAnalysisRequested] = useState(false);
+  const [graphDomainTime, setGraphDomainTime] = useState(0);
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const poseRafRef = useRef<number | null>(null);
+  const primaryPoseSmoothRef = useRef<{x: number; y: number; v: number}[] | null>(null);
+  const comparePoseSmoothRef = useRef<{x: number; y: number; v: number}[] | null>(null);
   const [poseStatus, setPoseStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [compareMediaLayoutVersion, setCompareMediaLayoutVersion] = useState(0);
 
@@ -633,6 +759,8 @@ export default function App() {
     if (!poseEnabled || (!videoSrc && !imageSrc && !compareVideoSrc && !compareImageSrc)) {
       setPoseKeypoints([]);
       setComparePoseKeypoints([]);
+      primaryPoseSmoothRef.current = null;
+      comparePoseSmoothRef.current = null;
       if (poseRafRef.current !== null) {
         cancelAnimationFrame(poseRafRef.current);
         poseRafRef.current = null;
@@ -643,6 +771,9 @@ export default function App() {
     let cancelled = false;
     let lastPrimaryVideoTime = -1;
     let lastCompareVideoTime = -1;
+    let lastPrimaryInferenceTs = 0;
+    let lastCompareInferenceTs = 0;
+    const minInferenceIntervalMs = 1000 / POSE_INFERENCE_HZ;
 
     const ensureLandmarker = async () => {
       if (poseLandmarkerRef.current) return poseLandmarkerRef.current;
@@ -650,14 +781,34 @@ export default function App() {
       const vision = await FilesetResolver.forVisionTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm',
       );
-      const landmarker = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',
-        },
-        runningMode: 'VIDEO',
-        numPoses: 1,
-      });
+      let landmarker: PoseLandmarker;
+      try {
+        landmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.6,
+          minPosePresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
+        });
+      } catch {
+        landmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task',
+            delegate: 'CPU',
+          },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.6,
+          minPosePresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
+        });
+      }
       poseLandmarkerRef.current = landmarker;
       setPoseStatus('ready');
       return landmarker;
@@ -666,9 +817,11 @@ export default function App() {
     const updatePoseFromResult = (
       result: any,
       setter: (next: {x: number; y: number; v: number}[]) => void,
+      smoothRef: {current: {x: number; y: number; v: number}[] | null},
     ) => {
       const landmarks = result?.landmarks?.[0];
       if (!landmarks || landmarks.length === 0) {
+        smoothRef.current = null;
         setter([]);
         return;
       }
@@ -676,7 +829,9 @@ export default function App() {
         const p = landmarks[id];
         return {x: p.x, y: p.y, v: p.visibility ?? 1};
       });
-      setter(selected);
+      const smoothed = smoothPosePoints(selected, smoothRef.current);
+      smoothRef.current = smoothed;
+      setter(smoothed);
     };
 
     const run = async () => {
@@ -695,12 +850,12 @@ export default function App() {
           if (imageSrc && primaryImage) {
             await landmarker.setOptions({runningMode: 'IMAGE'});
             const result = landmarker.detect(primaryImage);
-            if (!cancelled) updatePoseFromResult(result, setPoseKeypoints);
+            if (!cancelled) updatePoseFromResult(result, setPoseKeypoints, primaryPoseSmoothRef);
           }
           if (compareImageSrc && compareImage) {
             await landmarker.setOptions({runningMode: 'IMAGE'});
             const result = landmarker.detect(compareImage);
-            if (!cancelled) updatePoseFromResult(result, setComparePoseKeypoints);
+            if (!cancelled) updatePoseFromResult(result, setComparePoseKeypoints, comparePoseSmoothRef);
           }
           return;
         }
@@ -711,34 +866,45 @@ export default function App() {
           // Primary is an image: detect once and keep it.
           await landmarker.setOptions({runningMode: 'IMAGE'});
           const result = landmarker.detect(primaryImage);
-          if (!cancelled) updatePoseFromResult(result, setPoseKeypoints);
+          if (!cancelled) updatePoseFromResult(result, setPoseKeypoints, primaryPoseSmoothRef);
           await landmarker.setOptions({runningMode: 'VIDEO'});
         }
         if (compareImageSrc && compareImage) {
           await landmarker.setOptions({runningMode: 'IMAGE'});
           const result = landmarker.detect(compareImage);
-          if (!cancelled) updatePoseFromResult(result, setComparePoseKeypoints);
+          if (!cancelled) updatePoseFromResult(result, setComparePoseKeypoints, comparePoseSmoothRef);
           await landmarker.setOptions({runningMode: 'VIDEO'});
         }
 
         const tick = () => {
           if (cancelled) return;
+          const now = performance.now();
 
           if (videoSrc && primaryVideo) {
             const v = primaryVideo;
-            if (v.readyState >= 2 && (v.currentTime !== lastPrimaryVideoTime || !v.paused)) {
+            if (
+              v.readyState >= 2 &&
+              (v.currentTime !== lastPrimaryVideoTime || !v.paused) &&
+              now - lastPrimaryInferenceTs >= minInferenceIntervalMs
+            ) {
               lastPrimaryVideoTime = v.currentTime;
-              const result = landmarker.detectForVideo(v, performance.now());
-              updatePoseFromResult(result, setPoseKeypoints);
+              lastPrimaryInferenceTs = now;
+              const result = landmarker.detectForVideo(v, now);
+              updatePoseFromResult(result, setPoseKeypoints, primaryPoseSmoothRef);
             }
           }
 
           if (compareVideoSrc && compareVideo) {
             const v = compareVideo;
-            if (v.readyState >= 2 && (v.currentTime !== lastCompareVideoTime || !v.paused)) {
+            if (
+              v.readyState >= 2 &&
+              (v.currentTime !== lastCompareVideoTime || !v.paused) &&
+              now - lastCompareInferenceTs >= minInferenceIntervalMs
+            ) {
               lastCompareVideoTime = v.currentTime;
-              const result = landmarker.detectForVideo(v, performance.now());
-              updatePoseFromResult(result, setComparePoseKeypoints);
+              lastCompareInferenceTs = now;
+              const result = landmarker.detectForVideo(v, now);
+              updatePoseFromResult(result, setComparePoseKeypoints, comparePoseSmoothRef);
             }
           }
 
@@ -1001,6 +1167,55 @@ export default function App() {
   }, [videoSrc]);
 
   useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (!poseEnabled) {
+      video.playbackRate = 1;
+      setIsPoseAnalyzing(false);
+      setGraphAnalysisRequested(false);
+    }
+  }, [poseEnabled]);
+
+  useEffect(() => {
+    if (!graphAnalysisRequested || !videoSrc) return;
+    if (!poseEnabled) {
+      setPoseEnabled(true);
+      return;
+    }
+    if (poseStatus === 'error') {
+      setGraphAnalysisRequested(false);
+      setIsPoseAnalyzing(false);
+      return;
+    }
+    if (poseStatus !== 'ready') return;
+
+    const video = videoRef.current;
+    if (!video) return;
+    const targetDuration = Math.max(
+      getReliableVideoDuration(video),
+      duration,
+      0,
+    );
+    if (targetDuration <= 0) {
+      // Wait until metadata/duration are available, then start analysis.
+      return;
+    }
+    setKneeAngleSeries([]);
+    setKneeTrackingSide(null);
+    setIsKneeGraphLocked(false);
+    setIsPoseAnalyzing(true);
+    setGraphDomainTime(targetDuration);
+    try {
+      video.currentTime = 0;
+    } catch {
+      /* ignore seek errors while metadata loads */
+    }
+    video.playbackRate = POSE_ANALYSIS_PLAYBACK_RATE;
+    setIsPlaying(true);
+    setGraphAnalysisRequested(false);
+  }, [graphAnalysisRequested, poseEnabled, poseStatus, videoSrc, duration]);
+
+  useEffect(() => {
     setCompareCurrentTime(0);
     setCompareDuration(0);
     const video = compareVideoRef.current;
@@ -1034,6 +1249,79 @@ export default function App() {
       video.removeEventListener('canplay', handleCanPlay);
     };
   }, [compareVideoSrc]);
+
+  useEffect(() => {
+    if (!poseEnabled) {
+      setCurrentKneeAngle(null);
+      setKneeAngleSeries([]);
+      setKneeTrackingSide(null);
+      setIsKneeGraphLocked(false);
+      setIsPoseAnalyzing(false);
+      return;
+    }
+    if (!videoSrc) {
+      setKneeAngleSeries([]);
+    }
+    if (!videoSrc && !imageSrc) {
+      setKneeTrackingSide(null);
+    }
+  }, [poseEnabled, videoSrc, imageSrc]);
+
+  useEffect(() => {
+    setCurrentKneeAngle(null);
+    setKneeAngleSeries([]);
+    setKneeTrackingSide(null);
+    setGraphDomainTime(0);
+    primaryPoseSmoothRef.current = null;
+    comparePoseSmoothRef.current = null;
+  }, [videoSrc, imageSrc]);
+
+  useEffect(() => {
+    comparePoseSmoothRef.current = null;
+  }, [compareVideoSrc, compareImageSrc]);
+
+  useEffect(() => {
+    if (!poseEnabled) {
+      setCurrentKneeAngle(null);
+      return;
+    }
+    const activeSide = kneeTrackingSide ?? pickKneeTrackingSide(poseKeypoints);
+    if (!kneeTrackingSide && activeSide) {
+      setKneeTrackingSide(activeSide);
+    }
+    const kneeAngle = activeSide ? getKneeAngleFromPose(poseKeypoints, activeSide) : null;
+    const anchors = activeSide ? getTrackedLegAnchors(poseKeypoints, activeSide) : null;
+    setCurrentKneeAngle(kneeAngle);
+    if (!videoSrc || kneeAngle === null || !anchors || isKneeGraphLocked || !isPoseAnalyzing) return;
+
+    const time = videoRef.current?.currentTime ?? currentTime;
+    setKneeAngleSeries((prev) => {
+      if (prev.length === 0) {
+        return [{time, angle: kneeAngle, hipX: anchors.hipX, ankleX: anchors.ankleX}];
+      }
+      const last = prev[prev.length - 1]!;
+      if (time <= last.time + KNEE_SAMPLE_EPSILON_SECONDS) {
+        const next = [...prev];
+        next[next.length - 1] = {time, angle: kneeAngle, hipX: anchors.hipX, ankleX: anchors.ankleX};
+        return next;
+      }
+      return [...prev, {time, angle: kneeAngle, hipX: anchors.hipX, ankleX: anchors.ankleX}];
+    });
+  }, [poseEnabled, poseKeypoints, currentTime, videoSrc, kneeTrackingSide, isKneeGraphLocked, isPoseAnalyzing]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !videoSrc) return;
+    const handleEnded = () => {
+      if (!poseEnabled || !isPoseAnalyzing) return;
+      video.playbackRate = 1;
+      setIsPlaying(false);
+      setIsPoseAnalyzing(false);
+      setIsKneeGraphLocked(true);
+    };
+    video.addEventListener('ended', handleEnded);
+    return () => video.removeEventListener('ended', handleEnded);
+  }, [poseEnabled, videoSrc, isPoseAnalyzing]);
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
@@ -1079,6 +1367,12 @@ export default function App() {
     setAngle(null);
     setIsDrawing(false);
     setActiveTool(null);
+  };
+
+  const runGraphAnalysis = () => {
+    if (!videoSrc) return;
+    setIsKneeGraphLocked(false);
+    setGraphAnalysisRequested(true);
   };
 
   const isMediaLoaded = !!videoSrc || !!imageSrc;
@@ -1465,11 +1759,89 @@ export default function App() {
 
   const calculateAngle = (pts: { x: number; y: number }[]) => {
     const [p1, p2, p3] = pts;
-    const angle1 = Math.atan2(p1.y - p2.y, p1.x - p2.x);
-    const angle2 = Math.atan2(p3.y - p2.y, p3.x - p2.x);
-    let angle = Math.abs((angle1 - angle2) * (180 / Math.PI));
-    if (angle > 180) angle = 360 - angle;
-    setAngle(angle);
+    setAngle(calculateJointAngle(p1, p2, p3));
+  };
+
+  const renderKneeAnglePanel = () => {
+    if (!isMediaLoaded) return null;
+
+    const series = kneeAngleSeries;
+    const seriesEndTime = series.length > 0 ? series[series.length - 1]!.time : 0;
+    const sliderTime = Math.max(duration, currentTime, 0.0001);
+    // Keep a stable x-domain during analysis to avoid early stretching artifacts.
+    const maxTime = graphDomainTime > 0 ? graphDomainTime : Math.max(sliderTime, seriesEndTime, 0.0001);
+    const minAngle = 0;
+    const maxAngle = 180;
+    const graphHeight = 140;
+
+    const linePath = series
+      .map((sample, idx) => {
+        const x = (sample.time / maxTime) * 100;
+        const y = graphHeight - ((sample.angle - minAngle) / (maxAngle - minAngle)) * graphHeight;
+        return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(3)} ${y.toFixed(3)}`;
+      })
+      .join(' ');
+
+    return (
+      <section className="rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
+            Knee Angle (Hip-Knee-Ankle)
+          </h3>
+          {videoSrc ? (
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={runGraphAnalysis}
+                disabled={isPoseAnalyzing || graphAnalysisRequested}
+                className={`rounded-md border border-[var(--color-accent)]/20 p-1.5 hover:bg-[var(--color-panel-hover)] ${isPoseAnalyzing || graphAnalysisRequested ? 'cursor-not-allowed opacity-50' : 'text-[var(--color-accent)]'}`}
+                title="Analyze graph"
+                aria-label="Analyze graph"
+              >
+                <LineChart className="h-4 w-4" />
+              </button>
+            </div>
+          ) : null}
+        </div>
+        {videoSrc ? (
+          <div className="rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
+            {series.length >= 2 ? (
+              <svg
+                viewBox={`0 0 100 ${graphHeight}`}
+                preserveAspectRatio="none"
+                className="h-36 w-full"
+                role="img"
+                aria-label="Knee angle over time"
+              >
+                <path d={linePath} fill="none" stroke="var(--color-accent)" strokeWidth={1.2} />
+              </svg>
+            ) : (
+              <p className="py-8 text-center text-sm text-[var(--color-text-light)]">
+                Play or scrub the video to collect knee-angle samples.
+              </p>
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-[var(--color-text-light)]">
+            Angle graph is available for video playback; enable Pose to start tracking.
+          </p>
+        )}
+        <div className="mt-2 grid grid-cols-1 gap-1 text-xs text-[var(--color-text-light)] sm:grid-cols-3">
+          <p>Degree: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
+          <p>
+            Tracking:{' '}
+            {isKneeGraphLocked
+              ? `locked (${kneeTrackingSide ?? 'auto'} leg)`
+              : isPoseAnalyzing
+                ? `analyzing (${kneeTrackingSide ?? 'auto'} leg)`
+                : graphAnalysisRequested
+                  ? 'preparing mediapipe'
+                  : `${kneeTrackingSide ? `${kneeTrackingSide} leg` : 'auto'}`}
+          </p>
+          <p>Samples: {series.length}</p>
+        </div>
+      </section>
+    );
   };
 
   /** Letterboxed media: tall single view; slightly shorter when two-up compare. */
@@ -1794,11 +2166,11 @@ export default function App() {
                       type="button"
                       onClick={() => setPoseEnabled((v) => !v)}
                       disabled={!isMediaLoaded}
-                      className={`rounded-lg border border-[var(--color-accent)]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[var(--color-accent)]' : 'text-fg'}`}
-                      title="Toggle BlazePose joints"
-                      aria-label="Toggle BlazePose joints"
+                      className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
+                      title="Toggle pose overlay"
+                      aria-label="Toggle pose overlay"
                     >
-                      Pose
+                      <Activity className="w-6 h-6" />
                     </button>
                     <button
                       type="button"
@@ -1843,6 +2215,7 @@ export default function App() {
                   </div>
                 </div>
               </div>
+              {renderKneeAnglePanel()}
             </div>
           ) : imageSrc ? (
             <div
@@ -1978,11 +2351,11 @@ export default function App() {
                   type="button"
                   onClick={() => setPoseEnabled((v) => !v)}
                   disabled={!isMediaLoaded}
-                  className={`rounded-lg border border-[var(--color-accent)]/20 px-3 py-1.5 text-sm hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'bg-[var(--color-panel-hover)] text-[var(--color-accent)]' : 'text-fg'}`}
-                  title="Toggle BlazePose joints"
-                  aria-label="Toggle BlazePose joints"
+                  className={`p-2 rounded-full hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
+                  title="Toggle pose overlay"
+                  aria-label="Toggle pose overlay"
                 >
-                  Pose
+                  <Activity className="w-6 h-6" />
                 </button>
                 <button
                   type="button"
@@ -2025,6 +2398,7 @@ export default function App() {
                   {isFullscreen ? <Minimize className="w-6 h-6" /> : <Maximize className="w-6 h-6" />}
                 </button>
               </div>
+              {renderKneeAnglePanel()}
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-64 rounded-xl border-2 border-dashed border-[var(--color-accent)]/20 bg-[var(--color-bg-dark)] p-8 text-center">
