@@ -89,29 +89,39 @@ const ZOOM_MAX_SCALE = 8;
 const ZOOM_BUTTON_FACTOR = 1.25;
 const FRAME_STEP_SECONDS = 1 / 30; // approx single frame at 30fps
 const SLIDER_SCRUB_STEP_SECONDS = 1 / 60; // smaller increments for smoother scrubbing
-const POSE_HIP_KNEE_ANKLE_IDS = [11, 12, 13, 14, 15, 16];
-const POSE_LEFT_LEG_IDS = new Set([11, 13, 15]);
-const POSE_RIGHT_LEG_IDS = new Set([12, 14, 16]);
-const POSE_LEG_CONNECTIONS: [number, number][] = [
+const POSE_TRACKED_IDS = [11, 12, 13, 14, 15, 16, 5, 6, 7, 8, 9, 10];
+const POSE_LEFT_SIDE_IDS = new Set([5, 7, 9, 11, 13, 15]);
+const POSE_RIGHT_SIDE_IDS = new Set([6, 8, 10, 12, 14, 16]);
+const POSE_ARM_IDS = new Set([7, 8, 9, 10]);
+const POSE_BODY_CONNECTIONS: [number, number][] = [
   [11, 13],
   [13, 15],
   [12, 14],
   [14, 16],
   [11, 12],
+  [5, 11],
+  [6, 12],
+  [5, 6],
+  [5, 7],
+  [7, 9],
+  [6, 8],
+  [8, 10],
 ];
 const MIN_POSE_VISIBILITY = 0.25;
 const KNEE_SAMPLE_EPSILON_SECONDS = 1 / 1000;
 const POSE_INFERENCE_HZ = 24;
 const KNEE_MAXIMA_MIN_SAMPLES = 3;
 const KNEE_MAXIMA_MIN_GAP_SECONDS = 0.1;
+const KNEE_MINIMA_MIN_SAMPLES = 3;
+const KNEE_MINIMA_MIN_GAP_SECONDS = 0.3;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
-function calculateJointAngle(a: {x: number; y: number}, b: {x: number; y: number}, c: {x: number; y: number}) {
-  const angle1 = Math.atan2(a.y - b.y, a.x - b.x);
-  const angle2 = Math.atan2(c.y - b.y, c.x - b.x);
+function calculateJointAngle(a: {x: number; y: number}, b: {x: number; y: number}, c: {x: number; y: number}, aspectRatio = 1) {
+  const angle1 = Math.atan2(a.y - b.y, (a.x - b.x) * aspectRatio);
+  const angle2 = Math.atan2(c.y - b.y, (c.x - b.x) * aspectRatio);
   let angle = Math.abs((angle1 - angle2) * (180 / Math.PI));
   if (angle > 180) angle = 360 - angle;
   return angle;
@@ -121,10 +131,11 @@ function getKneeAngleFromPose(
   keypoints: {x: number; y: number; v: number}[],
   side: KneeSide,
   visibilityThreshold = MIN_POSE_VISIBILITY,
+  aspectRatio = 1,
 ) {
-  if (keypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return null;
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
   const byId = new Map<number, {x: number; y: number; v: number}>();
-  POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+  POSE_TRACKED_IDS.forEach((id, i) => {
     const p = keypoints[i];
     if (p) byId.set(id, p);
   });
@@ -143,7 +154,7 @@ function getKneeAngleFromPose(
       !!leftAnkle &&
       Math.min(leftHip.v, leftKnee.v, leftAnkle.v) >= visibilityThreshold;
     if (!leftVisible) return null;
-    return calculateJointAngle(leftHip!, leftKnee!, leftAnkle!);
+    return calculateJointAngle(leftHip!, leftKnee!, leftAnkle!, aspectRatio);
   }
 
   const rightVisible =
@@ -152,16 +163,16 @@ function getKneeAngleFromPose(
     !!rightAnkle &&
     Math.min(rightHip.v, rightKnee.v, rightAnkle.v) >= visibilityThreshold;
   if (!rightVisible) return null;
-  return calculateJointAngle(rightHip!, rightKnee!, rightAnkle!);
+  return calculateJointAngle(rightHip!, rightKnee!, rightAnkle!, aspectRatio);
 }
 
 function pickKneeTrackingSide(
   keypoints: {x: number; y: number; v: number}[],
   visibilityThreshold = MIN_POSE_VISIBILITY,
 ): KneeSide | null {
-  if (keypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return null;
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
   const byId = new Map<number, {x: number; y: number; v: number}>();
-  POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+  POSE_TRACKED_IDS.forEach((id, i) => {
     const p = keypoints[i];
     if (p) byId.set(id, p);
   });
@@ -186,9 +197,9 @@ function getTrackedLegAnchors(
   side: KneeSide,
   visibilityThreshold = MIN_POSE_VISIBILITY,
 ) {
-  if (keypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return null;
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
   const byId = new Map<number, {x: number; y: number; v: number}>();
-  POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+  POSE_TRACKED_IDS.forEach((id, i) => {
     const p = keypoints[i];
     if (p) byId.set(id, p);
   });
@@ -197,6 +208,72 @@ function getTrackedLegAnchors(
   if (!hip || !ankle) return null;
   if (Math.min(hip.v, ankle.v) < visibilityThreshold) return null;
   return {hipX: hip.x, ankleX: ankle.x};
+}
+
+/** Angle from horizontal at the knee to the hip. 0° = parallel, negative = below parallel. */
+function getSquatDepthAngle(
+  keypoints: {x: number; y: number; v: number}[],
+  side: KneeSide,
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+  aspectRatio = 1,
+): number | null {
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_TRACKED_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const hip = side === 'left' ? byId.get(11) : byId.get(12);
+  const knee = side === 'left' ? byId.get(13) : byId.get(14);
+  if (!hip || !knee) return null;
+  if (Math.min(hip.v, knee.v) < visibilityThreshold) return null;
+  const dx = Math.abs(hip.x - knee.x) * aspectRatio;
+  const dy = knee.y - hip.y;
+  if (dx < 1e-9 && Math.abs(dy) < 1e-9) return null;
+  return Math.atan2(dy, dx) * (180 / Math.PI);
+}
+
+function getBackAngle(
+  keypoints: {x: number; y: number; v: number}[],
+  side: KneeSide,
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+  aspectRatio = 1,
+): number | null {
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_TRACKED_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const shoulder = side === 'left' ? byId.get(5) : byId.get(6);
+  const hip = side === 'left' ? byId.get(11) : byId.get(12);
+  if (!shoulder || !hip) return null;
+  if (Math.min(shoulder.v, hip.v) < visibilityThreshold) return null;
+  const dx = Math.abs(shoulder.x - hip.x) * aspectRatio;
+  const dy = hip.y - shoulder.y;
+  if (dx < 1e-9 && Math.abs(dy) < 1e-9) return null;
+  return Math.atan2(dy, dx) * (180 / Math.PI);
+}
+
+/** Angle at the hip joint: shoulder-hip-knee. */
+function getHipAngle(
+  keypoints: {x: number; y: number; v: number}[],
+  side: KneeSide,
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+  aspectRatio = 1,
+): number | null {
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_TRACKED_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const shoulder = side === 'left' ? byId.get(5) : byId.get(6);
+  const hip = side === 'left' ? byId.get(11) : byId.get(12);
+  const knee = side === 'left' ? byId.get(13) : byId.get(14);
+  if (!shoulder || !hip || !knee) return null;
+  if (Math.min(shoulder.v, hip.v, knee.v) < visibilityThreshold) return null;
+  return calculateJointAngle(shoulder, hip, knee, aspectRatio);
 }
 
 
@@ -215,11 +292,48 @@ type PoseFrameSample = {
 };
 type FacingDirection = 'right' | 'left';
 type ExtensionDirection = 'forward' | 'behind';
+type AnalysisMode = 'stride' | 'squat';
 type KneeAnglePeak = {
   time: number;
   angle: number;
   direction: ExtensionDirection;
 };
+type KneeAngleValley = {
+  time: number;
+  angle: number;
+  depthAngle: number;
+  belowParallel: boolean;
+  hipAngle: number | null;
+  backAngle: number | null;
+};
+
+function detectFacingFromKeypoints(
+  keypoints: {x: number; y: number; v: number}[],
+): FacingDirection | null {
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_TRACKED_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const leftIds = [5, 7, 9, 11, 13, 15];
+  const rightIds = [6, 8, 10, 12, 14, 16];
+  let leftSum = 0, leftCount = 0;
+  for (const id of leftIds) {
+    const p = byId.get(id);
+    if (p) { leftSum += p.v; leftCount++; }
+  }
+  let rightSum = 0, rightCount = 0;
+  for (const id of rightIds) {
+    const p = byId.get(id);
+    if (p) { rightSum += p.v; rightCount++; }
+  }
+  if (leftCount === 0 && rightCount === 0) return null;
+  const leftAvg = leftCount > 0 ? leftSum / leftCount : 0;
+  const rightAvg = rightCount > 0 ? rightSum / rightCount : 0;
+  if (Math.abs(leftAvg - rightAvg) < 0.05) return null;
+  return leftAvg > rightAvg ? 'left' : 'right';
+}
 
 function facingDirectionToLeg(facing: FacingDirection): KneeSide {
   return facing === 'left' ? 'left' : 'right';
@@ -259,6 +373,48 @@ function detectKneeAngleMaxima(
   return kept
     .sort((a, b) => a.index - b.index)
     .map((k) => ({time: series[k.index]!.time, angle: series[k.index]!.angle, direction: k.direction}));
+}
+
+function detectKneeAngleMinima(
+  series: {time: number; angle: number; depthAngle: number | null; hipAngle: number | null; backAngle: number | null}[],
+  options: {
+    lowerAngle: number;
+    upperAngle: number;
+  },
+): KneeAngleValley[] {
+  if (series.length < KNEE_MINIMA_MIN_SAMPLES) return [];
+  const candidates: {index: number; angle: number}[] = [];
+  for (let i = 1; i < series.length - 1; i += 1) {
+    const prev = series[i - 1]!.angle;
+    const current = series[i]!.angle;
+    const next = series[i + 1]!.angle;
+    const isValley = (current <= prev && current < next) || (current < prev && current <= next);
+    if (!isValley || current < options.lowerAngle || current > options.upperAngle) continue;
+    candidates.push({index: i, angle: current});
+  }
+
+  candidates.sort((a, b) => a.angle - b.angle);
+  const kept: typeof candidates = [];
+  for (const c of candidates) {
+    const t = series[c.index]!.time;
+    const tooClose = kept.some((k) => Math.abs(t - series[k.index]!.time) < KNEE_MINIMA_MIN_GAP_SECONDS);
+    if (!tooClose) kept.push(c);
+  }
+
+  return kept
+    .sort((a, b) => a.index - b.index)
+    .map((k) => {
+      const s = series[k.index]!;
+      const depth = s.depthAngle ?? 0;
+      return {
+        time: s.time,
+        angle: s.angle,
+        depthAngle: depth,
+        belowParallel: depth < 0,
+        hipAngle: s.hipAngle,
+        backAngle: s.backAngle,
+      };
+    });
 }
 
 function findNearestCachedPose(
@@ -341,7 +497,10 @@ export default function App() {
   const [poseKeypoints, setPoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
   const [comparePoseKeypoints, setComparePoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
   const [currentKneeAngle, setCurrentKneeAngle] = useState<number | null>(null);
-  const [kneeAngleSeries, setKneeAngleSeries] = useState<{time: number; angle: number; hipX: number; ankleX: number}[]>([]);
+  const [currentLiveDepthAngle, setCurrentLiveDepthAngle] = useState<number | null>(null);
+  const [currentLiveHipAngle, setCurrentLiveHipAngle] = useState<number | null>(null);
+  const [currentLiveBackAngle, setCurrentLiveBackAngle] = useState<number | null>(null);
+  const [kneeAngleSeries, setKneeAngleSeries] = useState<{time: number; angle: number; hipX: number; ankleX: number; depthAngle: number | null; hipAngle: number | null; backAngle: number | null}[]>([]);
   const [posePointSeries, setPosePointSeries] = useState<PoseFrameSample[]>([]);
   const [kneeTrackingSide, setKneeTrackingSide] = useState<KneeSide | null>(null);
   const [isPoseAnalyzing, setIsPoseAnalyzing] = useState(false);
@@ -353,6 +512,7 @@ export default function App() {
   const [draggingBound, setDraggingBound] = useState<'lower' | 'upper' | null>(null);
   const [extensionFilter, setExtensionFilter] = useState<ExtensionDirection>('forward');
   const [facingDirection, setFacingDirection] = useState<FacingDirection>('right');
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('stride');
   const poseDetectorRef = useRef<poseDetection.PoseDetector | null>(null);
   const poseRafRef = useRef<number | null>(null);
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -880,6 +1040,7 @@ export default function App() {
       poses: poseDetection.Pose[] | null | undefined,
       source: HTMLVideoElement | HTMLImageElement | null,
       setter: (next: {x: number; y: number; v: number}[]) => void,
+      autoDetectFacing = false,
     ) => {
       const keypoints = poses?.[0]?.keypoints;
       const sourceWidth =
@@ -890,7 +1051,7 @@ export default function App() {
         setter([]);
         return;
       }
-      const selected = POSE_HIP_KNEE_ANKLE_IDS.map((id) => {
+      const selected = POSE_TRACKED_IDS.map((id) => {
         const p = keypoints[id];
         if (!p) return {x: 0, y: 0, v: 0};
         const score = p.score ?? 0;
@@ -898,6 +1059,13 @@ export default function App() {
         return {x: coords.x / sourceWidth, y: coords.y / sourceHeight, v: score};
       });
       setter(selected);
+      if (autoDetectFacing) {
+        const detected = detectFacingFromKeypoints(selected);
+        if (detected) {
+          setFacingDirection(detected);
+          setKneeTrackingSide(facingDirectionToLeg(detected));
+        }
+      }
     };
 
     const run = async () => {
@@ -911,11 +1079,10 @@ export default function App() {
         const compareImage = compareImageRef.current;
         const hasAnyVideo = (!!videoSrc && !!primaryVideo) || (!!compareVideoSrc && !!compareVideo);
 
-        // Handle images immediately (single detection), videos in a shared RAF loop.
         if (!hasAnyVideo) {
           if (imageSrc && primaryImage) {
             const result = await detector.estimatePoses(primaryImage, {flipHorizontal: false});
-            if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints);
+            if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints, true);
           }
           if (compareImageSrc && compareImage) {
             const result = await detector.estimatePoses(compareImage, {flipHorizontal: false});
@@ -1031,25 +1198,28 @@ export default function App() {
         ? findNearestCachedPose(poseCacheRef.current, overlayTime) ?? poseKeypoints
         : poseKeypoints;
 
-      if (poseEnabled && overlayKps.length === POSE_HIP_KNEE_ANKLE_IDS.length) {
+      if (poseEnabled && overlayKps.length === POSE_TRACKED_IDS.length) {
         const byId = new Map<number, {x: number; y: number; v: number}>();
-        POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+        POSE_TRACKED_IDS.forEach((id, i) => {
           const p = overlayKps[i];
           if (p) byId.set(id, p);
         });
 
         ctx.save();
-        const trackedIds = kneeTrackingSide === 'left' ? POSE_LEFT_LEG_IDS : POSE_RIGHT_LEG_IDS;
+        const trackedIds = kneeTrackingSide === 'left' ? POSE_LEFT_SIDE_IDS : POSE_RIGHT_SIDE_IDS;
         const isTrackedConnection = (aId: number, bId: number) =>
           trackedIds.has(aId) && trackedIds.has(bId);
+        const isArmConnection = (aId: number, bId: number) =>
+          POSE_ARM_IDS.has(aId) || POSE_ARM_IDS.has(bId);
 
-        for (const [aId, bId] of POSE_LEG_CONNECTIONS) {
+        for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
           const a = byId.get(aId);
           const b = byId.get(bId);
           if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
-          const tracked = isTrackedConnection(aId, bId);
-          ctx.strokeStyle = tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
-          ctx.lineWidth = tracked ? 3 : 1.5;
+          const arm = isArmConnection(aId, bId);
+          const tracked = !arm && isTrackedConnection(aId, bId);
+          ctx.strokeStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+          ctx.lineWidth = arm ? 1 : tracked ? 3 : 1.5;
           const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, videoRef.current ?? imageRef.current, canvasRef.current);
           const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, videoRef.current ?? imageRef.current, canvasRef.current);
           ctx.beginPath();
@@ -1057,14 +1227,15 @@ export default function App() {
           ctx.lineTo(bPx.x, bPx.y);
           ctx.stroke();
         }
-        POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+        POSE_TRACKED_IDS.forEach((id, i) => {
           const p = overlayKps[i];
           if (!p || p.v < 0.25) return;
-          const tracked = trackedIds.has(id);
-          ctx.fillStyle = tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+          const arm = POSE_ARM_IDS.has(id);
+          const tracked = !arm && trackedIds.has(id);
+          ctx.fillStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
           const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, videoRef.current ?? imageRef.current, canvasRef.current);
           ctx.beginPath();
-          ctx.arc(o.x, o.y, tracked ? 5 : 3.5, 0, Math.PI * 2);
+          ctx.arc(o.x, o.y, arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
           ctx.fill();
         });
         ctx.restore();
@@ -1132,12 +1303,12 @@ export default function App() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     if (!poseEnabled) return;
-    if (comparePoseKeypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return;
+    if (comparePoseKeypoints.length !== POSE_TRACKED_IDS.length) return;
 
     const media = (video ?? image) as HTMLVideoElement | HTMLImageElement;
 
     const byId = new Map<number, {x: number; y: number; v: number}>();
-    POSE_HIP_KNEE_ANKLE_IDS.forEach((id, i) => {
+    POSE_TRACKED_IDS.forEach((id, i) => {
       const p = comparePoseKeypoints[i];
       if (p) byId.set(id, p);
     });
@@ -1147,7 +1318,7 @@ export default function App() {
     ctx.fillStyle = '#00d2ff';
     ctx.lineWidth = 2.5;
 
-    for (const [aId, bId] of POSE_LEG_CONNECTIONS) {
+    for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
       const a = byId.get(aId);
       const b = byId.get(bId);
       if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
@@ -1276,7 +1447,8 @@ export default function App() {
     const targetDuration = Math.max(getReliableVideoDuration(mainVideo), mainVideo.duration || 0, 0);
     if (targetDuration <= 0) return;
 
-    const activeSide = facingDirectionToLeg(facingDirection);
+    let activeSide = facingDirectionToLeg(facingDirection);
+    let detectedFacing: FacingDirection | null = null;
 
     analysisAbortRef.current = true;
     const gen = ++analysisGenRef.current;
@@ -1324,6 +1496,7 @@ export default function App() {
 
     const sourceWidth = bgVideo.videoWidth || mainVideo.videoWidth;
     const sourceHeight = bgVideo.videoHeight || mainVideo.videoHeight;
+    const ar = sourceHeight > 0 ? sourceWidth / sourceHeight : 1;
 
     const seekAndWait = (t: number): Promise<void> =>
       new Promise((resolve) => {
@@ -1346,7 +1519,7 @@ export default function App() {
 
     const yieldToUI = () => new Promise<void>((r) => setTimeout(r, 0));
 
-    const angleSeries: {time: number; angle: number; hipX: number; ankleX: number}[] = [];
+    const angleSeries: {time: number; angle: number; hipX: number; ankleX: number; depthAngle: number | null; hipAngle: number | null; backAngle: number | null}[] = [];
     const pointSeries: PoseFrameSample[] = [];
     const cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[] = [];
     let t = 0;
@@ -1368,7 +1541,7 @@ export default function App() {
       const keypoints = result?.[0]?.keypoints;
       let normalized: {x: number; y: number; v: number}[] = [];
       if (keypoints && keypoints.length > 0 && sourceWidth > 0 && sourceHeight > 0) {
-        normalized = POSE_HIP_KNEE_ANKLE_IDS.map((id) => {
+        normalized = POSE_TRACKED_IDS.map((id) => {
           const p = keypoints[id];
           if (!p) return {x: 0, y: 0, v: 0};
           return {x: p.x / sourceWidth, y: p.y / sourceHeight, v: p.score ?? 0};
@@ -1377,12 +1550,35 @@ export default function App() {
 
       cache.push({time: t, keypoints: normalized});
 
-      if (normalized.length === POSE_HIP_KNEE_ANKLE_IDS.length) {
-        const kneeAngle = getKneeAngleFromPose(normalized, activeSide);
+      if (!detectedFacing && normalized.length === POSE_TRACKED_IDS.length) {
+        const detected = detectFacingFromKeypoints(normalized);
+        if (detected) {
+          detectedFacing = detected;
+          activeSide = facingDirectionToLeg(detected);
+          if (!isStale()) {
+            setFacingDirection(detected);
+            setKneeTrackingSide(activeSide);
+          }
+        }
+      }
+
+      if (normalized.length === POSE_TRACKED_IDS.length) {
+        const kneeAngle = getKneeAngleFromPose(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
         const anchors = getTrackedLegAnchors(normalized, activeSide);
+        const depth = getSquatDepthAngle(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
+        const hipJointAngle = getHipAngle(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
+        const torsoAngle = getBackAngle(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
         if (kneeAngle !== null && anchors) {
           const extension = Math.abs(anchors.ankleX - anchors.hipX);
-          angleSeries.push({time: t, angle: kneeAngle, hipX: anchors.hipX, ankleX: anchors.ankleX});
+          angleSeries.push({
+            time: t,
+            angle: kneeAngle,
+            hipX: anchors.hipX,
+            ankleX: anchors.ankleX,
+            depthAngle: depth,
+            hipAngle: hipJointAngle,
+            backAngle: torsoAngle,
+          });
           pointSeries.push({
             time: t,
             side: activeSide,
@@ -1423,9 +1619,11 @@ export default function App() {
   }, [facingDirection]);
 
   useEffect(() => {
+    if (!graphAnalysisRequested) return;
     if (!poseEnabled || !videoSrc) return;
     if (poseStatus === 'error') {
       setIsPoseAnalyzing(false);
+      setGraphAnalysisRequested(false);
       return;
     }
     if (poseStatus !== 'ready') return;
@@ -1439,10 +1637,7 @@ export default function App() {
     );
     if (targetDuration <= 0) return;
 
-    if (graphAnalysisRequested) {
-      setGraphAnalysisRequested(false);
-    }
-
+    setGraphAnalysisRequested(false);
     void runFrameByFrameAnalysis();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [poseEnabled, poseStatus, videoSrc, graphAnalysisRequested, runFrameByFrameAnalysis]);
@@ -1507,6 +1702,9 @@ export default function App() {
 
   useEffect(() => {
     setCurrentKneeAngle(null);
+    setCurrentLiveDepthAngle(null);
+    setCurrentLiveHipAngle(null);
+    setCurrentLiveBackAngle(null);
     setKneeAngleSeries([]);
     setPosePointSeries([]);
     poseCacheRef.current = [];
@@ -1520,6 +1718,9 @@ export default function App() {
   useEffect(() => {
     if (!poseEnabled) {
       setCurrentKneeAngle(null);
+      setCurrentLiveDepthAngle(null);
+      setCurrentLiveHipAngle(null);
+      setCurrentLiveBackAngle(null);
       return;
     }
     const sideFromFacing = facingDirectionToLeg(facingDirection);
@@ -1530,8 +1731,15 @@ export default function App() {
     const kps = poseCacheRef.current.length > 0
       ? (findNearestCachedPose(poseCacheRef.current, currentTime) ?? poseKeypoints)
       : poseKeypoints;
-    const kneeAngle = activeSide ? getKneeAngleFromPose(kps, activeSide) : null;
+    const media = videoRef.current ?? imageRef.current;
+    const w = media instanceof HTMLVideoElement ? media.videoWidth : media instanceof HTMLImageElement ? media.naturalWidth : 0;
+    const h = media instanceof HTMLVideoElement ? media.videoHeight : media instanceof HTMLImageElement ? media.naturalHeight : 0;
+    const liveAr = h > 0 ? w / h : 1;
+    const kneeAngle = activeSide ? getKneeAngleFromPose(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null;
     setCurrentKneeAngle(kneeAngle);
+    setCurrentLiveDepthAngle(activeSide ? getSquatDepthAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
+    setCurrentLiveHipAngle(activeSide ? getHipAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
+    setCurrentLiveBackAngle(activeSide ? getBackAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
   }, [poseEnabled, poseKeypoints, currentTime, videoSrc, kneeTrackingSide, facingDirection]);
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>) => {
@@ -1584,6 +1792,7 @@ export default function App() {
     if (!videoSrc) return;
     analysisAbortRef.current = true;
     setIsKneeGraphLocked(false);
+    if (!poseEnabled) setPoseEnabled(true);
     setGraphAnalysisRequested(true);
   };
 
@@ -1974,11 +2183,24 @@ export default function App() {
     setAngle(calculateJointAngle(p1, p2, p3));
   };
 
+  const handleAnalysisModeSwitch = (mode: AnalysisMode) => {
+    setAnalysisMode(mode);
+    if (mode === 'squat') {
+      setAngleLowerBound(40);
+      setAngleUpperBound(120);
+    } else {
+      setAngleLowerBound(100);
+      setAngleUpperBound(180);
+    }
+  };
+
   const renderKneeAnglePanel = () => {
     if (!isMediaLoaded) return null;
 
+    const isSquat = analysisMode === 'squat';
     const series = kneeAngleSeries;
-    const allMaxima = detectKneeAngleMaxima(series, {
+
+    const allMaxima = isSquat ? [] : detectKneeAngleMaxima(series, {
       lowerAngle: angleLowerBound,
       upperAngle: angleUpperBound,
       facing: facingDirection,
@@ -1993,40 +2215,89 @@ export default function App() {
       maxima.length > 0
         ? Math.max(...maxima.map((p) => p.angle))
         : null;
+
+    const valleys = isSquat ? detectKneeAngleMinima(series, {
+      lowerAngle: angleLowerBound,
+      upperAngle: angleUpperBound,
+    }) : [];
+    const belowParallelCount = valleys.filter((v) => v.belowParallel).length;
+    const avgRepKneeAngle =
+      valleys.length > 0
+        ? valleys.reduce((sum, v) => sum + v.angle, 0) / valleys.length
+        : null;
+    const avgDepthAngle =
+      valleys.length > 0
+        ? valleys.reduce((sum, v) => sum + v.depthAngle, 0) / valleys.length
+        : null;
+    const avgRepHipAngle = (() => {
+      const withHip = valleys.filter((v) => v.hipAngle !== null);
+      if (withHip.length === 0) return null;
+      return withHip.reduce((sum, v) => sum + v.hipAngle!, 0) / withHip.length;
+    })();
+    const avgRepBackAngle = (() => {
+      const withBack = valleys.filter((v) => v.backAngle !== null);
+      if (withBack.length === 0) return null;
+      return withBack.reduce((sum, v) => sum + v.backAngle!, 0) / withBack.length;
+    })();
+    const currentNearest = (() => {
+      if (!isSquat || series.length === 0) return null;
+      return series.reduce((best, s) =>
+        Math.abs(s.time - currentTime) < Math.abs(best.time - currentTime) ? s : best
+      );
+    })();
+    const currentDepthAngle = currentLiveDepthAngle ?? currentNearest?.depthAngle ?? null;
+    const currentHipAngle = currentLiveHipAngle ?? currentNearest?.hipAngle ?? null;
+    const currentBackAngle = currentLiveBackAngle ?? currentNearest?.backAngle ?? null;
+
     const seriesEndTime = series.length > 0 ? series[series.length - 1]!.time : 0;
     const sliderTime = Math.max(duration, currentTime, 0.0001);
     const maxTime = graphDomainTime > 0 ? graphDomainTime : Math.max(sliderTime, seriesEndTime, 0.0001);
-    const minAngle = 0;
-    const maxAngle = 180;
     const graphHeight = 140;
+
+    const strideMinAngle = 0;
+    const strideMaxAngle = 180;
+
+    const depthAngles = isSquat ? series.map(s => s.depthAngle).filter((d): d is number => d !== null) : [];
+    const depthMinRaw = depthAngles.length > 0 ? Math.min(...depthAngles) : -30;
+    const depthMaxRaw = depthAngles.length > 0 ? Math.max(...depthAngles) : 80;
+    const sqMinAngle = Math.min(depthMinRaw - 5, -10);
+    const sqMaxAngle = Math.max(depthMaxRaw + 5, 10);
+
+    const gMin = isSquat ? sqMinAngle : strideMinAngle;
+    const gMax = isSquat ? sqMaxAngle : strideMaxAngle;
+
     const lowerY = clamp(
-      graphHeight - ((angleLowerBound - minAngle) / (maxAngle - minAngle)) * graphHeight,
+      graphHeight - ((angleLowerBound - gMin) / (gMax - gMin)) * graphHeight,
       0,
       graphHeight,
     );
     const upperY = clamp(
-      graphHeight - ((angleUpperBound - minAngle) / (maxAngle - minAngle)) * graphHeight,
+      graphHeight - ((angleUpperBound - gMin) / (gMax - gMin)) * graphHeight,
       0,
       graphHeight,
     );
+    const parallelY = isSquat
+      ? clamp(graphHeight - ((0 - gMin) / (gMax - gMin)) * graphHeight, 0, graphHeight)
+      : 0;
     const updateBoundFromPointer = (clientY: number, svg: SVGSVGElement | null, bound: 'lower' | 'upper') => {
       if (!svg) return;
       const rect = svg.getBoundingClientRect();
       if (rect.height <= 0) return;
       const yPx = clamp(clientY - rect.top, 0, rect.height);
       const yNorm = yPx / rect.height;
-      const nextAngle = maxAngle - yNorm * (maxAngle - minAngle);
+      const nextAngle = gMax - yNorm * (gMax - gMin);
       if (bound === 'lower') {
-        setAngleLowerBound(clamp(nextAngle, minAngle, angleUpperBound - 1));
+        setAngleLowerBound(clamp(nextAngle, gMin, angleUpperBound - 1));
       } else {
-        setAngleUpperBound(clamp(nextAngle, angleLowerBound + 1, maxAngle));
+        setAngleUpperBound(clamp(nextAngle, angleLowerBound + 1, gMax));
       }
     };
 
     const linePath = series
       .map((sample, idx) => {
         const x = (sample.time / maxTime) * 100;
-        const y = graphHeight - ((sample.angle - minAngle) / (maxAngle - minAngle)) * graphHeight;
+        const val = isSquat ? (sample.depthAngle ?? 0) : sample.angle;
+        const y = graphHeight - ((val - gMin) / (gMax - gMin)) * graphHeight;
         return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(3)} ${y.toFixed(3)}`;
       })
       .join(' ');
@@ -2035,39 +2306,44 @@ export default function App() {
       <section className="rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4">
         <div className="mb-2 flex items-center justify-between gap-2">
           <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
-            Knee Angle (Hip-Knee-Ankle)
+            {isSquat ? 'Squat Depth — Below Parallel' : 'Knee Angle (Hip-Knee-Ankle)'}
           </h3>
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                const next: FacingDirection = facingDirection === 'right' ? 'left' : 'right';
-                setFacingDirection(next);
-                setKneeTrackingSide(facingDirectionToLeg(next));
-              }}
-              className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
-              title={`Facing ${facingDirection} — click to flip (tracks ${facingDirectionToLeg(facingDirection)} leg)`}
-            >
-              {facingDirection === 'right'
-                ? <><span>Facing</span><ChevronRight className="h-3.5 w-3.5" /></>
-                : <><ChevronLeft className="h-3.5 w-3.5" /><span>Facing</span></>
-              }
-            </button>
-            <button
-              type="button"
-              onClick={() => setExtensionFilter((prev) => (prev === 'forward' ? 'behind' : 'forward'))}
-              className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
-              title="Toggle forward / behind extension filter"
-            >
-              {extensionFilter === 'forward' ? 'Forward' : 'Behind'}
-            </button>
+            {!isSquat && (
+              <button
+                type="button"
+                onClick={() => setExtensionFilter((prev) => (prev === 'forward' ? 'behind' : 'forward'))}
+                className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
+                title="Toggle forward / behind extension filter"
+              >
+                {extensionFilter === 'forward' ? 'Forward' : 'Behind'}
+              </button>
+            )}
+            <div className="flex rounded-md border border-[var(--color-accent)]/20 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => handleAnalysisModeSwitch('stride')}
+                className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+                title="Stride analysis — track extension peaks"
+              >
+                Stride
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAnalysisModeSwitch('squat')}
+                className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+                title="Squat analysis — track depth valleys and 90° threshold"
+              >
+                Squat
+              </button>
+            </div>
             {videoSrc ? (
               <button
                 type="button"
                 onClick={runGraphAnalysis}
                 className="rounded-md border border-[var(--color-accent)]/20 p-1.5 hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
-                title="Re-analyze graph"
-                aria-label="Re-analyze graph"
+                title="Analyze graph"
+                aria-label="Analyze graph"
               >
                 <LineChart className="h-4 w-4" />
               </button>
@@ -2075,14 +2351,15 @@ export default function App() {
           </div>
         </div>
         {videoSrc ? (
-          <div className="rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
+          <div className="relative rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
             {series.length >= 2 ? (
+              <>
               <svg
                 viewBox={`0 0 100 ${graphHeight}`}
                 preserveAspectRatio="none"
                 className="h-36 w-full"
                 role="img"
-                aria-label="Knee angle over time"
+                aria-label={isSquat ? 'Squat depth over time' : 'Knee angle over time'}
               >
                 <path
                   d={linePath}
@@ -2093,33 +2370,39 @@ export default function App() {
                   strokeLinejoin="round"
                   vectorEffect="non-scaling-stroke"
                 />
-                <rect
-                  x={0}
-                  y={upperY}
-                  width={100}
-                  height={Math.max(0, lowerY - upperY)}
-                  fill="var(--color-accent)"
-                  opacity={0.06}
-                />
-                <line x1={0} y1={lowerY} x2={100} y2={lowerY} stroke="#ff4d4f" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
-                <line
-                  x1={0} y1={lowerY} x2={100} y2={lowerY}
-                  stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
-                  onPointerDown={(e) => { setDraggingBound('lower'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
-                  onPointerMove={(e) => { if (draggingBound === 'lower') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
-                  onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
-                  onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
-                />
-                <line x1={0} y1={upperY} x2={100} y2={upperY} stroke="#52c41a" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
-                <line
-                  x1={0} y1={upperY} x2={100} y2={upperY}
-                  stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
-                  onPointerDown={(e) => { setDraggingBound('upper'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
-                  onPointerMove={(e) => { if (draggingBound === 'upper') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
-                  onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
-                  onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
-                />
-                {otherMaxima.map((peak) => {
+                {isSquat ? (
+                  <line x1={0} y1={parallelY} x2={100} y2={parallelY} stroke="#ffffff" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.5} vectorEffect="non-scaling-stroke" />
+                ) : (
+                  <>
+                    <rect
+                      x={0}
+                      y={upperY}
+                      width={100}
+                      height={Math.max(0, lowerY - upperY)}
+                      fill="var(--color-accent)"
+                      opacity={0.06}
+                    />
+                    <line x1={0} y1={lowerY} x2={100} y2={lowerY} stroke="#ff4d4f" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
+                    <line
+                      x1={0} y1={lowerY} x2={100} y2={lowerY}
+                      stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
+                      onPointerDown={(e) => { setDraggingBound('lower'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
+                      onPointerMove={(e) => { if (draggingBound === 'lower') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
+                      onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+                      onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+                    />
+                    <line x1={0} y1={upperY} x2={100} y2={upperY} stroke="#52c41a" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
+                    <line
+                      x1={0} y1={upperY} x2={100} y2={upperY}
+                      stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
+                      onPointerDown={(e) => { setDraggingBound('upper'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
+                      onPointerMove={(e) => { if (draggingBound === 'upper') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
+                      onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+                      onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+                    />
+                  </>
+                )}
+                {!isSquat && otherMaxima.map((peak) => {
                   const x = (peak.time / maxTime) * 100;
                   return (
                     <line
@@ -2136,7 +2419,7 @@ export default function App() {
                     />
                   );
                 })}
-                {maxima.map((peak) => {
+                {!isSquat && maxima.map((peak) => {
                   const x = (peak.time / maxTime) * 100;
                   return (
                     <line
@@ -2153,10 +2436,53 @@ export default function App() {
                     />
                   );
                 })}
+                {isSquat && valleys.map((valley) => {
+                  const x = (valley.time / maxTime) * 100;
+                  return (
+                    <line
+                      key={`valley-${valley.time.toFixed(4)}`}
+                      x1={x}
+                      y1={0}
+                      x2={x}
+                      y2={graphHeight}
+                      stroke={valley.belowParallel ? '#52c41a' : '#ff4d4f'}
+                      strokeWidth={0.4}
+                      strokeDasharray="1.25 1.15"
+                      opacity={0.95}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  );
+                })}
               </svg>
+              {isSquat ? (
+                <span
+                  className="pointer-events-none absolute left-1 text-[10px] font-medium leading-none"
+                  style={{bottom: `${((0 - gMin) / (gMax - gMin)) * 100}%`, color: '#ffffff', opacity: 0.5, transform: 'translateY(-2px)'}}
+                >
+                  0° parallel
+                </span>
+              ) : (
+                <>
+                  <span
+                    className="pointer-events-none absolute left-1 text-[10px] font-medium leading-none"
+                    style={{bottom: `${((angleUpperBound - gMin) / (gMax - gMin)) * 100}%`, color: '#52c41a', transform: 'translateY(-2px)'}}
+                  >
+                    {angleUpperBound.toFixed(0)}°
+                  </span>
+                  <span
+                    className="pointer-events-none absolute left-1 text-[10px] font-medium leading-none"
+                    style={{bottom: `${((angleLowerBound - gMin) / (gMax - gMin)) * 100}%`, color: '#ff4d4f', transform: 'translateY(-2px)'}}
+                  >
+                    {angleLowerBound.toFixed(0)}°
+                  </span>
+                </>
+              )}
+              </>
             ) : (
               <p className="py-8 text-center text-sm text-[var(--color-text-light)]">
-                Play or scrub the video to collect knee-angle samples.
+                {isSquat
+                  ? 'Play or scrub the video to collect squat-depth samples.'
+                  : 'Play or scrub the video to collect knee-angle samples.'}
               </p>
             )}
           </div>
@@ -2178,27 +2504,85 @@ export default function App() {
             </div>
           </div>
         )}
-        <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
-          <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
-          <p>Samples: {series.length}</p>
-          <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {maxima.length}</p>
-          <p>
-            Avg peak: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}
-          </p>
-          <p>
-            Max peak: {maxPeakAngle !== null ? `${maxPeakAngle.toFixed(1)}°` : '—'}
-          </p>
-          <p>
-            Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°
-          </p>
-          <p>
-            {isPoseAnalyzing
-              ? `analyzing (${kneeTrackingSide ?? 'auto'} leg)`
-              : graphAnalysisRequested
-                ? 'loading model'
-                : `${kneeTrackingSide ? `${kneeTrackingSide} leg` : 'auto'} (facing ${facingDirection})`}
-          </p>
-        </div>
+        {isSquat ? (
+          <>
+            <div className="mt-2 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
+              <p className="font-medium text-[var(--color-accent)]">Knee: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
+              <p className="font-medium text-[var(--color-accent)]">Depth: {currentDepthAngle !== null ? `${currentDepthAngle.toFixed(1)}°` : '—'}</p>
+              <p className="font-medium text-[var(--color-accent)]">Hip: {currentHipAngle !== null ? `${currentHipAngle.toFixed(1)}°` : '—'}</p>
+              <p className="font-medium text-[var(--color-accent)]">Back: {currentBackAngle !== null ? `${currentBackAngle.toFixed(1)}°` : '—'}</p>
+            </div>
+            <div className="mt-1 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
+              <p>Avg: {avgRepKneeAngle !== null ? `${avgRepKneeAngle.toFixed(1)}°` : '—'}</p>
+              <p>Avg: {avgDepthAngle !== null ? `${avgDepthAngle.toFixed(1)}°` : '—'}</p>
+              <p>Avg: {avgRepHipAngle !== null ? `${avgRepHipAngle.toFixed(1)}°` : '—'}</p>
+              <p>Avg: {avgRepBackAngle !== null ? `${avgRepBackAngle.toFixed(1)}°` : '—'}</p>
+            </div>
+          </>
+        
+        ) : (
+          <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
+            <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
+            <p>Samples: {series.length}</p>
+            <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {maxima.length}</p>
+            <p>
+              Avg peak: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}
+            </p>
+            <p>
+              Max peak: {maxPeakAngle !== null ? `${maxPeakAngle.toFixed(1)}°` : '—'}
+            </p>
+            <p>
+              Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°
+            </p>
+            <p className="flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => {
+                  const next: FacingDirection = facingDirection === 'right' ? 'left' : 'right';
+                  setFacingDirection(next);
+                  setKneeTrackingSide(facingDirectionToLeg(next));
+                }}
+                className="flex items-center gap-0.5 text-[10px] opacity-40 hover:opacity-70 transition-opacity text-[var(--color-text-light)]"
+                title={`Facing ${facingDirection} (auto-detected) — click to override`}
+              >
+                {facingDirection === 'right'
+                  ? <><span>Facing</span><ChevronRight className="h-3 w-3" /></>
+                  : <><ChevronLeft className="h-3 w-3" /><span>Facing</span></>
+                }
+              </button>
+            </p>
+          </div>
+        )}
+        {isSquat && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-[var(--color-text-light)]">
+            <span className="text-xs">Reps: {valleys.length}</span>
+            <span className="text-xs" style={{color: valleys.length > 0 ? (belowParallelCount === valleys.length ? '#52c41a' : belowParallelCount > 0 ? '#faad14' : '#ff4d4f') : undefined}}>
+              Below parallel: {belowParallelCount}/{valleys.length}
+            </span>
+            {series.length >= 2 && (
+              <>
+                <span className="flex items-center gap-1"><span className="inline-block h-2 w-4 rounded-sm" style={{background: '#52c41a'}} /> below (depth &lt; 0°)</span>
+                <span className="flex items-center gap-1"><span className="inline-block h-2 w-4 rounded-sm" style={{background: '#ff4d4f'}} /> above (depth &gt; 0°)</span>
+              </>
+            )}
+            {isPoseAnalyzing && <span className="text-xs">analyzing...</span>}
+            <button
+              type="button"
+              onClick={() => {
+                const next: FacingDirection = facingDirection === 'right' ? 'left' : 'right';
+                setFacingDirection(next);
+                setKneeTrackingSide(facingDirectionToLeg(next));
+              }}
+              className="ml-auto flex items-center gap-0.5 text-[10px] opacity-40 hover:opacity-70 transition-opacity text-[var(--color-text-light)]"
+              title={`Facing ${facingDirection} (auto-detected) — click to override`}
+            >
+              {facingDirection === 'right'
+                ? <><span>Facing</span><ChevronRight className="h-3 w-3" /></>
+                : <><ChevronLeft className="h-3 w-3" /><span>Facing</span></>
+              }
+            </button>
+          </div>
+        )}
       </section>
     );
   };
