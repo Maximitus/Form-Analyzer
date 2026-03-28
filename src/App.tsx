@@ -101,20 +101,9 @@ const POSE_LEG_CONNECTIONS: [number, number][] = [
 ];
 const MIN_POSE_VISIBILITY = 0.25;
 const KNEE_SAMPLE_EPSILON_SECONDS = 1 / 1000;
-const POSE_ANALYSIS_PLAYBACK_RATE = 0.15;
 const POSE_INFERENCE_HZ = 24;
-const POSE_EMA_ALPHA = 0.55;
-const DEFAULT_ANKLE_LEAD = 0.030;
-const DEFAULT_KNEE_LEAD = 0.012;
-const DEFAULT_HIP_LEAD = 0.000;
-const HIP_OVERLAY_ALPHA = 0.08;
-const VELOCITY_WINDOW = 1 / 30;
 const KNEE_MAXIMA_MIN_SAMPLES = 3;
-const KNEE_MAXIMA_SMOOTH_RADIUS = 2;
-const KNEE_MAXIMA_MIN_ANGLE_DEGREES = 120;
-const KNEE_MAXIMA_MIN_PROMINENCE_DEGREES = 0;
-const KNEE_MAXIMA_MIN_GAP_SECONDS = 0.2;
-const KNEE_MAXIMA_PROMINENCE_WINDOW = 3;
+const KNEE_MAXIMA_MIN_GAP_SECONDS = 0.1;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -192,53 +181,6 @@ function pickKneeTrackingSide(
   return leftScore >= rightScore ? 'left' : 'right';
 }
 
-function smoothPosePoints(
-  next: {x: number; y: number; v: number}[],
-  previous: {x: number; y: number; v: number}[] | null,
-  alpha = POSE_EMA_ALPHA,
-) {
-  if (!previous || previous.length !== next.length) return next;
-  return next.map((p, i) => {
-    const prev = previous[i]!;
-    return {
-      x: prev.x + (p.x - prev.x) * alpha,
-      y: prev.y + (p.y - prev.y) * alpha,
-      v: prev.v + (p.v - prev.v) * alpha,
-    };
-  });
-}
-
-function movingAverageSeries<T extends {angle: number}>(series: T[], radius = 2) {
-  if (series.length === 0 || radius <= 0) return series;
-  return series.map((sample, i) => {
-    const start = Math.max(0, i - radius);
-    const end = Math.min(series.length - 1, i + radius);
-    let sum = 0;
-    let count = 0;
-    for (let j = start; j <= end; j += 1) {
-      sum += series[j]!.angle;
-      count += 1;
-    }
-    return {...sample, angle: sum / Math.max(1, count)};
-  });
-}
-
-function movingAverageValues(values: number[], radius = 2) {
-  if (values.length === 0 || radius <= 0) return values;
-  return values.map((_, i) => {
-    const start = Math.max(0, i - radius);
-    const end = Math.min(values.length - 1, i + radius);
-    let sum = 0;
-    let count = 0;
-    for (let j = start; j <= end; j += 1) {
-      sum += values[j] ?? 0;
-      count += 1;
-    }
-    return sum / Math.max(1, count);
-  });
-}
-
-
 function getTrackedLegAnchors(
   keypoints: {x: number; y: number; v: number}[],
   side: KneeSide,
@@ -286,35 +228,19 @@ function facingDirectionToLeg(facing: FacingDirection): KneeSide {
 function detectKneeAngleMaxima(
   series: {time: number; angle: number; hipX: number; ankleX: number}[],
   options: {
-    minAngle: number;
-    minProminence: number;
-    minGapSeconds: number;
-    smoothRadius: number;
+    lowerAngle: number;
+    upperAngle: number;
     facing: FacingDirection;
   },
 ): KneeAnglePeak[] {
   if (series.length < KNEE_MAXIMA_MIN_SAMPLES) return [];
-  const radius = Math.max(0, Math.round(options.smoothRadius));
-  const smoothed = movingAverageValues(series.map((s) => s.angle), radius);
   const candidates: {index: number; angle: number; direction: ExtensionDirection}[] = [];
-  for (let i = 1; i < smoothed.length - 1; i += 1) {
-    const prev = smoothed[i - 1] ?? 0;
-    const current = smoothed[i] ?? 0;
-    const next = smoothed[i + 1] ?? 0;
+  for (let i = 1; i < series.length - 1; i += 1) {
+    const prev = series[i - 1]!.angle;
+    const current = series[i]!.angle;
+    const next = series[i + 1]!.angle;
     const isPeak = (current >= prev && current > next) || (current > prev && current >= next);
-    if (!isPeak || current < options.minAngle) continue;
-    const leftStart = Math.max(0, i - KNEE_MAXIMA_PROMINENCE_WINDOW);
-    const rightEnd = Math.min(smoothed.length - 1, i + KNEE_MAXIMA_PROMINENCE_WINDOW);
-    let leftMin = current;
-    let rightMin = current;
-    for (let j = leftStart; j <= i; j += 1) {
-      leftMin = Math.min(leftMin, smoothed[j] ?? leftMin);
-    }
-    for (let j = i; j <= rightEnd; j += 1) {
-      rightMin = Math.min(rightMin, smoothed[j] ?? rightMin);
-    }
-    const prominence = current - Math.max(leftMin, rightMin);
-    if (prominence < options.minProminence) continue;
+    if (!isPeak || current < options.lowerAngle || current > options.upperAngle) continue;
     const s = series[i]!;
     const delta = s.ankleX - s.hipX;
     const isForward = options.facing === 'left' ? delta < 0 : delta > 0;
@@ -326,7 +252,7 @@ function detectKneeAngleMaxima(
   const kept: typeof candidates = [];
   for (const c of candidates) {
     const t = series[c.index]!.time;
-    const tooClose = kept.some((k) => Math.abs(t - series[k.index]!.time) < options.minGapSeconds);
+    const tooClose = kept.some((k) => Math.abs(t - series[k.index]!.time) < KNEE_MAXIMA_MIN_GAP_SECONDS);
     if (!tooClose) kept.push(c);
   }
 
@@ -354,24 +280,9 @@ function findNearestCachedPose(
   const lower = lo > 0 ? lo - 1 : 0;
   if (upper === lower) return cache[upper]!.keypoints;
 
-  const tLo = cache[lower]!.time;
-  const tHi = cache[upper]!.time;
-  const dt = tHi - tLo;
-  if (dt <= 0) return cache[upper]!.keypoints;
-
-  const t = Math.max(0, Math.min(1, (time - tLo) / dt));
-  const kpsLo = cache[lower]!.keypoints;
-  const kpsHi = cache[upper]!.keypoints;
-  if (kpsLo.length !== kpsHi.length) return kpsLo;
-
-  return kpsLo.map((pLo, i) => {
-    const pHi = kpsHi[i]!;
-    return {
-      x: pLo.x + (pHi.x - pLo.x) * t,
-      y: pLo.y + (pHi.y - pLo.y) * t,
-      v: pLo.v + (pHi.v - pLo.v) * t,
-    };
-  });
+  const distLo = Math.abs(time - cache[lower]!.time);
+  const distHi = Math.abs(time - cache[upper]!.time);
+  return distLo <= distHi ? cache[lower]!.keypoints : cache[upper]!.keypoints;
 }
 
 /** Media/content coordinates → overlay (viewport) pixels — identity when not zoomed. */
@@ -437,30 +348,19 @@ export default function App() {
   const [isKneeGraphLocked, setIsKneeGraphLocked] = useState(false);
   const [graphAnalysisRequested, setGraphAnalysisRequested] = useState(false);
   const [graphDomainTime, setGraphDomainTime] = useState(0);
-  const [peakAngleThreshold, setPeakAngleThreshold] = useState(KNEE_MAXIMA_MIN_ANGLE_DEGREES);
-  const [peakSmoothRadius, setPeakSmoothRadius] = useState(KNEE_MAXIMA_SMOOTH_RADIUS);
-  const [peakMinProminence, setPeakMinProminence] = useState(KNEE_MAXIMA_MIN_PROMINENCE_DEGREES);
-  const [peakMinGapSeconds, setPeakMinGapSeconds] = useState(KNEE_MAXIMA_MIN_GAP_SECONDS);
-  const [isThresholdDragging, setIsThresholdDragging] = useState(false);
+  const [angleLowerBound, setAngleLowerBound] = useState(100);
+  const [angleUpperBound, setAngleUpperBound] = useState(180);
+  const [draggingBound, setDraggingBound] = useState<'lower' | 'upper' | null>(null);
   const [extensionFilter, setExtensionFilter] = useState<ExtensionDirection>('forward');
   const [facingDirection, setFacingDirection] = useState<FacingDirection>('right');
-  const [ankleLead, setAnkleLead] = useState(DEFAULT_ANKLE_LEAD);
-  const [kneeLead, setKneeLead] = useState(DEFAULT_KNEE_LEAD);
-  const [hipLead, setHipLead] = useState(DEFAULT_HIP_LEAD);
   const poseDetectorRef = useRef<poseDetection.PoseDetector | null>(null);
   const poseRafRef = useRef<number | null>(null);
-  const primaryPoseSmoothRef = useRef<{x: number; y: number; v: number}[] | null>(null);
-  const comparePoseSmoothRef = useRef<{x: number; y: number; v: number}[] | null>(null);
+  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
   const [poseStatus, setPoseStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const poseCacheRef = useRef<{time: number; keypoints: {x: number; y: number; v: number}[]}[]>([]);
   const [analysisProgress, setAnalysisProgress] = useState<number | null>(null);
   const analysisAbortRef = useRef(false);
-  const jointPredRef = useRef<{
-    prevTime: number;
-    prevPositions: {x: number; y: number}[];
-    velocity: {vx: number; vy: number}[];
-  }>({prevTime: -1, prevPositions: [], velocity: []});
-  const hipSmoothRef = useRef<{x: number; y: number; v: number}[] | null>(null);
+  const analysisGenRef = useRef(0);
   const [compareMediaLayoutVersion, setCompareMediaLayoutVersion] = useState(0);
 
   const mapPoseNormToCanvasOverlayPx = (
@@ -916,6 +816,7 @@ export default function App() {
         cancelAnimationFrame(poseRafRef.current);
         poseRafRef.current = null;
       }
+      analysisAbortRef.current = true;
       poseDetectorRef.current?.dispose();
       poseDetectorRef.current = null;
     };
@@ -938,9 +839,6 @@ export default function App() {
     if (!poseEnabled || (!videoSrc && !imageSrc && !compareVideoSrc && !compareImageSrc)) {
       setPoseKeypoints([]);
       setComparePoseKeypoints([]);
-      primaryPoseSmoothRef.current = null;
-      comparePoseSmoothRef.current = null;
-      hipSmoothRef.current = null;
       if (poseRafRef.current !== null) {
         cancelAnimationFrame(poseRafRef.current);
         poseRafRef.current = null;
@@ -982,7 +880,6 @@ export default function App() {
       poses: poseDetection.Pose[] | null | undefined,
       source: HTMLVideoElement | HTMLImageElement | null,
       setter: (next: {x: number; y: number; v: number}[]) => void,
-      smoothRef: {current: {x: number; y: number; v: number}[] | null},
     ) => {
       const keypoints = poses?.[0]?.keypoints;
       const sourceWidth =
@@ -990,7 +887,6 @@ export default function App() {
       const sourceHeight =
         source instanceof HTMLVideoElement ? source.videoHeight : source instanceof HTMLImageElement ? source.naturalHeight : 0;
       if (!keypoints || keypoints.length === 0 || sourceWidth <= 0 || sourceHeight <= 0) {
-        smoothRef.current = null;
         setter([]);
         return;
       }
@@ -1001,9 +897,7 @@ export default function App() {
         const coords = p as {x: number; y: number};
         return {x: coords.x / sourceWidth, y: coords.y / sourceHeight, v: score};
       });
-      const smoothed = smoothPosePoints(selected, smoothRef.current);
-      smoothRef.current = smoothed;
-      setter(smoothed);
+      setter(selected);
     };
 
     const run = async () => {
@@ -1021,11 +915,11 @@ export default function App() {
         if (!hasAnyVideo) {
           if (imageSrc && primaryImage) {
             const result = await detector.estimatePoses(primaryImage, {flipHorizontal: false});
-            if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints, primaryPoseSmoothRef);
+            if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints);
           }
           if (compareImageSrc && compareImage) {
             const result = await detector.estimatePoses(compareImage, {flipHorizontal: false});
-            if (!cancelled) updatePoseFromResult(result, compareImage, setComparePoseKeypoints, comparePoseSmoothRef);
+            if (!cancelled) updatePoseFromResult(result, compareImage, setComparePoseKeypoints);
           }
           return;
         }
@@ -1033,11 +927,11 @@ export default function App() {
         if (imageSrc && primaryImage) {
           // Primary is an image: detect once and keep it.
           const result = await detector.estimatePoses(primaryImage, {flipHorizontal: false});
-          if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints, primaryPoseSmoothRef);
+          if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints);
         }
         if (compareImageSrc && compareImage) {
           const result = await detector.estimatePoses(compareImage, {flipHorizontal: false});
-          if (!cancelled) updatePoseFromResult(result, compareImage, setComparePoseKeypoints, comparePoseSmoothRef);
+          if (!cancelled) updatePoseFromResult(result, compareImage, setComparePoseKeypoints);
         }
 
         const tick = async () => {
@@ -1054,7 +948,7 @@ export default function App() {
               lastPrimaryVideoTime = v.currentTime;
               lastPrimaryInferenceTs = now;
               const result = await detector.estimatePoses(v, {flipHorizontal: false});
-              if (!cancelled) updatePoseFromResult(result, v, setPoseKeypoints, primaryPoseSmoothRef);
+              if (!cancelled) updatePoseFromResult(result, v, setPoseKeypoints);
             }
           }
 
@@ -1068,7 +962,7 @@ export default function App() {
               lastCompareVideoTime = v.currentTime;
               lastCompareInferenceTs = now;
               const result = await detector.estimatePoses(v, {flipHorizontal: false});
-              if (!cancelled) updatePoseFromResult(result, v, setComparePoseKeypoints, comparePoseSmoothRef);
+              if (!cancelled) updatePoseFromResult(result, v, setComparePoseKeypoints);
             }
           }
 
@@ -1091,26 +985,6 @@ export default function App() {
       }
     };
   }, [poseEnabled, videoSrc, imageSrc, compareVideoSrc, compareImageSrc]);
-
-  useEffect(() => {
-    if (!poseEnabled || poseKeypoints.length !== POSE_HIP_KNEE_ANKLE_IDS.length) return;
-    const time = videoRef.current?.currentTime ?? 0;
-    const pred = jointPredRef.current;
-    if (pred.prevPositions.length === poseKeypoints.length && pred.prevTime >= 0) {
-      const dt = time - pred.prevTime;
-      if (dt > 0.001 && dt < 0.5) {
-        pred.velocity = poseKeypoints.map((p, i) => {
-          const prev = pred.prevPositions[i];
-          return {
-            vx: (p.x - prev.x) / dt,
-            vy: (p.y - prev.y) / dt,
-          };
-        });
-      }
-    }
-    pred.prevTime = time;
-    pred.prevPositions = poseKeypoints.map(p => ({x: p?.x ?? 0, y: p?.y ?? 0}));
-  }, [poseKeypoints, poseEnabled]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1156,70 +1030,6 @@ export default function App() {
       let overlayKps = poseCacheRef.current.length > 0
         ? findNearestCachedPose(poseCacheRef.current, overlayTime) ?? poseKeypoints
         : poseKeypoints;
-
-      if (poseEnabled && overlayKps.length === POSE_HIP_KNEE_ANKLE_IDS.length) {
-        const adjusted = overlayKps.slice();
-        const jointLeads: {lead: number; indices: number[]}[] = [];
-        if (ankleLead > 0) jointLeads.push({lead: ankleLead, indices: [4, 5]});
-        if (kneeLead > 0) jointLeads.push({lead: kneeLead, indices: [2, 3]});
-        if (hipLead > 0) jointLeads.push({lead: hipLead, indices: [0, 1]});
-
-        if (jointLeads.length > 0) {
-          if (poseCacheRef.current.length > 0) {
-            const pastTime = Math.max(0, overlayTime - VELOCITY_WINDOW);
-            const pastKps = findNearestCachedPose(poseCacheRef.current, pastTime);
-            const dt = overlayTime - pastTime;
-            if (pastKps && dt > 0.001) {
-              for (const {lead, indices} of jointLeads) {
-                for (const idx of indices) {
-                  const curr = adjusted[idx];
-                  const past = pastKps[idx];
-                  if (curr && past && curr.v >= 0.25 && past.v >= 0.25) {
-                    adjusted[idx] = {
-                      x: curr.x + ((curr.x - past.x) / dt) * lead,
-                      y: curr.y + ((curr.y - past.y) / dt) * lead,
-                      v: curr.v,
-                    };
-                  }
-                }
-              }
-            }
-          } else {
-            const vel = jointPredRef.current.velocity;
-            for (const {lead, indices} of jointLeads) {
-              for (const idx of indices) {
-                const p = adjusted[idx];
-                const v = vel[idx];
-                if (p && v && p.v >= 0.25) {
-                  adjusted[idx] = {
-                    x: p.x + v.vx * lead,
-                    y: p.y + v.vy * lead,
-                    v: p.v,
-                  };
-                }
-              }
-            }
-          }
-        }
-
-        const prevHips = hipSmoothRef.current;
-        if (prevHips && prevHips.length === 2) {
-          for (let i = 0; i < 2; i++) {
-            const curr = adjusted[i];
-            const prev = prevHips[i];
-            if (curr && prev && curr.v >= 0.25) {
-              adjusted[i] = {
-                x: prev.x + (curr.x - prev.x) * HIP_OVERLAY_ALPHA,
-                y: prev.y + (curr.y - prev.y) * HIP_OVERLAY_ALPHA,
-                v: curr.v,
-              };
-            }
-          }
-        }
-        hipSmoothRef.current = [adjusted[0] ?? {x: 0, y: 0, v: 0}, adjusted[1] ?? {x: 0, y: 0, v: 0}];
-
-        overlayKps = adjusted;
-      }
 
       if (poseEnabled && overlayKps.length === POSE_HIP_KNEE_ANKLE_IDS.length) {
         const byId = new Map<number, {x: number; y: number; v: number}>();
@@ -1299,7 +1109,7 @@ export default function App() {
         if (rafId !== null) cancelAnimationFrame(rafId);
       };
     }
-  }, [points, videoSrc, imageSrc, angle, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints, accentId, kneeTrackingSide, currentTime, ankleLead, kneeLead, hipLead]);
+  }, [points, videoSrc, imageSrc, angle, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints, accentId, kneeTrackingSide, currentTime]);
 
   // Compare panel pose overlay (independent from primary zoom/pan)
   useEffect(() => {
@@ -1447,27 +1257,30 @@ export default function App() {
   }, [videoSrc]);
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
     if (!poseEnabled) {
-      video.playbackRate = 1;
       setIsPoseAnalyzing(false);
       setGraphAnalysisRequested(false);
       analysisAbortRef.current = true;
+      analysisGenRef.current += 1;
       setAnalysisProgress(null);
     }
   }, [poseEnabled]);
 
   const runFrameByFrameAnalysis = useCallback(async () => {
-    const video = videoRef.current;
-    if (!video) return;
+    const bgVideo = bgVideoRef.current;
+    const mainVideo = videoRef.current;
+    if (!bgVideo || !mainVideo) return;
     const detector = poseDetectorRef.current;
     if (!detector) return;
 
-    const targetDuration = Math.max(getReliableVideoDuration(video), video.duration || 0, 0);
+    const targetDuration = Math.max(getReliableVideoDuration(mainVideo), mainVideo.duration || 0, 0);
     if (targetDuration <= 0) return;
 
     const activeSide = facingDirectionToLeg(facingDirection);
+
+    analysisAbortRef.current = true;
+    const gen = ++analysisGenRef.current;
+    const isStale = () => analysisGenRef.current !== gen;
 
     setKneeAngleSeries([]);
     setPosePointSeries([]);
@@ -1477,21 +1290,45 @@ export default function App() {
     setIsPoseAnalyzing(true);
     setGraphDomainTime(targetDuration);
     setAnalysisProgress(0);
-    setIsPlaying(false);
-    video.pause();
-    video.playbackRate = 1;
     analysisAbortRef.current = false;
 
     const ANALYSIS_FPS = 30;
     const frameStep = 1 / ANALYSIS_FPS;
     const totalFrames = Math.ceil(targetDuration * ANALYSIS_FPS);
-    const sourceWidth = video.videoWidth;
-    const sourceHeight = video.videoHeight;
+
+    const PROGRESSIVE_BATCH = 15;
+
+    const waitForBgVideoReady = (): Promise<boolean> =>
+      new Promise((resolve) => {
+        if (bgVideo.readyState >= 2) { resolve(true); return; }
+        let resolved = false;
+        const finish = (ok: boolean) => {
+          if (resolved) return;
+          resolved = true;
+          bgVideo.removeEventListener('canplay', onReady);
+          resolve(ok);
+        };
+        const onReady = () => finish(true);
+        bgVideo.addEventListener('canplay', onReady);
+        setTimeout(() => finish(bgVideo.readyState >= 2), 5000);
+      });
+
+    const ready = await waitForBgVideoReady();
+    if (!ready || isStale()) {
+      if (!isStale()) {
+        setIsPoseAnalyzing(false);
+        setAnalysisProgress(null);
+      }
+      return;
+    }
+
+    const sourceWidth = bgVideo.videoWidth || mainVideo.videoWidth;
+    const sourceHeight = bgVideo.videoHeight || mainVideo.videoHeight;
 
     const seekAndWait = (t: number): Promise<void> =>
       new Promise((resolve) => {
         const clamped = Math.min(t, targetDuration);
-        if (Math.abs(video.currentTime - clamped) < 0.005) {
+        if (Math.abs(bgVideo.currentTime - clamped) < 0.005) {
           resolve();
           return;
         }
@@ -1499,11 +1336,11 @@ export default function App() {
         const finish = () => {
           if (resolved) return;
           resolved = true;
-          video.removeEventListener('seeked', finish);
+          bgVideo.removeEventListener('seeked', finish);
           resolve();
         };
-        video.addEventListener('seeked', finish);
-        video.currentTime = clamped;
+        bgVideo.addEventListener('seeked', finish);
+        bgVideo.currentTime = clamped;
         setTimeout(finish, 2000);
       });
 
@@ -1512,23 +1349,22 @@ export default function App() {
     const angleSeries: {time: number; angle: number; hipX: number; ankleX: number}[] = [];
     const pointSeries: PoseFrameSample[] = [];
     const cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[] = [];
-    let prevSmoothed: {x: number; y: number; v: number}[] | null = null;
     let t = 0;
     let frameIdx = 0;
 
-    while (t <= targetDuration && !analysisAbortRef.current) {
+    while (t <= targetDuration && !isStale()) {
       await seekAndWait(t);
-      if (analysisAbortRef.current) break;
-      if (video.readyState < 2) {
+      if (isStale()) break;
+      if (bgVideo.readyState < 2) {
         await new Promise<void>((r) => {
-          const onReady = () => { video.removeEventListener('canplay', onReady); r(); };
-          video.addEventListener('canplay', onReady);
-          setTimeout(() => { video.removeEventListener('canplay', onReady); r(); }, 3000);
+          const onReady = () => { bgVideo.removeEventListener('canplay', onReady); r(); };
+          bgVideo.addEventListener('canplay', onReady);
+          setTimeout(() => { bgVideo.removeEventListener('canplay', onReady); r(); }, 3000);
         });
       }
 
-      const result = await detector.estimatePoses(video, {flipHorizontal: false});
-      if (analysisAbortRef.current) break;
+      const result = await detector.estimatePoses(bgVideo, {flipHorizontal: false});
+      if (isStale()) break;
       const keypoints = result?.[0]?.keypoints;
       let normalized: {x: number; y: number; v: number}[] = [];
       if (keypoints && keypoints.length > 0 && sourceWidth > 0 && sourceHeight > 0) {
@@ -1537,8 +1373,6 @@ export default function App() {
           if (!p) return {x: 0, y: 0, v: 0};
           return {x: p.x / sourceWidth, y: p.y / sourceHeight, v: p.score ?? 0};
         });
-        normalized = smoothPosePoints(normalized, prevSmoothed);
-        prevSmoothed = normalized;
       }
 
       cache.push({time: t, keypoints: normalized});
@@ -1561,55 +1395,57 @@ export default function App() {
         }
       }
 
-      setPoseKeypoints(normalized);
-      setCurrentTime(t);
-
       frameIdx += 1;
       const pct = Math.min(100, Math.round((frameIdx / totalFrames) * 100));
       setAnalysisProgress(pct);
 
-      if (frameIdx % 2 === 0) await yieldToUI();
+      if (frameIdx % PROGRESSIVE_BATCH === 0) {
+        poseCacheRef.current = cache.slice();
+        setKneeAngleSeries(angleSeries.slice());
+        setPosePointSeries(pointSeries.slice());
+        await yieldToUI();
+      } else if (frameIdx % 2 === 0) {
+        await yieldToUI();
+      }
 
       t += frameStep;
     }
 
-    if (!analysisAbortRef.current) {
+    if (!isStale()) {
       poseCacheRef.current = cache;
       setKneeAngleSeries(angleSeries);
       setPosePointSeries(pointSeries);
       setIsPoseAnalyzing(false);
       setIsKneeGraphLocked(true);
       setAnalysisProgress(null);
-      video.currentTime = 0;
-      setCurrentTime(0);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [facingDirection]);
 
   useEffect(() => {
-    if (!graphAnalysisRequested || !videoSrc) return;
-    if (!poseEnabled) {
-      setPoseEnabled(true);
-      return;
-    }
+    if (!poseEnabled || !videoSrc) return;
     if (poseStatus === 'error') {
-      setGraphAnalysisRequested(false);
       setIsPoseAnalyzing(false);
       return;
     }
     if (poseStatus !== 'ready') return;
-    if (!poseDetectorRef.current || !videoRef.current) return;
+    if (!poseDetectorRef.current || !videoRef.current || !bgVideoRef.current) return;
 
+    const mainVideo = videoRef.current;
     const targetDuration = Math.max(
-      getReliableVideoDuration(videoRef.current),
-      videoRef.current.duration || 0,
+      getReliableVideoDuration(mainVideo),
+      mainVideo.duration || 0,
       0,
     );
     if (targetDuration <= 0) return;
 
-    setGraphAnalysisRequested(false);
+    if (graphAnalysisRequested) {
+      setGraphAnalysisRequested(false);
+    }
+
     void runFrameByFrameAnalysis();
-  }, [graphAnalysisRequested, poseEnabled, poseStatus, videoSrc, runFrameByFrameAnalysis]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poseEnabled, poseStatus, videoSrc, graphAnalysisRequested, runFrameByFrameAnalysis]);
 
   useEffect(() => {
     setCompareCurrentTime(0);
@@ -1678,14 +1514,8 @@ export default function App() {
     setGraphDomainTime(0);
     setAnalysisProgress(null);
     analysisAbortRef.current = true;
-    primaryPoseSmoothRef.current = null;
-    comparePoseSmoothRef.current = null;
-    hipSmoothRef.current = null;
+    setIsPoseAnalyzing(false);
   }, [videoSrc, imageSrc]);
-
-  useEffect(() => {
-    comparePoseSmoothRef.current = null;
-  }, [compareVideoSrc, compareImageSrc]);
 
   useEffect(() => {
     if (!poseEnabled) {
@@ -1752,6 +1582,7 @@ export default function App() {
 
   const runGraphAnalysis = () => {
     if (!videoSrc) return;
+    analysisAbortRef.current = true;
     setIsKneeGraphLocked(false);
     setGraphAnalysisRequested(true);
   };
@@ -2148,10 +1979,8 @@ export default function App() {
 
     const series = kneeAngleSeries;
     const allMaxima = detectKneeAngleMaxima(series, {
-      minAngle: peakAngleThreshold,
-      minProminence: peakMinProminence,
-      minGapSeconds: peakMinGapSeconds,
-      smoothRadius: peakSmoothRadius,
+      lowerAngle: angleLowerBound,
+      upperAngle: angleUpperBound,
       facing: facingDirection,
     });
     const maxima = allMaxima.filter((p) => p.direction === extensionFilter);
@@ -2160,26 +1989,38 @@ export default function App() {
       maxima.length > 0
         ? maxima.reduce((sum, peak) => sum + peak.angle, 0) / maxima.length
         : null;
+    const maxPeakAngle =
+      maxima.length > 0
+        ? Math.max(...maxima.map((p) => p.angle))
+        : null;
     const seriesEndTime = series.length > 0 ? series[series.length - 1]!.time : 0;
     const sliderTime = Math.max(duration, currentTime, 0.0001);
-    // Keep a stable x-domain during analysis to avoid early stretching artifacts.
     const maxTime = graphDomainTime > 0 ? graphDomainTime : Math.max(sliderTime, seriesEndTime, 0.0001);
     const minAngle = 0;
     const maxAngle = 180;
     const graphHeight = 140;
-    const thresholdY = clamp(
-      graphHeight - ((peakAngleThreshold - minAngle) / (maxAngle - minAngle)) * graphHeight,
+    const lowerY = clamp(
+      graphHeight - ((angleLowerBound - minAngle) / (maxAngle - minAngle)) * graphHeight,
       0,
       graphHeight,
     );
-    const updateThresholdFromPointer = (clientY: number, svg: SVGSVGElement | null) => {
+    const upperY = clamp(
+      graphHeight - ((angleUpperBound - minAngle) / (maxAngle - minAngle)) * graphHeight,
+      0,
+      graphHeight,
+    );
+    const updateBoundFromPointer = (clientY: number, svg: SVGSVGElement | null, bound: 'lower' | 'upper') => {
       if (!svg) return;
       const rect = svg.getBoundingClientRect();
       if (rect.height <= 0) return;
       const yPx = clamp(clientY - rect.top, 0, rect.height);
       const yNorm = yPx / rect.height;
       const nextAngle = maxAngle - yNorm * (maxAngle - minAngle);
-      setPeakAngleThreshold(clamp(nextAngle, minAngle, maxAngle));
+      if (bound === 'lower') {
+        setAngleLowerBound(clamp(nextAngle, minAngle, angleUpperBound - 1));
+      } else {
+        setAngleUpperBound(clamp(nextAngle, angleLowerBound + 1, maxAngle));
+      }
     };
 
     const linePath = series
@@ -2224,10 +2065,9 @@ export default function App() {
               <button
                 type="button"
                 onClick={runGraphAnalysis}
-                disabled={isPoseAnalyzing || graphAnalysisRequested}
-                className={`rounded-md border border-[var(--color-accent)]/20 p-1.5 hover:bg-[var(--color-panel-hover)] ${isPoseAnalyzing || graphAnalysisRequested ? 'cursor-not-allowed opacity-50' : 'text-[var(--color-accent)]'}`}
-                title="Analyze graph"
-                aria-label="Analyze graph"
+                className="rounded-md border border-[var(--color-accent)]/20 p-1.5 hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
+                title="Re-analyze graph"
+                aria-label="Re-analyze graph"
               >
                 <LineChart className="h-4 w-4" />
               </button>
@@ -2253,50 +2093,31 @@ export default function App() {
                   strokeLinejoin="round"
                   vectorEffect="non-scaling-stroke"
                 />
-                <line
-                  x1={0}
-                  y1={thresholdY}
-                  x2={100}
-                  y2={thresholdY}
-                  stroke="#ff4d4f"
-                  strokeWidth={0.55}
-                  strokeDasharray="2 1.2"
-                  opacity={0.95}
-                  vectorEffect="non-scaling-stroke"
+                <rect
+                  x={0}
+                  y={upperY}
+                  width={100}
+                  height={Math.max(0, lowerY - upperY)}
+                  fill="var(--color-accent)"
+                  opacity={0.06}
                 />
+                <line x1={0} y1={lowerY} x2={100} y2={lowerY} stroke="#ff4d4f" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
                 <line
-                  x1={0}
-                  y1={thresholdY}
-                  x2={100}
-                  y2={thresholdY}
-                  stroke="transparent"
-                  strokeWidth={8}
-                  className="cursor-ns-resize"
-                  onPointerDown={(e) => {
-                    setIsThresholdDragging(true);
-                    e.currentTarget.setPointerCapture(e.pointerId);
-                    updateThresholdFromPointer(e.clientY, e.currentTarget.ownerSVGElement);
-                  }}
-                  onPointerMove={(e) => {
-                    if (!isThresholdDragging) return;
-                    updateThresholdFromPointer(e.clientY, e.currentTarget.ownerSVGElement);
-                  }}
-                  onPointerUp={(e) => {
-                    setIsThresholdDragging(false);
-                    try {
-                      e.currentTarget.releasePointerCapture(e.pointerId);
-                    } catch {
-                      /* ignore if not captured */
-                    }
-                  }}
-                  onPointerCancel={(e) => {
-                    setIsThresholdDragging(false);
-                    try {
-                      e.currentTarget.releasePointerCapture(e.pointerId);
-                    } catch {
-                      /* ignore if not captured */
-                    }
-                  }}
+                  x1={0} y1={lowerY} x2={100} y2={lowerY}
+                  stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
+                  onPointerDown={(e) => { setDraggingBound('lower'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
+                  onPointerMove={(e) => { if (draggingBound === 'lower') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
+                  onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+                  onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+                />
+                <line x1={0} y1={upperY} x2={100} y2={upperY} stroke="#52c41a" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
+                <line
+                  x1={0} y1={upperY} x2={100} y2={upperY}
+                  stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
+                  onPointerDown={(e) => { setDraggingBound('upper'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
+                  onPointerMove={(e) => { if (draggingBound === 'upper') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
+                  onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+                  onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
                 />
                 {otherMaxima.map((peak) => {
                   const x = (peak.time / maxTime) * 100;
@@ -2357,118 +2178,26 @@ export default function App() {
             </div>
           </div>
         )}
-        <div className="mt-2 grid grid-cols-1 gap-1 text-xs text-[var(--color-text-light)] sm:grid-cols-3">
-          <p>Degree: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
-          <p>
-            Tracking:{' '}
-            {isKneeGraphLocked
-              ? `locked (${kneeTrackingSide ?? 'auto'} leg, facing ${facingDirection})`
-              : isPoseAnalyzing
-                ? `analyzing (${kneeTrackingSide ?? 'auto'} leg, facing ${facingDirection})`
-                : graphAnalysisRequested
-                  ? 'preparing pose model'
-                  : `${kneeTrackingSide ? `${kneeTrackingSide} leg` : 'auto'} (facing ${facingDirection})`}
-          </p>
+        <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
+          <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
           <p>Samples: {series.length}</p>
-          <p>Pose point samples: {posePointSeries.length}</p>
-          <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} maxima: {maxima.length}</p>
+          <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {maxima.length}</p>
           <p>
-            Avg {extensionFilter} angle:{' '}
-            {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}
+            Avg peak: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}
           </p>
-        </div>
-        <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-[var(--color-text-light)] sm:grid-cols-2">
-          <label className="flex items-center gap-2">
-            <span className="min-w-[112px]">Threshold</span>
-            <input
-              type="range"
-              min={0}
-              max={180}
-              step={0.5}
-              value={peakAngleThreshold}
-              onChange={(e) => setPeakAngleThreshold(parseFloat(e.target.value))}
-              className="w-full"
-            />
-            <span className="w-14 text-right">{peakAngleThreshold.toFixed(1)}°</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="min-w-[112px]">Smooth</span>
-            <input
-              type="range"
-              min={0}
-              max={6}
-              step={1}
-              value={peakSmoothRadius}
-              onChange={(e) => setPeakSmoothRadius(parseInt(e.target.value, 10))}
-              className="w-full"
-            />
-            <span className="w-14 text-right">r={peakSmoothRadius}</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="min-w-[112px]">Prominence</span>
-            <input
-              type="range"
-              min={0}
-              max={4}
-              step={0.05}
-              value={peakMinProminence}
-              onChange={(e) => setPeakMinProminence(parseFloat(e.target.value))}
-              className="w-full"
-            />
-            <span className="w-14 text-right">{peakMinProminence.toFixed(1)}°</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="min-w-[112px]">Min gap</span>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={peakMinGapSeconds}
-              onChange={(e) => setPeakMinGapSeconds(parseFloat(e.target.value))}
-              className="w-full"
-            />
-            <span className="w-14 text-right">{peakMinGapSeconds.toFixed(2)}s</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="min-w-[112px]">Hip lead</span>
-            <input
-              type="range"
-              min={0}
-              max={0.03}
-              step={0.001}
-              value={hipLead}
-              onChange={(e) => setHipLead(parseFloat(e.target.value))}
-              className="w-full"
-            />
-            <span className="w-14 text-right">{(hipLead * 1000).toFixed(0)}ms</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="min-w-[112px]">Ankle lead</span>
-            <input
-              type="range"
-              min={0}
-              max={0.08}
-              step={0.002}
-              value={ankleLead}
-              onChange={(e) => setAnkleLead(parseFloat(e.target.value))}
-              className="w-full"
-            />
-            <span className="w-14 text-right">{(ankleLead * 1000).toFixed(0)}ms</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="min-w-[112px]">Knee lead</span>
-            <input
-              type="range"
-              min={0}
-              max={0.05}
-              step={0.002}
-              value={kneeLead}
-              onChange={(e) => setKneeLead(parseFloat(e.target.value))}
-              className="w-full"
-            />
-            <span className="w-14 text-right">{(kneeLead * 1000).toFixed(0)}ms</span>
-          </label>
+          <p>
+            Max peak: {maxPeakAngle !== null ? `${maxPeakAngle.toFixed(1)}°` : '—'}
+          </p>
+          <p>
+            Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°
+          </p>
+          <p>
+            {isPoseAnalyzing
+              ? `analyzing (${kneeTrackingSide ?? 'auto'} leg)`
+              : graphAnalysisRequested
+                ? 'loading model'
+                : `${kneeTrackingSide ? `${kneeTrackingSide} leg` : 'auto'} (facing ${facingDirection})`}
+          </p>
         </div>
       </section>
     );
@@ -3154,6 +2883,16 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+      {videoSrc && (
+        <video
+          ref={bgVideoRef}
+          src={videoSrc}
+          preload="auto"
+          playsInline
+          muted
+          style={{ position: 'fixed', top: -9999, left: -9999, width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+        />
       )}
     </div>
   );
