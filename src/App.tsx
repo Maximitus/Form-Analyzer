@@ -510,6 +510,9 @@ export default function App() {
   const [angleLowerBound, setAngleLowerBound] = useState(100);
   const [angleUpperBound, setAngleUpperBound] = useState(180);
   const [draggingBound, setDraggingBound] = useState<'lower' | 'upper' | null>(null);
+  const [draggingPlayhead, setDraggingPlayhead] = useState(false);
+  const wasPlayingBeforeScrubRef = useRef(false);
+  const graphSvgRef = useRef<SVGSVGElement | null>(null);
   const [extensionFilter, setExtensionFilter] = useState<ExtensionDirection>('forward');
   const [facingDirection, setFacingDirection] = useState<FacingDirection>('right');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('stride');
@@ -2293,6 +2296,47 @@ export default function App() {
       }
     };
 
+    const seekFromGraphPointer = (clientX: number, svg: SVGSVGElement | null) => {
+      if (!svg || !videoRef.current) return;
+      const rect = svg.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const xNorm = clamp((clientX - rect.left) / rect.width, 0, 1);
+      const time = xNorm * maxTime;
+      scrubTargetRef.current = time;
+      if (scrubRafRef.current === null) {
+        scrubRafRef.current = requestAnimationFrame(() => {
+          scrubRafRef.current = null;
+          if (!videoRef.current) return;
+          const target = scrubTargetRef.current ?? 0;
+          videoRef.current.currentTime = target;
+          setCurrentTime(videoRef.current.currentTime);
+        });
+      }
+      setCurrentTime(time);
+    };
+
+    const handleGraphPointerDown = (e: ReactPointerEvent<SVGSVGElement>) => {
+      setDraggingPlayhead(true);
+      wasPlayingBeforeScrubRef.current = isPlaying;
+      if (isPlaying) setIsPlaying(false);
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      seekFromGraphPointer(e.clientX, graphSvgRef.current);
+    };
+
+    const handleGraphPointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
+      if (!draggingPlayhead) return;
+      seekFromGraphPointer(e.clientX, graphSvgRef.current);
+    };
+
+    const handleGraphPointerUp = (e: ReactPointerEvent<SVGSVGElement>) => {
+      if (!draggingPlayhead) return;
+      setDraggingPlayhead(false);
+      if (wasPlayingBeforeScrubRef.current) setIsPlaying(true);
+      try { (e.currentTarget as Element).releasePointerCapture(e.pointerId); } catch { /* */ }
+    };
+
+    const playheadX = maxTime > 0 ? (currentTime / maxTime) * 100 : 0;
+
     const linePath = series
       .map((sample, idx) => {
         const x = (sample.time / maxTime) * 100;
@@ -2355,11 +2399,17 @@ export default function App() {
             {series.length >= 2 ? (
               <>
               <svg
+                ref={graphSvgRef}
                 viewBox={`0 0 100 ${graphHeight}`}
                 preserveAspectRatio="none"
                 className="h-36 w-full"
+                style={{ cursor: draggingPlayhead ? 'grabbing' : 'pointer', touchAction: 'none' }}
                 role="img"
                 aria-label={isSquat ? 'Squat depth over time' : 'Knee angle over time'}
+                onPointerDown={handleGraphPointerDown}
+                onPointerMove={handleGraphPointerMove}
+                onPointerUp={handleGraphPointerUp}
+                onPointerCancel={handleGraphPointerUp}
               >
                 <path
                   d={linePath}
@@ -2386,7 +2436,7 @@ export default function App() {
                     <line
                       x1={0} y1={lowerY} x2={100} y2={lowerY}
                       stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
-                      onPointerDown={(e) => { setDraggingBound('lower'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
+                      onPointerDown={(e) => { e.stopPropagation(); setDraggingBound('lower'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
                       onPointerMove={(e) => { if (draggingBound === 'lower') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'lower'); }}
                       onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
                       onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
@@ -2395,7 +2445,7 @@ export default function App() {
                     <line
                       x1={0} y1={upperY} x2={100} y2={upperY}
                       stroke="transparent" strokeWidth={8} className="cursor-ns-resize"
-                      onPointerDown={(e) => { setDraggingBound('upper'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
+                      onPointerDown={(e) => { e.stopPropagation(); setDraggingBound('upper'); e.currentTarget.setPointerCapture(e.pointerId); updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
                       onPointerMove={(e) => { if (draggingBound === 'upper') updateBoundFromPointer(e.clientY, e.currentTarget.ownerSVGElement, 'upper'); }}
                       onPointerUp={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
                       onPointerCancel={(e) => { setDraggingBound(null); try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
@@ -2453,6 +2503,19 @@ export default function App() {
                     />
                   );
                 })}
+                {maxTime > 0 && series.length >= 2 && (
+                  <line
+                    x1={playheadX}
+                    y1={0}
+                    x2={playheadX}
+                    y2={graphHeight}
+                    stroke="white"
+                    strokeWidth={1.5}
+                    opacity={draggingPlayhead ? 1 : 0.7}
+                    vectorEffect="non-scaling-stroke"
+                    style={{ pointerEvents: 'none' }}
+                  />
+                )}
               </svg>
               {isSquat ? (
                 <span
