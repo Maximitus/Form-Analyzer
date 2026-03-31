@@ -10,6 +10,7 @@ import {
   useLayoutEffect,
   useCallback,
   ChangeEvent,
+  MutableRefObject,
   PointerEvent as ReactPointerEvent,
 } from 'react';
 import {
@@ -114,6 +115,7 @@ const KNEE_MAXIMA_MIN_SAMPLES = 3;
 const KNEE_MAXIMA_MIN_GAP_SECONDS = 0.1;
 const KNEE_MINIMA_MIN_SAMPLES = 3;
 const KNEE_MINIMA_MIN_GAP_SECONDS = 0.3;
+const KNEE_MINIMA_DEFAULT_PROMINENCE = 15;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -252,7 +254,8 @@ function getBackAngle(
   const dx = Math.abs(shoulder.x - hip.x) * aspectRatio;
   const dy = hip.y - shoulder.y;
   if (dx < 1e-9 && Math.abs(dy) < 1e-9) return null;
-  return Math.atan2(dy, dx) * (180 / Math.PI);
+  // Report trunk inclination from vertical (biomechanics standard).
+  return 90 - (Math.atan2(dy, dx) * (180 / Math.PI));
 }
 
 /** Angle at the hip joint: shoulder-hip-knee. */
@@ -276,6 +279,222 @@ function getHipAngle(
   return calculateJointAngle(shoulder, hip, knee, aspectRatio);
 }
 
+
+/** Euclidean distance between two normalized keypoints, corrected for pixel aspect ratio. */
+function segmentLength(
+  a: {x: number; y: number},
+  b: {x: number; y: number},
+  aspectRatio = 1,
+): number {
+  const dx = (a.x - b.x) * aspectRatio;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+type BodyProportions = {
+  torsoLen: number;
+  femurLen: number;
+  tibiaLen: number;
+  femurToTorso: number;
+  tibiaToFemur: number;
+  legToTorso: number;
+};
+
+type ProportionProfile = {
+  proportions: BodyProportions;
+  femurCategory: 'short' | 'slightly-short' | 'average' | 'slightly-long' | 'long';
+  tibiaCategory: 'short' | 'slightly-short' | 'average' | 'slightly-long' | 'long';
+  /** 0 = easiest possible, 100 = hardest possible */
+  difficultyScore: number;
+  /** Estimated minimum torso forward lean (degrees from vertical) at parallel depth */
+  estimatedLeanDeg: number;
+  dominantPattern: 'quad-dominant' | 'posterior-chain' | 'balanced';
+  insights: string[];
+};
+
+function getBodyProportions(
+  keypoints: {x: number; y: number; v: number}[],
+  side: KneeSide,
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+  aspectRatio = 1,
+): BodyProportions | null {
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_TRACKED_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const shoulder = side === 'left' ? byId.get(5) : byId.get(6);
+  const hip = side === 'left' ? byId.get(11) : byId.get(12);
+  const knee = side === 'left' ? byId.get(13) : byId.get(14);
+  const ankle = side === 'left' ? byId.get(15) : byId.get(16);
+  if (!shoulder || !hip || !knee || !ankle) return null;
+  if (Math.min(shoulder.v, hip.v, knee.v, ankle.v) < visibilityThreshold) return null;
+
+  const torsoLen = segmentLength(shoulder, hip, aspectRatio);
+  const femurLen = segmentLength(hip, knee, aspectRatio);
+  const tibiaLen = segmentLength(knee, ankle, aspectRatio);
+
+  if (torsoLen < 1e-6 || femurLen < 1e-6 || tibiaLen < 1e-6) return null;
+
+  // Reject physiologically impossible proportions (detection errors, extreme
+  // camera angles, or partial occlusion producing garbage geometry).
+  // Each segment should be 18–50% of the total and no segment > 2× another.
+  const total = torsoLen + femurLen + tibiaLen;
+  const pcts = [torsoLen / total, femurLen / total, tibiaLen / total];
+  if (pcts.some((p) => p < 0.18 || p > 0.50)) return null;
+  const segs = [torsoLen, femurLen, tibiaLen];
+  for (let i = 0; i < segs.length; i++) {
+    for (let j = i + 1; j < segs.length; j++) {
+      const ratio = segs[i]! / segs[j]!;
+      if (ratio > 2.0 || ratio < 0.5) return null;
+    }
+  }
+
+  return {
+    torsoLen,
+    femurLen,
+    tibiaLen,
+    femurToTorso: femurLen / torsoLen,
+    tibiaToFemur: tibiaLen / femurLen,
+    legToTorso: (femurLen + tibiaLen) / torsoLen,
+  };
+}
+
+/**
+ * Estimate the minimum forward lean of the torso (degrees from vertical) needed
+ * to keep center of mass over midfoot at parallel squat depth.
+ *
+ * 2D sagittal-plane balance model:
+ *   - At parallel the femur is horizontal (hip drops to knee height).
+ *   - The tibia tilts forward from the ankle by ankleDorsiflex (default 22°,
+ *     calibrated against Fuglsang et al. 2017 JSCR data).
+ *   - Knee-x  = ankle-x + tibia × sin(dorsiflex).
+ *   - Hip-x   = knee-x − femur (femur horizontal).
+ *   - The ankle is at the rear ~25% of the foot; balance is over the midfoot,
+ *     which sits ~0.038H forward of the ankle (Drillis & Contini 1966).
+ *     We estimate H from the three measured segments: H ≈ (T+F+S) / 0.779.
+ *   - Balance: shoulder-x ≈ midfoot-x.
+ *   → sin(lean) = (midfootOffset + femur − tibia × sin(dorsiflex)) / torso
+ */
+const MIDFOOT_RATIO = 0.038 / 0.779;
+function estimateForwardLean(
+  p: BodyProportions,
+  ankleDorsiflexDeg = 22,
+): number {
+  const dorsRad = ankleDorsiflexDeg * (Math.PI / 180);
+  const totalSegs = p.torsoLen + p.femurLen + p.tibiaLen;
+  const midfootOffset = MIDFOOT_RATIO * totalSegs;
+  const kneeForward = p.tibiaLen * Math.sin(dorsRad);
+  const hipBehind = midfootOffset + p.femurLen - kneeForward;
+  const sinLean = hipBehind / p.torsoLen;
+  const clamped = Math.min(1, Math.max(-1, sinLean));
+  return Math.asin(clamped) * (180 / Math.PI);
+}
+
+function classifyProportions(p: BodyProportions): ProportionProfile {
+  // Population averages from Drillis & Contini (1966) joint-center-to-joint-center
+  // segment data: femur/torso ≈ 0.85, tibia/femur ≈ 1.00.
+  // 5-tier scale so borderline lifters get structure-specific advice instead of
+  // being lumped into "average." Outer thresholds at ~±8% (biomechanically
+  // meaningful lean change of ~3-5°); inner thresholds at ~±4% from center.
+  const femurCategory: ProportionProfile['femurCategory'] =
+    p.femurToTorso < 0.78 ? 'short'
+    : p.femurToTorso < 0.82 ? 'slightly-short'
+    : p.femurToTorso > 0.92 ? 'long'
+    : p.femurToTorso > 0.88 ? 'slightly-long'
+    : 'average';
+  const tibiaCategory: ProportionProfile['tibiaCategory'] =
+    p.tibiaToFemur < 0.92 ? 'short'
+    : p.tibiaToFemur < 0.96 ? 'slightly-short'
+    : p.tibiaToFemur > 1.08 ? 'long'
+    : p.tibiaToFemur > 1.04 ? 'slightly-long'
+    : 'average';
+
+  const estimatedLeanDeg = estimateForwardLean(p);
+
+  // Continuous difficulty score (0–100).
+  // Favorable proportions yield ~35°; challenging ones reach 55°+.
+  // Map the lean range [30°, 55°] → [0, 100].
+  const difficultyScore = clamp(((estimatedLeanDeg - 30) / 25) * 100, 0, 100);
+
+  const dominantPattern: ProportionProfile['dominantPattern'] =
+    estimatedLeanDeg > 48 ? 'posterior-chain'
+    : estimatedLeanDeg < 38 ? 'quad-dominant'
+    : 'balanced';
+
+  const insights: string[] = [];
+
+  // Headline insight based on the physics-derived lean from vertical.
+  if (estimatedLeanDeg > 50) {
+    insights.push(`Proportions require substantial forward lean (~${Math.round(estimatedLeanDeg)}° from vertical) to balance at parallel.`);
+  } else if (estimatedLeanDeg > 42) {
+    insights.push(`Moderate forward lean (~${Math.round(estimatedLeanDeg)}° from vertical) needed at parallel depth.`);
+  } else {
+    insights.push(`Favorable geometry — only ~${Math.round(estimatedLeanDeg)}° forward lean needed at parallel.`);
+  }
+
+  // Pattern-specific cues
+  if (dominantPattern === 'posterior-chain') {
+    insights.push('This lean angle loads the posterior chain heavily — expect to feel it in glutes and lower back.');
+    insights.push('Squat shoes (heel elevation) reduce forward lean by ~5-8° and shift load toward quads.');
+  } else if (dominantPattern === 'quad-dominant') {
+    insights.push('A relatively upright torso means quads will be the primary mover.');
+    insights.push('Lower back stress should be minimal; high-bar position is a natural fit.');
+  }
+
+  // Interaction-aware cues — treat "slightly-X" as leaning toward X with softer language.
+  const femurLong = femurCategory === 'long' || femurCategory === 'slightly-long';
+  const femurShort = femurCategory === 'short' || femurCategory === 'slightly-short';
+  const tibiaLong = tibiaCategory === 'long' || tibiaCategory === 'slightly-long';
+  const tibiaShort = tibiaCategory === 'short' || tibiaCategory === 'slightly-short';
+  const mild = femurCategory.startsWith('slightly') || tibiaCategory.startsWith('slightly');
+
+  if (femurLong && tibiaShort) {
+    if (mild) {
+      insights.push('Your femurs trend long and tibias trend short — this nudges the hip back with limited knee travel to compensate.');
+      insights.push('Heel elevation or a slightly wider stance can help; experiment to find what feels natural.');
+    } else {
+      insights.push('Long femurs + short tibias is the hardest combination — the femur pushes the hip back while the tibia can\'t compensate with forward knee travel.');
+      insights.push('Strongly consider: wider stance, low-bar position, and/or squat shoes.');
+    }
+  } else if (femurLong && tibiaLong) {
+    if (mild) {
+      insights.push('Femurs trend long but tibias also trend long — the extra knee travel mostly compensates, so the net effect on lean is small.');
+    } else {
+      insights.push('Long femurs are partially offset by long tibias — extra knee travel reduces the lean that would otherwise be needed.');
+    }
+  } else if (femurShort && tibiaLong) {
+    if (mild) {
+      insights.push('Femurs trend short with tibias trending long — depth and a fairly upright posture should come relatively easy.');
+    } else {
+      insights.push('Short femurs + long tibias — depth and upright posture should come naturally.');
+    }
+  } else if (femurShort && tibiaShort) {
+    if (mild) {
+      insights.push('Femurs and tibias both trend a bit short — the hip stays close but knee travel is limited, so the net effect is near-average.');
+    } else {
+      insights.push('Short femurs keep the hip close, but short tibias limit knee travel — net effect is roughly average difficulty.');
+    }
+  } else if (femurLong && !tibiaShort && !tibiaLong) {
+    insights.push(`${femurCategory === 'slightly-long' ? 'Slightly long' : 'Long'} femurs with average-length tibias — expect a bit more forward lean than typical; squat shoes can help.`);
+  } else if (femurShort && !tibiaShort && !tibiaLong) {
+    insights.push(`${femurCategory === 'slightly-short' ? 'Slightly short' : 'Short'} femurs with average-length tibias — the hip stays relatively close to midfoot, keeping lean moderate.`);
+  } else if (tibiaLong && !femurShort && !femurLong) {
+    insights.push(`Average femurs with ${tibiaCategory === 'slightly-long' ? 'slightly long' : 'long'} tibias — extra knee travel helps keep the torso upright.`);
+  } else if (tibiaShort && !femurShort && !femurLong) {
+    insights.push(`Average femurs with ${tibiaCategory === 'slightly-short' ? 'slightly short' : 'short'} tibias — limited knee travel adds a few degrees of lean; ankle mobility work pays off here.`);
+  }
+
+  // Depth-specific cue
+  if (p.legToTorso > 2.1) {
+    insights.push('Long legs relative to torso — even with good ankle mobility, maintaining an upright torso below parallel will be challenging.');
+  } else if (p.legToTorso < 1.7) {
+    insights.push('Compact legs relative to torso — achieving full depth should be straightforward.');
+  }
+
+  return {proportions: p, femurCategory, tibiaCategory, difficultyScore, estimatedLeanDeg, dominantPattern, insights};
+}
 
 type AppliedZoomMap = {x: number; y: number; s: number};
 type ViewportTarget = 'primary' | 'compare';
@@ -303,6 +522,15 @@ type KneeAngleValley = {
   angle: number;
   depthAngle: number;
   belowParallel: boolean;
+  hipAngle: number | null;
+  backAngle: number | null;
+};
+type PoseAngleSample = {
+  time: number;
+  angle: number;
+  hipX: number;
+  ankleX: number;
+  depthAngle: number | null;
   hipAngle: number | null;
   backAngle: number | null;
 };
@@ -375,14 +603,34 @@ function detectKneeAngleMaxima(
     .map((k) => ({time: series[k.index]!.time, angle: series[k.index]!.angle, direction: k.direction}));
 }
 
+function valleyProminence(
+  series: {angle: number}[],
+  valleyIdx: number,
+): number {
+  const valleyAngle = series[valleyIdx]!.angle;
+  let leftMax = valleyAngle;
+  for (let i = valleyIdx - 1; i >= 0; i--) {
+    if (series[i]!.angle > leftMax) leftMax = series[i]!.angle;
+    if (series[i]!.angle < valleyAngle) break;
+  }
+  let rightMax = valleyAngle;
+  for (let i = valleyIdx + 1; i < series.length; i++) {
+    if (series[i]!.angle > rightMax) rightMax = series[i]!.angle;
+    if (series[i]!.angle < valleyAngle) break;
+  }
+  return Math.min(leftMax, rightMax) - valleyAngle;
+}
+
 function detectKneeAngleMinima(
-  series: {time: number; angle: number; depthAngle: number | null; hipAngle: number | null; backAngle: number | null}[],
+  series: PoseAngleSample[],
   options: {
     lowerAngle: number;
     upperAngle: number;
+    minProminence?: number;
   },
 ): KneeAngleValley[] {
   if (series.length < KNEE_MINIMA_MIN_SAMPLES) return [];
+  const prominence = options.minProminence ?? KNEE_MINIMA_DEFAULT_PROMINENCE;
   const candidates: {index: number; angle: number}[] = [];
   for (let i = 1; i < series.length - 1; i += 1) {
     const prev = series[i - 1]!.angle;
@@ -390,6 +638,7 @@ function detectKneeAngleMinima(
     const next = series[i + 1]!.angle;
     const isValley = (current <= prev && current < next) || (current < prev && current <= next);
     if (!isValley || current < options.lowerAngle || current > options.upperAngle) continue;
+    if (valleyProminence(series, i) < prominence) continue;
     candidates.push({index: i, angle: current});
   }
 
@@ -500,9 +749,19 @@ export default function App() {
   const [currentLiveDepthAngle, setCurrentLiveDepthAngle] = useState<number | null>(null);
   const [currentLiveHipAngle, setCurrentLiveHipAngle] = useState<number | null>(null);
   const [currentLiveBackAngle, setCurrentLiveBackAngle] = useState<number | null>(null);
-  const [kneeAngleSeries, setKneeAngleSeries] = useState<{time: number; angle: number; hipX: number; ankleX: number; depthAngle: number | null; hipAngle: number | null; backAngle: number | null}[]>([]);
+  const [kneeAngleSeries, setKneeAngleSeries] = useState<PoseAngleSample[]>([]);
+  const [compareCurrentKneeAngle, setCompareCurrentKneeAngle] = useState<number | null>(null);
+  const [compareCurrentLiveDepthAngle, setCompareCurrentLiveDepthAngle] = useState<number | null>(null);
+  const [compareCurrentLiveHipAngle, setCompareCurrentLiveHipAngle] = useState<number | null>(null);
+  const [compareCurrentLiveBackAngle, setCompareCurrentLiveBackAngle] = useState<number | null>(null);
+  const [compareKneeAngleSeries, setCompareKneeAngleSeries] = useState<PoseAngleSample[]>([]);
   const [posePointSeries, setPosePointSeries] = useState<PoseFrameSample[]>([]);
+  const [bodyProportions, setBodyProportions] = useState<ProportionProfile | null>(null);
+  const [liveBodyProportions, setLiveBodyProportions] = useState<BodyProportions | null>(null);
+  const [compareBodyProportions, setCompareBodyProportions] = useState<ProportionProfile | null>(null);
+  const [compareLiveBodyProportions, setCompareLiveBodyProportions] = useState<BodyProportions | null>(null);
   const [kneeTrackingSide, setKneeTrackingSide] = useState<KneeSide | null>(null);
+  const [compareKneeTrackingSide, setCompareKneeTrackingSide] = useState<KneeSide | null>(null);
   const [isPoseAnalyzing, setIsPoseAnalyzing] = useState(false);
   const [isKneeGraphLocked, setIsKneeGraphLocked] = useState(false);
   const [graphAnalysisRequested, setGraphAnalysisRequested] = useState(false);
@@ -513,6 +772,11 @@ export default function App() {
   const [draggingPlayhead, setDraggingPlayhead] = useState(false);
   const wasPlayingBeforeScrubRef = useRef(false);
   const graphSvgRef = useRef<SVGSVGElement | null>(null);
+  const [draggingComparePlayhead, setDraggingComparePlayhead] = useState(false);
+  const wasPlayingBeforeCompareScrubRef = useRef(false);
+  const compareGraphSvgRef = useRef<SVGSVGElement | null>(null);
+  const [showRepDetails, setShowRepDetails] = useState(false);
+  const [showAngleGuide, setShowAngleGuide] = useState(false);
   const [extensionFilter, setExtensionFilter] = useState<ExtensionDirection>('forward');
   const [facingDirection, setFacingDirection] = useState<FacingDirection>('right');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('stride');
@@ -521,10 +785,12 @@ export default function App() {
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
   const [poseStatus, setPoseStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const poseCacheRef = useRef<{time: number; keypoints: {x: number; y: number; v: number}[]}[]>([]);
+  const comparePoseCacheRef = useRef<{time: number; keypoints: {x: number; y: number; v: number}[]}[]>([]);
   const [analysisProgress, setAnalysisProgress] = useState<number | null>(null);
   const analysisAbortRef = useRef(false);
   const analysisGenRef = useRef(0);
   const [compareMediaLayoutVersion, setCompareMediaLayoutVersion] = useState(0);
+  const compareBgVideoRef = useRef<HTMLVideoElement | null>(null);
 
   const mapPoseNormToCanvasOverlayPx = (
     xn: number,
@@ -1295,54 +1561,89 @@ export default function App() {
     const wrap = canvas.parentElement;
     if (!wrap) return;
 
-    const vw = wrap.clientWidth;
-    const vh = wrap.clientHeight;
-    canvas.width = Math.max(1, Math.round(vw));
-    canvas.height = Math.max(1, Math.round(vh));
+    const draw = () => {
+      const vw = wrap.clientWidth;
+      const vh = wrap.clientHeight;
+      canvas.width = Math.max(1, Math.round(vw));
+      canvas.height = Math.max(1, Math.round(vh));
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!poseEnabled) return;
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const overlayTime = compareVideoRef.current?.currentTime ?? 0;
+      const overlayKps = comparePoseCacheRef.current.length > 0
+        ? findNearestCachedPose(comparePoseCacheRef.current, overlayTime) ?? comparePoseKeypoints
+        : comparePoseKeypoints;
+      if (overlayKps.length !== POSE_TRACKED_IDS.length) return;
 
-    if (!poseEnabled) return;
-    if (comparePoseKeypoints.length !== POSE_TRACKED_IDS.length) return;
+      const media = (compareVideoRef.current ?? compareImageRef.current) as HTMLVideoElement | HTMLImageElement;
+      const byId = new Map<number, {x: number; y: number; v: number}>();
+      POSE_TRACKED_IDS.forEach((id, i) => {
+        const p = overlayKps[i];
+        if (p) byId.set(id, p);
+      });
 
-    const media = (video ?? image) as HTMLVideoElement | HTMLImageElement;
+      ctx.save();
+      const sideFromFacing = facingDirectionToLeg(facingDirection);
+      const trackedSide = compareKneeTrackingSide ?? kneeTrackingSide ?? sideFromFacing;
+      const trackedIds = trackedSide === 'left' ? POSE_LEFT_SIDE_IDS : POSE_RIGHT_SIDE_IDS;
+      const isTrackedConnection = (aId: number, bId: number) =>
+        trackedIds.has(aId) && trackedIds.has(bId);
+      const isArmConnection = (aId: number, bId: number) =>
+        POSE_ARM_IDS.has(aId) || POSE_ARM_IDS.has(bId);
 
-    const byId = new Map<number, {x: number; y: number; v: number}>();
-    POSE_TRACKED_IDS.forEach((id, i) => {
-      const p = comparePoseKeypoints[i];
-      if (p) byId.set(id, p);
-    });
+      for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
+        const a = byId.get(aId);
+        const b = byId.get(bId);
+        if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+        const arm = isArmConnection(aId, bId);
+        const tracked = !arm && isTrackedConnection(aId, bId);
+        ctx.strokeStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+        ctx.lineWidth = arm ? 1 : tracked ? 3 : 1.5;
+        const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, media, canvas);
+        const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, media, canvas);
+        ctx.beginPath();
+        ctx.moveTo(aPx.x, aPx.y);
+        ctx.lineTo(bPx.x, bPx.y);
+        ctx.stroke();
+      }
 
-    ctx.save();
-    ctx.strokeStyle = '#00d2ff';
-    ctx.fillStyle = '#00d2ff';
-    ctx.lineWidth = 2.5;
+      POSE_TRACKED_IDS.forEach((id, i) => {
+        const p = overlayKps[i];
+        if (!p || p.v < 0.25) return;
+        const arm = POSE_ARM_IDS.has(id);
+        const tracked = !arm && trackedIds.has(id);
+        ctx.fillStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+        const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, media, canvas);
+        ctx.beginPath();
+        ctx.arc(o.x, o.y, arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      });
 
-    for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
-      const a = byId.get(aId);
-      const b = byId.get(bId);
-      if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
-      const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, media, canvas);
-      const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, media, canvas);
-      ctx.beginPath();
-      ctx.moveTo(aPx.x, aPx.y);
-      ctx.lineTo(bPx.x, bPx.y);
-      ctx.stroke();
+      ctx.restore();
+    };
+
+    draw();
+
+    if (compareVideoSrc && poseEnabled) {
+      let rafId: number | null = null;
+      let lastDrawnTime = -1;
+      const loop = () => {
+        const vt = compareVideoRef.current?.currentTime ?? -1;
+        if (vt !== lastDrawnTime) {
+          lastDrawnTime = vt;
+          draw();
+        }
+        rafId = requestAnimationFrame(loop);
+      };
+      rafId = requestAnimationFrame(loop);
+      return () => {
+        if (rafId !== null) cancelAnimationFrame(rafId);
+      };
     }
-
-    for (const p of comparePoseKeypoints) {
-      if (p.v < 0.25) continue;
-      const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, media, canvas);
-      ctx.beginPath();
-      ctx.arc(o.x, o.y, 5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    ctx.restore();
-  }, [comparePoseKeypoints, compareVideoSrc, compareImageSrc, compareMediaLayoutVersion, poseEnabled]);
+  }, [comparePoseKeypoints, compareVideoSrc, compareImageSrc, compareMediaLayoutVersion, poseEnabled, compareKneeTrackingSide, kneeTrackingSide, facingDirection]);
 
   const [draggingPointIndex, setDraggingPointIndex] = useState<number | null>(null);
   const [compareCurrentTime, setCompareCurrentTime] = useState(0);
@@ -1459,7 +1760,11 @@ export default function App() {
 
     setKneeAngleSeries([]);
     setPosePointSeries([]);
+    setBodyProportions(null);
+    setCompareKneeAngleSeries([]);
+    setCompareBodyProportions(null);
     poseCacheRef.current = [];
+    comparePoseCacheRef.current = [];
     setKneeTrackingSide(activeSide);
     setIsKneeGraphLocked(false);
     setIsPoseAnalyzing(true);
@@ -1469,42 +1774,27 @@ export default function App() {
 
     const ANALYSIS_FPS = 30;
     const frameStep = 1 / ANALYSIS_FPS;
-    const totalFrames = Math.ceil(targetDuration * ANALYSIS_FPS);
-
     const PROGRESSIVE_BATCH = 15;
 
-    const waitForBgVideoReady = (): Promise<boolean> =>
+    const waitForVideoReady = (videoEl: HTMLVideoElement): Promise<boolean> =>
       new Promise((resolve) => {
-        if (bgVideo.readyState >= 2) { resolve(true); return; }
+        if (videoEl.readyState >= 2) { resolve(true); return; }
         let resolved = false;
         const finish = (ok: boolean) => {
           if (resolved) return;
           resolved = true;
-          bgVideo.removeEventListener('canplay', onReady);
+          videoEl.removeEventListener('canplay', onReady);
           resolve(ok);
         };
         const onReady = () => finish(true);
-        bgVideo.addEventListener('canplay', onReady);
-        setTimeout(() => finish(bgVideo.readyState >= 2), 5000);
+        videoEl.addEventListener('canplay', onReady);
+        setTimeout(() => finish(videoEl.readyState >= 2), 5000);
       });
 
-    const ready = await waitForBgVideoReady();
-    if (!ready || isStale()) {
-      if (!isStale()) {
-        setIsPoseAnalyzing(false);
-        setAnalysisProgress(null);
-      }
-      return;
-    }
-
-    const sourceWidth = bgVideo.videoWidth || mainVideo.videoWidth;
-    const sourceHeight = bgVideo.videoHeight || mainVideo.videoHeight;
-    const ar = sourceHeight > 0 ? sourceWidth / sourceHeight : 1;
-
-    const seekAndWait = (t: number): Promise<void> =>
+    const seekAndWait = (videoEl: HTMLVideoElement, t: number, cap: number): Promise<void> =>
       new Promise((resolve) => {
-        const clamped = Math.min(t, targetDuration);
-        if (Math.abs(bgVideo.currentTime - clamped) < 0.005) {
+        const clamped = Math.min(t, cap);
+        if (Math.abs(videoEl.currentTime - clamped) < 0.005) {
           resolve();
           return;
         }
@@ -1512,114 +1802,208 @@ export default function App() {
         const finish = () => {
           if (resolved) return;
           resolved = true;
-          bgVideo.removeEventListener('seeked', finish);
+          videoEl.removeEventListener('seeked', finish);
           resolve();
         };
-        bgVideo.addEventListener('seeked', finish);
-        bgVideo.currentTime = clamped;
+        videoEl.addEventListener('seeked', finish);
+        videoEl.currentTime = clamped;
         setTimeout(finish, 2000);
       });
 
     const yieldToUI = () => new Promise<void>((r) => setTimeout(r, 0));
+    const averageProportions = (samples: BodyProportions[]): ProportionProfile | null => {
+      if (samples.length === 0) return null;
+      const n = samples.length;
+      const avg: BodyProportions = {
+        torsoLen: samples.reduce((s, p) => s + p.torsoLen, 0) / n,
+        femurLen: samples.reduce((s, p) => s + p.femurLen, 0) / n,
+        tibiaLen: samples.reduce((s, p) => s + p.tibiaLen, 0) / n,
+        femurToTorso: samples.reduce((s, p) => s + p.femurToTorso, 0) / n,
+        tibiaToFemur: samples.reduce((s, p) => s + p.tibiaToFemur, 0) / n,
+        legToTorso: samples.reduce((s, p) => s + p.legToTorso, 0) / n,
+      };
+      return classifyProportions(avg);
+    };
 
-    const angleSeries: {time: number; angle: number; hipX: number; ankleX: number; depthAngle: number | null; hipAngle: number | null; backAngle: number | null}[] = [];
-    const pointSeries: PoseFrameSample[] = [];
-    const cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[] = [];
-    let t = 0;
-    let frameIdx = 0;
-
-    while (t <= targetDuration && !isStale()) {
-      await seekAndWait(t);
-      if (isStale()) break;
-      if (bgVideo.readyState < 2) {
-        await new Promise<void>((r) => {
-          const onReady = () => { bgVideo.removeEventListener('canplay', onReady); r(); };
-          bgVideo.addEventListener('canplay', onReady);
-          setTimeout(() => { bgVideo.removeEventListener('canplay', onReady); r(); }, 3000);
-        });
+    const analyzeSingleVideo = async ({
+      sourceVideo,
+      visibleVideo,
+      initialSide,
+      setSeries,
+      setPointSeries,
+      cacheRef,
+      setSide,
+      setProfile,
+      progressOffset,
+      progressScale,
+    }: {
+      sourceVideo: HTMLVideoElement;
+      visibleVideo: HTMLVideoElement;
+      initialSide: KneeSide;
+      setSeries: (series: PoseAngleSample[]) => void;
+      setPointSeries?: (series: PoseFrameSample[]) => void;
+      cacheRef: MutableRefObject<{time: number; keypoints: {x: number; y: number; v: number}[]}[]>;
+      setSide: (side: KneeSide) => void;
+      setProfile: (profile: ProportionProfile | null) => void;
+      progressOffset: number;
+      progressScale: number;
+    }) => {
+      const localDuration = Math.max(getReliableVideoDuration(visibleVideo), visibleVideo.duration || 0, 0);
+      if (localDuration <= 0) {
+        cacheRef.current = [];
+        setSeries([]);
+        setPointSeries?.([]);
+        setProfile(null);
+        return;
       }
+      const ready = await waitForVideoReady(sourceVideo);
+      if (!ready || isStale()) return;
 
-      const result = await detector.estimatePoses(bgVideo, {flipHorizontal: false});
-      if (isStale()) break;
-      const keypoints = result?.[0]?.keypoints;
-      let normalized: {x: number; y: number; v: number}[] = [];
-      if (keypoints && keypoints.length > 0 && sourceWidth > 0 && sourceHeight > 0) {
-        normalized = POSE_TRACKED_IDS.map((id) => {
-          const p = keypoints[id];
-          if (!p) return {x: 0, y: 0, v: 0};
-          return {x: p.x / sourceWidth, y: p.y / sourceHeight, v: p.score ?? 0};
-        });
-      }
+      let activeLocalSide = initialSide;
+      let detectedFacing: FacingDirection | null = null;
+      const sourceWidth = sourceVideo.videoWidth || visibleVideo.videoWidth;
+      const sourceHeight = sourceVideo.videoHeight || visibleVideo.videoHeight;
+      const ar = sourceHeight > 0 ? sourceWidth / sourceHeight : 1;
+      const totalFrames = Math.ceil(localDuration * ANALYSIS_FPS);
 
-      cache.push({time: t, keypoints: normalized});
+      const angleSeries: PoseAngleSample[] = [];
+      const pointSeries: PoseFrameSample[] = [];
+      const cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[] = [];
+      const proportionSamples: BodyProportions[] = [];
 
-      if (!detectedFacing && normalized.length === POSE_TRACKED_IDS.length) {
-        const detected = detectFacingFromKeypoints(normalized);
-        if (detected) {
-          detectedFacing = detected;
-          activeSide = facingDirectionToLeg(detected);
-          if (!isStale()) {
-            setFacingDirection(detected);
-            setKneeTrackingSide(activeSide);
+      let t = 0;
+      let frameIdx = 0;
+      while (t <= localDuration && !isStale()) {
+        await seekAndWait(sourceVideo, t, localDuration);
+        if (isStale()) break;
+        if (sourceVideo.readyState < 2) {
+          await new Promise<void>((r) => {
+            const onReady = () => { sourceVideo.removeEventListener('canplay', onReady); r(); };
+            sourceVideo.addEventListener('canplay', onReady);
+            setTimeout(() => { sourceVideo.removeEventListener('canplay', onReady); r(); }, 3000);
+          });
+        }
+
+        const result = await detector.estimatePoses(sourceVideo, {flipHorizontal: false});
+        if (isStale()) break;
+        const keypoints = result?.[0]?.keypoints;
+        let normalized: {x: number; y: number; v: number}[] = [];
+        if (keypoints && keypoints.length > 0 && sourceWidth > 0 && sourceHeight > 0) {
+          normalized = POSE_TRACKED_IDS.map((id) => {
+            const p = keypoints[id];
+            if (!p) return {x: 0, y: 0, v: 0};
+            return {x: p.x / sourceWidth, y: p.y / sourceHeight, v: p.score ?? 0};
+          });
+        }
+        cache.push({time: t, keypoints: normalized});
+
+        if (!detectedFacing && normalized.length === POSE_TRACKED_IDS.length) {
+          const detected = detectFacingFromKeypoints(normalized);
+          if (detected) {
+            detectedFacing = detected;
+            activeLocalSide = facingDirectionToLeg(detected);
+            if (!isStale()) setSide(activeLocalSide);
           }
         }
-      }
 
-      if (normalized.length === POSE_TRACKED_IDS.length) {
-        const kneeAngle = getKneeAngleFromPose(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
-        const anchors = getTrackedLegAnchors(normalized, activeSide);
-        const depth = getSquatDepthAngle(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
-        const hipJointAngle = getHipAngle(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
-        const torsoAngle = getBackAngle(normalized, activeSide, MIN_POSE_VISIBILITY, ar);
-        if (kneeAngle !== null && anchors) {
-          const extension = Math.abs(anchors.ankleX - anchors.hipX);
-          angleSeries.push({
-            time: t,
-            angle: kneeAngle,
-            hipX: anchors.hipX,
-            ankleX: anchors.ankleX,
-            depthAngle: depth,
-            hipAngle: hipJointAngle,
-            backAngle: torsoAngle,
-          });
-          pointSeries.push({
-            time: t,
-            side: activeSide,
-            kneeAngle,
-            hipX: anchors.hipX,
-            ankleX: anchors.ankleX,
-            extension,
-            keypoints: normalized.map((p) => ({x: p.x, y: p.y, v: p.v})),
-          });
+        if (normalized.length === POSE_TRACKED_IDS.length) {
+          const kneeAngle = getKneeAngleFromPose(normalized, activeLocalSide, MIN_POSE_VISIBILITY, ar);
+          const anchors = getTrackedLegAnchors(normalized, activeLocalSide);
+          const depth = getSquatDepthAngle(normalized, activeLocalSide, MIN_POSE_VISIBILITY, ar);
+          const hipJointAngle = getHipAngle(normalized, activeLocalSide, MIN_POSE_VISIBILITY, ar);
+          const torsoAngle = getBackAngle(normalized, activeLocalSide, MIN_POSE_VISIBILITY, ar);
+          const frameProp = getBodyProportions(normalized, activeLocalSide, MIN_POSE_VISIBILITY, ar);
+          if (frameProp) proportionSamples.push(frameProp);
+          if (kneeAngle !== null && anchors) {
+            const extension = Math.abs(anchors.ankleX - anchors.hipX);
+            angleSeries.push({
+              time: t,
+              angle: kneeAngle,
+              hipX: anchors.hipX,
+              ankleX: anchors.ankleX,
+              depthAngle: depth,
+              hipAngle: hipJointAngle,
+              backAngle: torsoAngle,
+            });
+            if (setPointSeries) {
+              pointSeries.push({
+                time: t,
+                side: activeLocalSide,
+                kneeAngle,
+                hipX: anchors.hipX,
+                ankleX: anchors.ankleX,
+                extension,
+                keypoints: normalized.map((p) => ({x: p.x, y: p.y, v: p.v})),
+              });
+            }
+          }
         }
+
+        frameIdx += 1;
+        const pct = Math.min(100, Math.round((frameIdx / totalFrames) * 100));
+        setAnalysisProgress(Math.min(100, Math.round(progressOffset + pct * progressScale)));
+
+        if (frameIdx % PROGRESSIVE_BATCH === 0) {
+          cacheRef.current = cache.slice();
+          setSeries(angleSeries.slice());
+          setPointSeries?.(pointSeries.slice());
+          await yieldToUI();
+        } else if (frameIdx % 2 === 0) {
+          await yieldToUI();
+        }
+        t += frameStep;
       }
 
-      frameIdx += 1;
-      const pct = Math.min(100, Math.round((frameIdx / totalFrames) * 100));
-      setAnalysisProgress(pct);
+      if (isStale()) return;
+      cacheRef.current = cache;
+      setSeries(angleSeries);
+      setPointSeries?.(pointSeries);
+      setProfile(averageProportions(proportionSamples));
+    };
 
-      if (frameIdx % PROGRESSIVE_BATCH === 0) {
-        poseCacheRef.current = cache.slice();
-        setKneeAngleSeries(angleSeries.slice());
-        setPosePointSeries(pointSeries.slice());
-        await yieldToUI();
-      } else if (frameIdx % 2 === 0) {
-        await yieldToUI();
-      }
+    await analyzeSingleVideo({
+      sourceVideo: bgVideo,
+      visibleVideo: mainVideo,
+      initialSide: activeSide,
+      setSeries: setKneeAngleSeries,
+      setPointSeries: setPosePointSeries,
+      cacheRef: poseCacheRef,
+      setSide: (side) => {
+        setKneeTrackingSide(side);
+        setFacingDirection(side === 'left' ? 'left' : 'right');
+      },
+      setProfile: setBodyProportions,
+      progressOffset: 0,
+      progressScale: compareVideoSrc ? 0.5 : 1,
+    });
 
-      t += frameStep;
+    const compareBgVideo = compareBgVideoRef.current;
+    const compareMainVideo = compareVideoRef.current;
+    if (!isStale() && compareVideoSrc && compareBgVideo && compareMainVideo) {
+      await analyzeSingleVideo({
+        sourceVideo: compareBgVideo,
+        visibleVideo: compareMainVideo,
+        initialSide: compareKneeTrackingSide ?? activeSide,
+        setSeries: setCompareKneeAngleSeries,
+        cacheRef: comparePoseCacheRef,
+        setSide: setCompareKneeTrackingSide,
+        setProfile: setCompareBodyProportions,
+        progressOffset: 50,
+        progressScale: 0.5,
+      });
+    } else if (!isStale()) {
+      setCompareKneeAngleSeries([]);
+      comparePoseCacheRef.current = [];
+      setCompareBodyProportions(null);
     }
 
     if (!isStale()) {
-      poseCacheRef.current = cache;
-      setKneeAngleSeries(angleSeries);
-      setPosePointSeries(pointSeries);
       setIsPoseAnalyzing(false);
       setIsKneeGraphLocked(true);
       setAnalysisProgress(null);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [facingDirection]);
+  }, [facingDirection, compareVideoSrc, compareKneeTrackingSide]);
 
   useEffect(() => {
     if (!graphAnalysisRequested) return;
@@ -1685,8 +2069,19 @@ export default function App() {
       setCurrentKneeAngle(null);
       setKneeAngleSeries([]);
       setPosePointSeries([]);
+      setBodyProportions(null);
+      setLiveBodyProportions(null);
+      setCompareCurrentKneeAngle(null);
+      setCompareCurrentLiveDepthAngle(null);
+      setCompareCurrentLiveHipAngle(null);
+      setCompareCurrentLiveBackAngle(null);
+      setCompareKneeAngleSeries([]);
+      setCompareBodyProportions(null);
+      setCompareLiveBodyProportions(null);
       poseCacheRef.current = [];
+      comparePoseCacheRef.current = [];
       setKneeTrackingSide(null);
+      setCompareKneeTrackingSide(null);
       setIsKneeGraphLocked(false);
       setIsPoseAnalyzing(false);
       setAnalysisProgress(null);
@@ -1696,12 +2091,21 @@ export default function App() {
     if (!videoSrc) {
       setKneeAngleSeries([]);
       setPosePointSeries([]);
+      setBodyProportions(null);
       poseCacheRef.current = [];
+    }
+    if (!compareVideoSrc) {
+      setCompareKneeAngleSeries([]);
+      setCompareBodyProportions(null);
+      comparePoseCacheRef.current = [];
     }
     if (!videoSrc && !imageSrc) {
       setKneeTrackingSide(null);
     }
-  }, [poseEnabled, videoSrc, imageSrc]);
+    if (!compareVideoSrc && !compareImageSrc) {
+      setCompareKneeTrackingSide(null);
+    }
+  }, [poseEnabled, videoSrc, imageSrc, compareVideoSrc, compareImageSrc]);
 
   useEffect(() => {
     setCurrentKneeAngle(null);
@@ -1710,13 +2114,24 @@ export default function App() {
     setCurrentLiveBackAngle(null);
     setKneeAngleSeries([]);
     setPosePointSeries([]);
+    setBodyProportions(null);
+    setLiveBodyProportions(null);
+    setCompareCurrentKneeAngle(null);
+    setCompareCurrentLiveDepthAngle(null);
+    setCompareCurrentLiveHipAngle(null);
+    setCompareCurrentLiveBackAngle(null);
+    setCompareKneeAngleSeries([]);
+    setCompareBodyProportions(null);
+    setCompareLiveBodyProportions(null);
     poseCacheRef.current = [];
+    comparePoseCacheRef.current = [];
     setKneeTrackingSide(null);
+    setCompareKneeTrackingSide(null);
     setGraphDomainTime(0);
     setAnalysisProgress(null);
     analysisAbortRef.current = true;
     setIsPoseAnalyzing(false);
-  }, [videoSrc, imageSrc]);
+  }, [videoSrc, imageSrc, compareVideoSrc, compareImageSrc]);
 
   useEffect(() => {
     if (!poseEnabled) {
@@ -1724,6 +2139,7 @@ export default function App() {
       setCurrentLiveDepthAngle(null);
       setCurrentLiveHipAngle(null);
       setCurrentLiveBackAngle(null);
+      setLiveBodyProportions(null);
       return;
     }
     const sideFromFacing = facingDirectionToLeg(facingDirection);
@@ -1743,7 +2159,48 @@ export default function App() {
     setCurrentLiveDepthAngle(activeSide ? getSquatDepthAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
     setCurrentLiveHipAngle(activeSide ? getHipAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
     setCurrentLiveBackAngle(activeSide ? getBackAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
+    setLiveBodyProportions(activeSide ? getBodyProportions(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
   }, [poseEnabled, poseKeypoints, currentTime, videoSrc, kneeTrackingSide, facingDirection]);
+
+  useEffect(() => {
+    if (!poseEnabled) {
+      setCompareCurrentKneeAngle(null);
+      setCompareCurrentLiveDepthAngle(null);
+      setCompareCurrentLiveHipAngle(null);
+      setCompareCurrentLiveBackAngle(null);
+      setCompareLiveBodyProportions(null);
+      return;
+    }
+    if (!compareVideoSrc && !compareImageSrc) {
+      setCompareCurrentKneeAngle(null);
+      setCompareCurrentLiveDepthAngle(null);
+      setCompareCurrentLiveHipAngle(null);
+      setCompareCurrentLiveBackAngle(null);
+      setCompareLiveBodyProportions(null);
+      return;
+    }
+
+    const sideFromFacing = facingDirectionToLeg(facingDirection);
+    const activeSide = compareKneeTrackingSide ?? sideFromFacing;
+    if (!compareKneeTrackingSide) {
+      setCompareKneeTrackingSide(sideFromFacing);
+    }
+
+    const kps = comparePoseCacheRef.current.length > 0
+      ? (findNearestCachedPose(comparePoseCacheRef.current, compareCurrentTime) ?? comparePoseKeypoints)
+      : comparePoseKeypoints;
+    const media = compareVideoRef.current ?? compareImageRef.current;
+    const w = media instanceof HTMLVideoElement ? media.videoWidth : media instanceof HTMLImageElement ? media.naturalWidth : 0;
+    const h = media instanceof HTMLVideoElement ? media.videoHeight : media instanceof HTMLImageElement ? media.naturalHeight : 0;
+    const liveAr = h > 0 ? w / h : 1;
+
+    const kneeAngle = activeSide ? getKneeAngleFromPose(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null;
+    setCompareCurrentKneeAngle(kneeAngle);
+    setCompareCurrentLiveDepthAngle(activeSide ? getSquatDepthAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
+    setCompareCurrentLiveHipAngle(activeSide ? getHipAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
+    setCompareCurrentLiveBackAngle(activeSide ? getBackAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
+    setCompareLiveBodyProportions(activeSide ? getBodyProportions(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
+  }, [poseEnabled, comparePoseKeypoints, compareCurrentTime, compareVideoSrc, compareImageSrc, compareKneeTrackingSide, facingDirection]);
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
@@ -2202,65 +2659,147 @@ export default function App() {
 
     const isSquat = analysisMode === 'squat';
     const series = kneeAngleSeries;
+    const toKneeFlexion = (jointAngle: number | null) => jointAngle === null ? null : 180 - jointAngle;
+    const toHipFlexionProxy = (jointAngle: number | null) => jointAngle === null ? null : 180 - jointAngle;
+    const formatAngle = (value: number | null) => value !== null ? `${value.toFixed(1)}°` : '—';
 
-    const allMaxima = isSquat ? [] : detectKneeAngleMaxima(series, {
-      lowerAngle: angleLowerBound,
-      upperAngle: angleUpperBound,
-      facing: facingDirection,
-    });
-    const maxima = allMaxima.filter((p) => p.direction === extensionFilter);
-    const otherMaxima = allMaxima.filter((p) => p.direction !== extensionFilter);
-    const avgPeakAngle =
-      maxima.length > 0
-        ? maxima.reduce((sum, peak) => sum + peak.angle, 0) / maxima.length
-        : null;
-    const maxPeakAngle =
-      maxima.length > 0
-        ? Math.max(...maxima.map((p) => p.angle))
-        : null;
+    const computePanelStats = (
+      panelSeries: PoseAngleSample[],
+      panelTime: number,
+      panelCurrentKneeAngle: number | null,
+      panelLiveDepth: number | null,
+      panelLiveHip: number | null,
+      panelLiveBack: number | null,
+    ) => {
+      const panelAllMaxima = isSquat ? [] : detectKneeAngleMaxima(panelSeries, {
+        lowerAngle: angleLowerBound,
+        upperAngle: angleUpperBound,
+        facing: facingDirection,
+      });
+      const panelMaxima = panelAllMaxima.filter((p) => p.direction === extensionFilter);
+      const panelOtherMaxima = panelAllMaxima.filter((p) => p.direction !== extensionFilter);
+      const panelAvgPeakAngle =
+        panelMaxima.length > 0
+          ? panelMaxima.reduce((sum, peak) => sum + peak.angle, 0) / panelMaxima.length
+          : null;
+      const panelMaxPeakAngle =
+        panelMaxima.length > 0
+          ? Math.max(...panelMaxima.map((p) => p.angle))
+          : null;
 
-    const valleys = isSquat ? detectKneeAngleMinima(series, {
-      lowerAngle: angleLowerBound,
-      upperAngle: angleUpperBound,
-    }) : [];
-    const belowParallelCount = valleys.filter((v) => v.belowParallel).length;
-    const avgRepKneeAngle =
-      valleys.length > 0
-        ? valleys.reduce((sum, v) => sum + v.angle, 0) / valleys.length
-        : null;
-    const avgDepthAngle =
-      valleys.length > 0
-        ? valleys.reduce((sum, v) => sum + v.depthAngle, 0) / valleys.length
-        : null;
-    const avgRepHipAngle = (() => {
-      const withHip = valleys.filter((v) => v.hipAngle !== null);
-      if (withHip.length === 0) return null;
-      return withHip.reduce((sum, v) => sum + v.hipAngle!, 0) / withHip.length;
-    })();
-    const avgRepBackAngle = (() => {
-      const withBack = valleys.filter((v) => v.backAngle !== null);
-      if (withBack.length === 0) return null;
-      return withBack.reduce((sum, v) => sum + v.backAngle!, 0) / withBack.length;
-    })();
-    const currentNearest = (() => {
-      if (!isSquat || series.length === 0) return null;
-      return series.reduce((best, s) =>
-        Math.abs(s.time - currentTime) < Math.abs(best.time - currentTime) ? s : best
-      );
-    })();
-    const currentDepthAngle = currentLiveDepthAngle ?? currentNearest?.depthAngle ?? null;
-    const currentHipAngle = currentLiveHipAngle ?? currentNearest?.hipAngle ?? null;
-    const currentBackAngle = currentLiveBackAngle ?? currentNearest?.backAngle ?? null;
+      const panelValleys = isSquat ? detectKneeAngleMinima(panelSeries, {
+        lowerAngle: angleLowerBound,
+        upperAngle: angleUpperBound,
+      }) : [];
+      const panelBelowParallelCount = panelValleys.filter((v) => v.belowParallel).length;
+      const panelAvgRepKneeAngle =
+        panelValleys.length > 0
+          ? panelValleys.reduce((sum, v) => sum + v.angle, 0) / panelValleys.length
+          : null;
+      const panelAvgDepthAngle =
+        panelValleys.length > 0
+          ? panelValleys.reduce((sum, v) => sum + v.depthAngle, 0) / panelValleys.length
+          : null;
+      const panelAvgRepHipAngle = (() => {
+        const withHip = panelValleys.filter((v) => v.hipAngle !== null);
+        if (withHip.length === 0) return null;
+        return withHip.reduce((sum, v) => sum + v.hipAngle!, 0) / withHip.length;
+      })();
+      const panelAvgRepBackAngle = (() => {
+        const withBack = panelValleys.filter((v) => v.backAngle !== null);
+        if (withBack.length === 0) return null;
+        return withBack.reduce((sum, v) => sum + v.backAngle!, 0) / withBack.length;
+      })();
+      const panelNearest = (() => {
+        if (!isSquat || panelSeries.length === 0) return null;
+        return panelSeries.reduce((best, s) =>
+          Math.abs(s.time - panelTime) < Math.abs(best.time - panelTime) ? s : best
+        );
+      })();
+      const panelCurrentDepthAngle = panelLiveDepth ?? panelNearest?.depthAngle ?? null;
+      const panelCurrentHipAngle = panelLiveHip ?? panelNearest?.hipAngle ?? null;
+      const panelCurrentBackAngle = panelLiveBack ?? panelNearest?.backAngle ?? null;
 
+      return {
+        allMaxima: panelAllMaxima,
+        maxima: panelMaxima,
+        otherMaxima: panelOtherMaxima,
+        avgPeakAngle: panelAvgPeakAngle,
+        maxPeakAngle: panelMaxPeakAngle,
+        valleys: panelValleys,
+        belowParallelCount: panelBelowParallelCount,
+        avgRepKneeAngle: panelAvgRepKneeAngle,
+        avgDepthAngle: panelAvgDepthAngle,
+        avgRepHipAngle: panelAvgRepHipAngle,
+        avgRepBackAngle: panelAvgRepBackAngle,
+        currentDepthAngle: panelCurrentDepthAngle,
+        currentHipAngle: panelCurrentHipAngle,
+        currentBackAngle: panelCurrentBackAngle,
+        currentKneeDisplay: toKneeFlexion(panelCurrentKneeAngle),
+        avgKneeDisplay: toKneeFlexion(panelAvgRepKneeAngle),
+        currentHipDisplay: toHipFlexionProxy(panelCurrentHipAngle),
+        avgHipDisplay: toHipFlexionProxy(panelAvgRepHipAngle),
+      };
+    };
+
+    const primaryStats = computePanelStats(
+      series,
+      currentTime,
+      currentKneeAngle,
+      currentLiveDepthAngle,
+      currentLiveHipAngle,
+      currentLiveBackAngle,
+    );
+    const compareStats = hasCompareMedia
+      ? computePanelStats(
+        compareKneeAngleSeries,
+        compareCurrentTime,
+        compareCurrentKneeAngle,
+        compareCurrentLiveDepthAngle,
+        compareCurrentLiveHipAngle,
+        compareCurrentLiveBackAngle,
+      )
+      : null;
+
+    const allMaxima = primaryStats.allMaxima;
+    const maxima = primaryStats.maxima;
+    const otherMaxima = primaryStats.otherMaxima;
+    const avgPeakAngle = primaryStats.avgPeakAngle;
+    const maxPeakAngle = primaryStats.maxPeakAngle;
+    const valleys = primaryStats.valleys;
+    const belowParallelCount = primaryStats.belowParallelCount;
+    const avgRepKneeAngle = primaryStats.avgRepKneeAngle;
+    const avgDepthAngle = primaryStats.avgDepthAngle;
+    const avgRepHipAngle = primaryStats.avgRepHipAngle;
+    const avgRepBackAngle = primaryStats.avgRepBackAngle;
+    const currentDepthAngle = primaryStats.currentDepthAngle;
+    const currentHipAngle = primaryStats.currentHipAngle;
+    const currentBackAngle = primaryStats.currentBackAngle;
+    const currentKneeDisplay = primaryStats.currentKneeDisplay;
+    const avgKneeDisplay = primaryStats.avgKneeDisplay;
+    const currentHipDisplay = primaryStats.currentHipDisplay;
+    const avgHipDisplay = primaryStats.avgHipDisplay;
+    const compareMaxima = compareStats?.maxima ?? [];
+    const compareOtherMaxima = compareStats?.otherMaxima ?? [];
+    const compareValleys = compareStats?.valleys ?? [];
+
+    const compareSeries = compareKneeAngleSeries;
     const seriesEndTime = series.length > 0 ? series[series.length - 1]!.time : 0;
+    const compareSeriesEndTime = compareSeries.length > 0 ? compareSeries[compareSeries.length - 1]!.time : 0;
     const sliderTime = Math.max(duration, currentTime, 0.0001);
+    const compareSliderTime = Math.max(compareDuration, compareCurrentTime, 0.0001);
     const maxTime = graphDomainTime > 0 ? graphDomainTime : Math.max(sliderTime, seriesEndTime, 0.0001);
+    const compareMaxTime = graphDomainTime > 0 ? graphDomainTime : Math.max(compareSliderTime, compareSeriesEndTime, 0.0001);
     const graphHeight = 140;
 
     const strideMinAngle = 0;
     const strideMaxAngle = 180;
 
-    const depthAngles = isSquat ? series.map(s => s.depthAngle).filter((d): d is number => d !== null) : [];
+    const depthAngles = isSquat
+      ? [...series, ...(hasCompareMedia ? compareSeries : [])]
+        .map((s) => s.depthAngle)
+        .filter((d): d is number => d !== null)
+      : [];
     const depthMinRaw = depthAngles.length > 0 ? Math.min(...depthAngles) : -30;
     const depthMaxRaw = depthAngles.length > 0 ? Math.max(...depthAngles) : 80;
     const sqMinAngle = Math.min(depthMinRaw - 5, -10);
@@ -2335,16 +2874,60 @@ export default function App() {
       try { (e.currentTarget as Element).releasePointerCapture(e.pointerId); } catch { /* */ }
     };
 
-    const playheadX = maxTime > 0 ? (currentTime / maxTime) * 100 : 0;
+    const seekFromCompareGraphPointer = (clientX: number, svg: SVGSVGElement | null) => {
+      if (!svg || !compareVideoRef.current) return;
+      const rect = svg.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const xNorm = clamp((clientX - rect.left) / rect.width, 0, 1);
+      const time = xNorm * compareMaxTime;
+      compareScrubTargetRef.current = time;
+      if (compareScrubRafRef.current === null) {
+        compareScrubRafRef.current = requestAnimationFrame(() => {
+          compareScrubRafRef.current = null;
+          if (!compareVideoRef.current) return;
+          const target = compareScrubTargetRef.current ?? 0;
+          compareVideoRef.current.currentTime = target;
+          setCompareCurrentTime(compareVideoRef.current.currentTime);
+        });
+      }
+      setCompareCurrentTime(time);
+    };
 
-    const linePath = series
-      .map((sample, idx) => {
-        const x = (sample.time / maxTime) * 100;
-        const val = isSquat ? (sample.depthAngle ?? 0) : sample.angle;
-        const y = graphHeight - ((val - gMin) / (gMax - gMin)) * graphHeight;
-        return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(3)} ${y.toFixed(3)}`;
-      })
-      .join(' ');
+    const handleCompareGraphPointerDown = (e: ReactPointerEvent<SVGSVGElement>) => {
+      setDraggingComparePlayhead(true);
+      wasPlayingBeforeCompareScrubRef.current = isPlaying;
+      if (isPlaying) setIsPlaying(false);
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      seekFromCompareGraphPointer(e.clientX, compareGraphSvgRef.current);
+    };
+
+    const handleCompareGraphPointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
+      if (!draggingComparePlayhead) return;
+      seekFromCompareGraphPointer(e.clientX, compareGraphSvgRef.current);
+    };
+
+    const handleCompareGraphPointerUp = (e: ReactPointerEvent<SVGSVGElement>) => {
+      if (!draggingComparePlayhead) return;
+      setDraggingComparePlayhead(false);
+      if (wasPlayingBeforeCompareScrubRef.current) setIsPlaying(true);
+      try { (e.currentTarget as Element).releasePointerCapture(e.pointerId); } catch { /* */ }
+    };
+
+    const playheadX = maxTime > 0 ? (currentTime / maxTime) * 100 : 0;
+    const comparePlayheadX = compareMaxTime > 0 ? (compareCurrentTime / compareMaxTime) * 100 : 0;
+
+    const makeLinePath = (panelSeries: PoseAngleSample[], panelMaxTime: number) =>
+      panelSeries
+        .map((sample, idx) => {
+          const x = (sample.time / panelMaxTime) * 100;
+          const val = isSquat ? (sample.depthAngle ?? 0) : sample.angle;
+          const y = graphHeight - ((val - gMin) / (gMax - gMin)) * graphHeight;
+          return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(3)} ${y.toFixed(3)}`;
+        })
+        .join(' ');
+
+    const linePath = makeLinePath(series, maxTime);
+    const compareLinePath = makeLinePath(compareSeries, compareMaxTime);
 
     return (
       <section className="rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4">
@@ -2395,7 +2978,8 @@ export default function App() {
           </div>
         </div>
         {videoSrc ? (
-          <div className="relative rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
+          <div className={`grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+            <div className="relative rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
             {series.length >= 2 ? (
               <>
               <svg
@@ -2540,6 +3124,12 @@ export default function App() {
                   </span>
                 </>
               )}
+              {isSquat && series.length >= 2 && (
+                <div className="pointer-events-none absolute bottom-1 right-1 flex items-center gap-2 rounded bg-black/20 px-1.5 py-0.5 text-[10px] text-[var(--color-text-light)]">
+                  <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#52c41a'}} /> below</span>
+                  <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#ff4d4f'}} /> above</span>
+                </div>
+              )}
               </>
             ) : (
               <p className="py-8 text-center text-sm text-[var(--color-text-light)]">
@@ -2547,6 +3137,153 @@ export default function App() {
                   ? 'Play or scrub the video to collect squat-depth samples.'
                   : 'Play or scrub the video to collect knee-angle samples.'}
               </p>
+            )}
+            </div>
+            {hasCompareMedia && (
+              <div className="relative rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
+                {compareSeries.length >= 2 ? (
+                  <>
+                    <svg
+                      ref={compareGraphSvgRef}
+                      viewBox={`0 0 100 ${graphHeight}`}
+                      preserveAspectRatio="none"
+                      className="h-36 w-full"
+                      style={{ cursor: draggingComparePlayhead ? 'grabbing' : 'pointer', touchAction: 'none' }}
+                      role="img"
+                      aria-label={isSquat ? 'Compare squat depth over time' : 'Compare knee angle over time'}
+                      onPointerDown={handleCompareGraphPointerDown}
+                      onPointerMove={handleCompareGraphPointerMove}
+                      onPointerUp={handleCompareGraphPointerUp}
+                      onPointerCancel={handleCompareGraphPointerUp}
+                    >
+                      <path
+                        d={compareLinePath}
+                        fill="none"
+                        stroke="var(--color-accent)"
+                        strokeWidth={0.8}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                      {isSquat ? (
+                        <line x1={0} y1={parallelY} x2={100} y2={parallelY} stroke="#ffffff" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.5} vectorEffect="non-scaling-stroke" />
+                      ) : (
+                        <>
+                          <rect
+                            x={0}
+                            y={upperY}
+                            width={100}
+                            height={Math.max(0, lowerY - upperY)}
+                            fill="var(--color-accent)"
+                            opacity={0.06}
+                          />
+                          <line x1={0} y1={lowerY} x2={100} y2={lowerY} stroke="#ff4d4f" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
+                          <line x1={0} y1={upperY} x2={100} y2={upperY} stroke="#52c41a" strokeWidth={0.55} strokeDasharray="2 1.2" opacity={0.95} vectorEffect="non-scaling-stroke" />
+                        </>
+                      )}
+                      {!isSquat && compareOtherMaxima.map((peak) => {
+                        const x = (peak.time / compareMaxTime) * 100;
+                        return (
+                          <line
+                            key={`compare-other-${peak.time.toFixed(4)}`}
+                            x1={x}
+                            y1={0}
+                            x2={x}
+                            y2={graphHeight}
+                            stroke="#555"
+                            strokeWidth={0.25}
+                            strokeDasharray="1.25 1.15"
+                            opacity={0.4}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        );
+                      })}
+                      {!isSquat && compareMaxima.map((peak) => {
+                        const x = (peak.time / compareMaxTime) * 100;
+                        return (
+                          <line
+                            key={`compare-peak-${peak.time.toFixed(4)}`}
+                            x1={x}
+                            y1={0}
+                            x2={x}
+                            y2={graphHeight}
+                            stroke="#00d2ff"
+                            strokeWidth={0.35}
+                            strokeDasharray="1.25 1.15"
+                            opacity={0.95}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        );
+                      })}
+                      {isSquat && compareValleys.map((valley) => {
+                        const x = (valley.time / compareMaxTime) * 100;
+                        return (
+                          <line
+                            key={`compare-valley-${valley.time.toFixed(4)}`}
+                            x1={x}
+                            y1={0}
+                            x2={x}
+                            y2={graphHeight}
+                            stroke={valley.belowParallel ? '#52c41a' : '#ff4d4f'}
+                            strokeWidth={0.4}
+                            strokeDasharray="1.25 1.15"
+                            opacity={0.95}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        );
+                      })}
+                      {compareMaxTime > 0 && compareSeries.length >= 2 && (
+                        <line
+                          x1={comparePlayheadX}
+                          y1={0}
+                          x2={comparePlayheadX}
+                          y2={graphHeight}
+                          stroke="white"
+                          strokeWidth={1.5}
+                          opacity={draggingComparePlayhead ? 1 : 0.7}
+                          vectorEffect="non-scaling-stroke"
+                          style={{ pointerEvents: 'none' }}
+                        />
+                      )}
+                    </svg>
+                    {isSquat ? (
+                      <span
+                        className="pointer-events-none absolute left-1 text-[10px] font-medium leading-none"
+                        style={{bottom: `${((0 - gMin) / (gMax - gMin)) * 100}%`, color: '#ffffff', opacity: 0.5, transform: 'translateY(-2px)'}}
+                      >
+                        0° parallel
+                      </span>
+                    ) : (
+                      <>
+                        <span
+                          className="pointer-events-none absolute left-1 text-[10px] font-medium leading-none"
+                          style={{bottom: `${((angleUpperBound - gMin) / (gMax - gMin)) * 100}%`, color: '#52c41a', transform: 'translateY(-2px)'}}
+                        >
+                          {angleUpperBound.toFixed(0)}°
+                        </span>
+                        <span
+                          className="pointer-events-none absolute left-1 text-[10px] font-medium leading-none"
+                          style={{bottom: `${((angleLowerBound - gMin) / (gMax - gMin)) * 100}%`, color: '#ff4d4f', transform: 'translateY(-2px)'}}
+                        >
+                          {angleLowerBound.toFixed(0)}°
+                        </span>
+                      </>
+                    )}
+                    {isSquat && compareSeries.length >= 2 && (
+                      <div className="pointer-events-none absolute bottom-1 right-1 flex items-center gap-2 rounded bg-black/20 px-1.5 py-0.5 text-[10px] text-[var(--color-text-light)]">
+                        <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#52c41a'}} /> below</span>
+                        <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#ff4d4f'}} /> above</span>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="py-8 text-center text-sm text-[var(--color-text-light)]">
+                    {isSquat
+                      ? 'Play or scrub the compare video to collect squat-depth samples.'
+                      : 'Play or scrub the compare video to collect knee-angle samples.'}
+                  </p>
+                )}
+              </div>
             )}
           </div>
         ) : (
@@ -2568,84 +3305,277 @@ export default function App() {
           </div>
         )}
         {isSquat ? (
-          <>
-            <div className="mt-2 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
-              <p className="font-medium text-[var(--color-accent)]">Knee: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
-              <p className="font-medium text-[var(--color-accent)]">Depth: {currentDepthAngle !== null ? `${currentDepthAngle.toFixed(1)}°` : '—'}</p>
-              <p className="font-medium text-[var(--color-accent)]">Hip: {currentHipAngle !== null ? `${currentHipAngle.toFixed(1)}°` : '—'}</p>
-              <p className="font-medium text-[var(--color-accent)]">Back: {currentBackAngle !== null ? `${currentBackAngle.toFixed(1)}°` : '—'}</p>
+          <div className={`mt-2 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+            <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+              <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Primary</p>
+              <div className="grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
+                <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(currentKneeDisplay)}</p>
+                <p className="font-medium text-[var(--color-accent)]">Depth (coach): {formatAngle(currentDepthAngle)}</p>
+                <p className="font-medium text-[var(--color-accent)]">Hip flex*: {formatAngle(currentHipDisplay)}</p>
+                <p className="font-medium text-[var(--color-accent)]">Trunk lean: {formatAngle(currentBackAngle)}</p>
+              </div>
+              <div className="mt-1 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
+                <p>Avg: {formatAngle(avgKneeDisplay)}</p>
+                <p>Avg: {formatAngle(avgDepthAngle)}</p>
+                <p>Avg: {formatAngle(avgHipDisplay)}</p>
+                <p>Avg: {formatAngle(avgRepBackAngle)}</p>
+              </div>
             </div>
-            <div className="mt-1 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
-              <p>Avg: {avgRepKneeAngle !== null ? `${avgRepKneeAngle.toFixed(1)}°` : '—'}</p>
-              <p>Avg: {avgDepthAngle !== null ? `${avgDepthAngle.toFixed(1)}°` : '—'}</p>
-              <p>Avg: {avgRepHipAngle !== null ? `${avgRepHipAngle.toFixed(1)}°` : '—'}</p>
-              <p>Avg: {avgRepBackAngle !== null ? `${avgRepBackAngle.toFixed(1)}°` : '—'}</p>
-            </div>
-          </>
-        
+            {hasCompareMedia && (
+              <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+                <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
+                <div className="grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
+                  <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(compareStats?.currentKneeDisplay ?? null)}</p>
+                  <p className="font-medium text-[var(--color-accent)]">Depth (coach): {formatAngle(compareStats?.currentDepthAngle ?? null)}</p>
+                  <p className="font-medium text-[var(--color-accent)]">Hip flex*: {formatAngle(compareStats?.currentHipDisplay ?? null)}</p>
+                  <p className="font-medium text-[var(--color-accent)]">Trunk lean: {formatAngle(compareStats?.currentBackAngle ?? null)}</p>
+                </div>
+                <div className="mt-1 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
+                  <p>Avg: {formatAngle(compareStats?.avgKneeDisplay ?? null)}</p>
+                  <p>Avg: {formatAngle(compareStats?.avgDepthAngle ?? null)}</p>
+                  <p>Avg: {formatAngle(compareStats?.avgHipDisplay ?? null)}</p>
+                  <p>Avg: {formatAngle(compareStats?.avgRepBackAngle ?? null)}</p>
+                </div>
+              </div>
+            )}
+          </div>
         ) : (
-          <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
-            <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
-            <p>Samples: {series.length}</p>
-            <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {maxima.length}</p>
-            <p>
-              Avg peak: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}
-            </p>
-            <p>
-              Max peak: {maxPeakAngle !== null ? `${maxPeakAngle.toFixed(1)}°` : '—'}
-            </p>
-            <p>
-              Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°
-            </p>
-            <p className="flex items-center justify-end">
-              <button
-                type="button"
-                onClick={() => {
-                  const next: FacingDirection = facingDirection === 'right' ? 'left' : 'right';
-                  setFacingDirection(next);
-                  setKneeTrackingSide(facingDirectionToLeg(next));
-                }}
-                className="flex items-center gap-0.5 text-[10px] opacity-40 hover:opacity-70 transition-opacity text-[var(--color-text-light)]"
-                title={`Facing ${facingDirection} (auto-detected) — click to override`}
-              >
-                {facingDirection === 'right'
-                  ? <><span>Facing</span><ChevronRight className="h-3 w-3" /></>
-                  : <><ChevronLeft className="h-3 w-3" /><span>Facing</span></>
-                }
-              </button>
-            </p>
+          <div className={`mt-2 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+            <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+              <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Primary</p>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
+                <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
+                <p>Samples: {series.length}</p>
+                <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {maxima.length}</p>
+                <p>Avg peak: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}</p>
+                <p>Max peak: {maxPeakAngle !== null ? `${maxPeakAngle.toFixed(1)}°` : '—'}</p>
+                <p>Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°</p>
+              </div>
+            </div>
+            {hasCompareMedia && (
+              <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+                <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
+                  <p>Current: {compareCurrentKneeAngle !== null ? `${compareCurrentKneeAngle.toFixed(1)}°` : '—'}</p>
+                  <p>Samples: {compareKneeAngleSeries.length}</p>
+                  <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {compareStats?.maxima.length ?? 0}</p>
+                  <p>Avg peak: {compareStats?.avgPeakAngle !== null && compareStats?.avgPeakAngle !== undefined ? `${compareStats.avgPeakAngle.toFixed(1)}°` : '—'}</p>
+                  <p>Max peak: {compareStats?.maxPeakAngle !== null && compareStats?.maxPeakAngle !== undefined ? `${compareStats.maxPeakAngle.toFixed(1)}°` : '—'}</p>
+                  <p>Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°</p>
+                </div>
+              </div>
+            )}
           </div>
         )}
-        {isSquat && (
+        {showAngleGuide && (
+          <div className="mt-2 rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+            <div className="mb-1.5 flex items-center justify-between">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
+                Angle guide
+              </p>
+            </div>
+            {isSquat ? (
+            <div className="grid gap-2 text-[10px] text-[var(--color-text-light)] md:grid-cols-2 xl:grid-cols-4">
+              <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
+                <p className="font-semibold text-[var(--color-accent)]">Knee flex</p>
+                <p className="opacity-75">How bent the knee is at the bottom. Higher means deeper bend.</p>
+                <p className="mt-1 font-mono opacity-60">hip •───∠knee───• ankle</p>
+              </div>
+              <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
+                <p className="font-semibold text-[var(--color-accent)]">Depth (coach)</p>
+                <p className="opacity-75">Hip-to-knee segment vs horizontal. 0° is parallel; below 0° is below parallel.</p>
+                <p className="mt-1 font-mono opacity-60">thigh angle vs ─────────</p>
+              </div>
+              <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
+                <p className="font-semibold text-[var(--color-accent)]">Hip flex*</p>
+                <p className="opacity-75">Trunk-thigh proxy for hip bend. Higher means more closed hip position.</p>
+                <p className="mt-1 font-mono opacity-60">shoulder •─∠hip─• knee</p>
+              </div>
+              <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
+                <p className="font-semibold text-[var(--color-accent)]">Trunk lean</p>
+                <p className="opacity-75">Torso inclination from vertical. Higher means more forward torso lean.</p>
+                <p className="mt-1 font-mono opacity-60">vertical │ vs shoulder↘hip</p>
+              </div>
+            </div>
+          ) : (
+            <div className="grid gap-2 text-[10px] text-[var(--color-text-light)] md:grid-cols-2 xl:grid-cols-3">
+              <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
+                <p className="font-semibold text-[var(--color-accent)]">Knee angle (hip-knee-ankle)</p>
+                <p className="opacity-75">Primary stride angle. Peaks represent extension events over time.</p>
+                <p className="mt-1 font-mono opacity-60">hip •───∠knee───• ankle</p>
+              </div>
+              <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
+                <p className="font-semibold text-[var(--color-accent)]">Forward / behind peaks</p>
+                <p className="opacity-75">Classifies peak extension direction relative to hip-ankle geometry.</p>
+                <p className="mt-1 font-mono opacity-60">forward ↗ or behind ↖</p>
+              </div>
+              <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
+                <p className="font-semibold text-[var(--color-accent)]">Bounds</p>
+                <p className="opacity-75">Green/red threshold window used to count valid stride peaks.</p>
+                <p className="mt-1 font-mono opacity-60">green upper / red lower</p>
+              </div>
+            </div>
+          )}
+          </div>
+        )}
+        {isSquat && isPoseAnalyzing && (
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-[var(--color-text-light)]">
-            <span className="text-xs">Reps: {valleys.length}</span>
-            <span className="text-xs" style={{color: valleys.length > 0 ? (belowParallelCount === valleys.length ? '#52c41a' : belowParallelCount > 0 ? '#faad14' : '#ff4d4f') : undefined}}>
-              Below parallel: {belowParallelCount}/{valleys.length}
-            </span>
-            {series.length >= 2 && (
-              <>
-                <span className="flex items-center gap-1"><span className="inline-block h-2 w-4 rounded-sm" style={{background: '#52c41a'}} /> below (depth &lt; 0°)</span>
-                <span className="flex items-center gap-1"><span className="inline-block h-2 w-4 rounded-sm" style={{background: '#ff4d4f'}} /> above (depth &gt; 0°)</span>
-              </>
+            <span className="text-xs">analyzing...</span>
+          </div>
+        )}
+        {isSquat && showRepDetails && (
+          <div className={`mt-1.5 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+            <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2 text-xs text-[var(--color-text-light)]">
+              <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60">Primary rep details</p>
+              <p>Reps: {valleys.length}</p>
+              <p style={{color: valleys.length > 0 ? (belowParallelCount === valleys.length ? '#52c41a' : belowParallelCount > 0 ? '#faad14' : '#ff4d4f') : undefined}}>
+                Below parallel: {belowParallelCount}/{valleys.length}
+              </p>
+            </div>
+            {hasCompareMedia && (
+              <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2 text-xs text-[var(--color-text-light)]">
+                <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60">Compare rep details</p>
+                <p>Reps: {compareStats?.valleys.length ?? 0}</p>
+                <p
+                  style={{
+                    color: (compareStats?.valleys.length ?? 0) > 0
+                      ? ((compareStats?.belowParallelCount ?? 0) === (compareStats?.valleys.length ?? 0)
+                        ? '#52c41a'
+                        : (compareStats?.belowParallelCount ?? 0) > 0
+                          ? '#faad14'
+                          : '#ff4d4f')
+                      : undefined,
+                  }}
+                >
+                  Below parallel: {compareStats?.belowParallelCount ?? 0}/{compareStats?.valleys.length ?? 0}
+                </p>
+              </div>
             )}
-            {isPoseAnalyzing && <span className="text-xs">analyzing...</span>}
+          </div>
+        )}
+        {isSquat && (() => {
+          const primaryProfile = bodyProportions;
+          const primaryLive = liveBodyProportions;
+          const primaryShowLive = !primaryProfile && primaryLive;
+          const primaryProps = primaryProfile?.proportions ?? primaryLive;
+          const primaryDisplay = primaryProfile ?? (primaryLive ? classifyProportions(primaryLive) : null);
+
+          const compareProfile = compareBodyProportions;
+          const compareLive = compareLiveBodyProportions;
+          const compareShowLive = !compareProfile && compareLive;
+          const compareProps = compareProfile?.proportions ?? compareLive;
+          const compareDisplay = compareProfile ?? (compareLive ? classifyProportions(compareLive) : null);
+
+          if (!primaryDisplay || !primaryProps) return null;
+
+          type SegCat = ProportionProfile['femurCategory'];
+          const catColor = (cat: SegCat, favorable: 'short' | 'long') => {
+            const favorMap: Record<string, number> = {short: -2, 'slightly-short': -1, average: 0, 'slightly-long': 1, long: 2};
+            const dir = favorable === 'short' ? -1 : 1;
+            const score = (favorMap[cat] ?? 0) * dir;
+            if (score >= 2) return '#52c41a';
+            if (score >= 1) return '#8bc34a';
+            if (score <= -2) return '#ff4d4f';
+            if (score <= -1) return '#ff9800';
+            return '#faad14';
+          };
+
+          const renderProportionCard = (
+            title: string,
+            profile: ProportionProfile,
+            props: BodyProportions,
+            showLive: BodyProportions | false | null,
+          ) => {
+            const leanDeg = profile.estimatedLeanDeg;
+            const leanColor = leanDeg < 40 ? '#52c41a' : leanDeg < 48 ? '#faad14' : '#ff4d4f';
+            return (
+              <div className="rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <h4 className="text-xs font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
+                    {title} proportions {showLive ? <span className="text-[10px] font-normal opacity-50">(snapshot)</span> : <span className="text-[10px] font-normal opacity-50">(average)</span>}
+                  </h4>
+                </div>
+
+                <div className="mb-3 flex items-baseline gap-2">
+                  <span className="text-2xl font-bold" style={{color: leanColor}}>
+                    ~{Math.round(leanDeg)}°
+                  </span>
+                  <span className="text-[10px] text-[var(--color-text-light)] opacity-70">
+                    forward lean at parallel (from vertical)
+                  </span>
+                </div>
+
+                <div className="mb-2.5 grid grid-cols-2 gap-2 text-center text-[11px] text-[var(--color-text-light)]">
+                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                    <p className="text-[9px] uppercase tracking-wider opacity-50">Femur / Torso</p>
+                    <p className="text-sm font-semibold text-[var(--color-accent)]">{props.femurToTorso.toFixed(2)}</p>
+                    <p className="text-[9px] font-medium" style={{color: catColor(profile.femurCategory, 'short')}}>
+                      {profile.femurCategory.replace('-', ' ')} femurs
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                    <p className="text-[9px] uppercase tracking-wider opacity-50">Tibia / Femur</p>
+                    <p className="text-sm font-semibold text-[var(--color-accent)]">{props.tibiaToFemur.toFixed(2)}</p>
+                    <p className="text-[9px] font-medium" style={{color: catColor(profile.tibiaCategory, 'long')}}>
+                      {profile.tibiaCategory.replace('-', ' ')} tibias
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  {profile.insights.map((insight, i) => (
+                    <p key={i} className="text-[10px] leading-snug text-[var(--color-text-light)]">
+                      <span className="mr-1 opacity-40">&#x25B8;</span>{insight}
+                    </p>
+                  ))}
+                </div>
+              </div>
+            );
+          };
+
+          return (
+            <div className={`mt-3 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+              {renderProportionCard('Primary', primaryDisplay, primaryProps, primaryShowLive)}
+              {hasCompareMedia && compareDisplay && compareProps
+                ? renderProportionCard('Compare', compareDisplay, compareProps, compareShowLive)
+                : null}
+            </div>
+          );
+        })()}
+        <div className="mt-2 flex flex-wrap items-center justify-end gap-2 border-t border-[var(--color-accent)]/10 pt-2 text-[10px]">
+          <button
+            type="button"
+            onClick={() => setShowAngleGuide((v) => !v)}
+            className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
+          >
+            {showAngleGuide ? 'Hide guide' : 'Show guide'}
+          </button>
+          {isSquat && (
             <button
               type="button"
-              onClick={() => {
-                const next: FacingDirection = facingDirection === 'right' ? 'left' : 'right';
-                setFacingDirection(next);
-                setKneeTrackingSide(facingDirectionToLeg(next));
-              }}
-              className="ml-auto flex items-center gap-0.5 text-[10px] opacity-40 hover:opacity-70 transition-opacity text-[var(--color-text-light)]"
-              title={`Facing ${facingDirection} (auto-detected) — click to override`}
+              onClick={() => setShowRepDetails((v) => !v)}
+              className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
             >
-              {facingDirection === 'right'
-                ? <><span>Facing</span><ChevronRight className="h-3 w-3" /></>
-                : <><ChevronLeft className="h-3 w-3" /><span>Facing</span></>
-              }
+              {showRepDetails ? 'Hide rep details' : 'Show rep details'}
             </button>
-          </div>
-        )}
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              const next: FacingDirection = facingDirection === 'right' ? 'left' : 'right';
+              setFacingDirection(next);
+              setKneeTrackingSide(facingDirectionToLeg(next));
+              setCompareKneeTrackingSide(facingDirectionToLeg(next));
+            }}
+            className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
+            title={`Facing ${facingDirection} (auto-detected) — click to override`}
+          >
+            {facingDirection === 'right'
+              ? <><span>Facing</span><ChevronRight className="h-3 w-3" /></>
+              : <><ChevronLeft className="h-3 w-3" /><span>Facing</span></>
+            }
+          </button>
+        </div>
       </section>
     );
   };
@@ -3335,6 +4265,16 @@ export default function App() {
         <video
           ref={bgVideoRef}
           src={videoSrc}
+          preload="auto"
+          playsInline
+          muted
+          style={{ position: 'fixed', top: -9999, left: -9999, width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+        />
+      )}
+      {compareVideoSrc && (
+        <video
+          ref={compareBgVideoRef}
+          src={compareVideoSrc}
           preload="auto"
           playsInline
           muted
