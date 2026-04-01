@@ -308,6 +308,10 @@ type ProportionProfile = {
   difficultyScore: number;
   /** Estimated minimum torso forward lean (degrees from vertical) at parallel depth */
   estimatedLeanDeg: number;
+  /** Estimated knee flexion at parallel depth (0 = fully extended) */
+  estimatedParallelKneeFlexDeg: number;
+  /** Estimated hip flexion proxy at parallel depth (trunk-thigh proxy) */
+  estimatedParallelHipFlexDeg: number;
   dominantPattern: 'quad-dominant' | 'posterior-chain' | 'balanced';
   insights: string[];
 };
@@ -378,9 +382,10 @@ function getBodyProportions(
  *   → sin(lean) = (midfootOffset + femur − tibia × sin(dorsiflex)) / torso
  */
 const MIDFOOT_RATIO = 0.038 / 0.779;
+const DEFAULT_PARALLEL_ANKLE_DORSIFLEX_DEG = 22;
 function estimateForwardLean(
   p: BodyProportions,
-  ankleDorsiflexDeg = 22,
+  ankleDorsiflexDeg = DEFAULT_PARALLEL_ANKLE_DORSIFLEX_DEG,
 ): number {
   const dorsRad = ankleDorsiflexDeg * (Math.PI / 180);
   const totalSegs = p.torsoLen + p.femurLen + p.tibiaLen;
@@ -390,6 +395,19 @@ function estimateForwardLean(
   const sinLean = hipBehind / p.torsoLen;
   const clamped = Math.min(1, Math.max(-1, sinLean));
   return Math.asin(clamped) * (180 / Math.PI);
+}
+
+function estimateParallelFlexionAngles(
+  p: BodyProportions,
+  ankleDorsiflexDeg = DEFAULT_PARALLEL_ANKLE_DORSIFLEX_DEG,
+): {kneeFlexDeg: number; hipFlexProxyDeg: number} {
+  const leanDeg = estimateForwardLean(p, ankleDorsiflexDeg);
+  // At parallel with femur horizontal in this model:
+  // knee flexion = 90° + ankle dorsiflexion
+  // hip flexion proxy = 90° + trunk lean-from-vertical
+  const kneeFlexDeg = clamp(90 + ankleDorsiflexDeg, 0, 180);
+  const hipFlexProxyDeg = clamp(90 + leanDeg, 0, 180);
+  return {kneeFlexDeg, hipFlexProxyDeg};
 }
 
 function classifyProportions(p: BodyProportions): ProportionProfile {
@@ -412,6 +430,7 @@ function classifyProportions(p: BodyProportions): ProportionProfile {
     : 'average';
 
   const estimatedLeanDeg = estimateForwardLean(p);
+  const parallelFlex = estimateParallelFlexionAngles(p);
 
   // Continuous difficulty score (0–100).
   // Favorable proportions yield ~35°; challenging ones reach 55°+.
@@ -493,7 +512,17 @@ function classifyProportions(p: BodyProportions): ProportionProfile {
     insights.push('Compact legs relative to torso — achieving full depth should be straightforward.');
   }
 
-  return {proportions: p, femurCategory, tibiaCategory, difficultyScore, estimatedLeanDeg, dominantPattern, insights};
+  return {
+    proportions: p,
+    femurCategory,
+    tibiaCategory,
+    difficultyScore,
+    estimatedLeanDeg,
+    estimatedParallelKneeFlexDeg: parallelFlex.kneeFlexDeg,
+    estimatedParallelHipFlexDeg: parallelFlex.hipFlexProxyDeg,
+    dominantPattern,
+    insights,
+  };
 }
 
 type AppliedZoomMap = {x: number; y: number; s: number};
@@ -775,10 +804,11 @@ export default function App() {
   const [draggingComparePlayhead, setDraggingComparePlayhead] = useState(false);
   const wasPlayingBeforeCompareScrubRef = useRef(false);
   const compareGraphSvgRef = useRef<SVGSVGElement | null>(null);
-  const [showRepDetails, setShowRepDetails] = useState(false);
   const [showAngleGuide, setShowAngleGuide] = useState(false);
+  const [showBiomechanics, setShowBiomechanics] = useState(false);
   const [extensionFilter, setExtensionFilter] = useState<ExtensionDirection>('forward');
-  const [facingDirection, setFacingDirection] = useState<FacingDirection>('right');
+  const [primaryFacingDirection, setPrimaryFacingDirection] = useState<FacingDirection>('right');
+  const [compareFacingDirection, setCompareFacingDirection] = useState<FacingDirection>('right');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('stride');
   const poseDetectorRef = useRef<poseDetection.PoseDetector | null>(null);
   const poseRafRef = useRef<number | null>(null);
@@ -1310,6 +1340,8 @@ export default function App() {
       source: HTMLVideoElement | HTMLImageElement | null,
       setter: (next: {x: number; y: number; v: number}[]) => void,
       autoDetectFacing = false,
+      onDetectFacing?: (facing: FacingDirection) => void,
+      onDetectSide?: (side: KneeSide) => void,
     ) => {
       const keypoints = poses?.[0]?.keypoints;
       const sourceWidth =
@@ -1331,8 +1363,8 @@ export default function App() {
       if (autoDetectFacing) {
         const detected = detectFacingFromKeypoints(selected);
         if (detected) {
-          setFacingDirection(detected);
-          setKneeTrackingSide(facingDirectionToLeg(detected));
+          onDetectFacing?.(detected);
+          onDetectSide?.(facingDirectionToLeg(detected));
         }
       }
     };
@@ -1351,11 +1383,29 @@ export default function App() {
         if (!hasAnyVideo) {
           if (imageSrc && primaryImage) {
             const result = await detector.estimatePoses(primaryImage, {flipHorizontal: false});
-            if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints, true);
+            if (!cancelled) {
+              updatePoseFromResult(
+                result,
+                primaryImage,
+                setPoseKeypoints,
+                true,
+                setPrimaryFacingDirection,
+                setKneeTrackingSide,
+              );
+            }
           }
           if (compareImageSrc && compareImage) {
             const result = await detector.estimatePoses(compareImage, {flipHorizontal: false});
-            if (!cancelled) updatePoseFromResult(result, compareImage, setComparePoseKeypoints);
+            if (!cancelled) {
+              updatePoseFromResult(
+                result,
+                compareImage,
+                setComparePoseKeypoints,
+                true,
+                setCompareFacingDirection,
+                setCompareKneeTrackingSide,
+              );
+            }
           }
           return;
         }
@@ -1363,11 +1413,29 @@ export default function App() {
         if (imageSrc && primaryImage) {
           // Primary is an image: detect once and keep it.
           const result = await detector.estimatePoses(primaryImage, {flipHorizontal: false});
-          if (!cancelled) updatePoseFromResult(result, primaryImage, setPoseKeypoints);
+          if (!cancelled) {
+            updatePoseFromResult(
+              result,
+              primaryImage,
+              setPoseKeypoints,
+              true,
+              setPrimaryFacingDirection,
+              setKneeTrackingSide,
+            );
+          }
         }
         if (compareImageSrc && compareImage) {
           const result = await detector.estimatePoses(compareImage, {flipHorizontal: false});
-          if (!cancelled) updatePoseFromResult(result, compareImage, setComparePoseKeypoints);
+          if (!cancelled) {
+            updatePoseFromResult(
+              result,
+              compareImage,
+              setComparePoseKeypoints,
+              true,
+              setCompareFacingDirection,
+              setCompareKneeTrackingSide,
+            );
+          }
         }
 
         const tick = async () => {
@@ -1384,7 +1452,16 @@ export default function App() {
               lastPrimaryVideoTime = v.currentTime;
               lastPrimaryInferenceTs = now;
               const result = await detector.estimatePoses(v, {flipHorizontal: false});
-              if (!cancelled) updatePoseFromResult(result, v, setPoseKeypoints);
+              if (!cancelled) {
+                updatePoseFromResult(
+                  result,
+                  v,
+                  setPoseKeypoints,
+                  true,
+                  setPrimaryFacingDirection,
+                  setKneeTrackingSide,
+                );
+              }
             }
           }
 
@@ -1398,7 +1475,16 @@ export default function App() {
               lastCompareVideoTime = v.currentTime;
               lastCompareInferenceTs = now;
               const result = await detector.estimatePoses(v, {flipHorizontal: false});
-              if (!cancelled) updatePoseFromResult(result, v, setComparePoseKeypoints);
+              if (!cancelled) {
+                updatePoseFromResult(
+                  result,
+                  v,
+                  setComparePoseKeypoints,
+                  true,
+                  setCompareFacingDirection,
+                  setCompareKneeTrackingSide,
+                );
+              }
             }
           }
 
@@ -1586,8 +1672,8 @@ export default function App() {
       });
 
       ctx.save();
-      const sideFromFacing = facingDirectionToLeg(facingDirection);
-      const trackedSide = compareKneeTrackingSide ?? kneeTrackingSide ?? sideFromFacing;
+      const sideFromFacing = facingDirectionToLeg(compareFacingDirection);
+      const trackedSide = compareKneeTrackingSide ?? sideFromFacing;
       const trackedIds = trackedSide === 'left' ? POSE_LEFT_SIDE_IDS : POSE_RIGHT_SIDE_IDS;
       const isTrackedConnection = (aId: number, bId: number) =>
         trackedIds.has(aId) && trackedIds.has(bId);
@@ -1643,7 +1729,7 @@ export default function App() {
         if (rafId !== null) cancelAnimationFrame(rafId);
       };
     }
-  }, [comparePoseKeypoints, compareVideoSrc, compareImageSrc, compareMediaLayoutVersion, poseEnabled, compareKneeTrackingSide, kneeTrackingSide, facingDirection]);
+  }, [comparePoseKeypoints, compareVideoSrc, compareImageSrc, compareMediaLayoutVersion, poseEnabled, compareKneeTrackingSide, compareFacingDirection]);
 
   const [draggingPointIndex, setDraggingPointIndex] = useState<number | null>(null);
   const [compareCurrentTime, setCompareCurrentTime] = useState(0);
@@ -1751,8 +1837,7 @@ export default function App() {
     const targetDuration = Math.max(getReliableVideoDuration(mainVideo), mainVideo.duration || 0, 0);
     if (targetDuration <= 0) return;
 
-    let activeSide = facingDirectionToLeg(facingDirection);
-    let detectedFacing: FacingDirection | null = null;
+    let activeSide = facingDirectionToLeg(primaryFacingDirection);
 
     analysisAbortRef.current = true;
     const gen = ++analysisGenRef.current;
@@ -1833,6 +1918,7 @@ export default function App() {
       setPointSeries,
       cacheRef,
       setSide,
+      setFacing,
       setProfile,
       progressOffset,
       progressScale,
@@ -1844,6 +1930,7 @@ export default function App() {
       setPointSeries?: (series: PoseFrameSample[]) => void;
       cacheRef: MutableRefObject<{time: number; keypoints: {x: number; y: number; v: number}[]}[]>;
       setSide: (side: KneeSide) => void;
+      setFacing?: (facing: FacingDirection) => void;
       setProfile: (profile: ProportionProfile | null) => void;
       progressOffset: number;
       progressScale: number;
@@ -1903,6 +1990,7 @@ export default function App() {
             detectedFacing = detected;
             activeLocalSide = facingDirectionToLeg(detected);
             if (!isStale()) setSide(activeLocalSide);
+            if (!isStale()) setFacing?.(detected);
           }
         }
 
@@ -1968,10 +2056,8 @@ export default function App() {
       setSeries: setKneeAngleSeries,
       setPointSeries: setPosePointSeries,
       cacheRef: poseCacheRef,
-      setSide: (side) => {
-        setKneeTrackingSide(side);
-        setFacingDirection(side === 'left' ? 'left' : 'right');
-      },
+      setSide: setKneeTrackingSide,
+      setFacing: setPrimaryFacingDirection,
       setProfile: setBodyProportions,
       progressOffset: 0,
       progressScale: compareVideoSrc ? 0.5 : 1,
@@ -1983,10 +2069,11 @@ export default function App() {
       await analyzeSingleVideo({
         sourceVideo: compareBgVideo,
         visibleVideo: compareMainVideo,
-        initialSide: compareKneeTrackingSide ?? activeSide,
+        initialSide: compareKneeTrackingSide ?? facingDirectionToLeg(compareFacingDirection),
         setSeries: setCompareKneeAngleSeries,
         cacheRef: comparePoseCacheRef,
         setSide: setCompareKneeTrackingSide,
+        setFacing: setCompareFacingDirection,
         setProfile: setCompareBodyProportions,
         progressOffset: 50,
         progressScale: 0.5,
@@ -2003,7 +2090,7 @@ export default function App() {
       setAnalysisProgress(null);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [facingDirection, compareVideoSrc, compareKneeTrackingSide]);
+  }, [primaryFacingDirection, compareFacingDirection, compareVideoSrc, compareKneeTrackingSide]);
 
   useEffect(() => {
     if (!graphAnalysisRequested) return;
@@ -2142,7 +2229,7 @@ export default function App() {
       setLiveBodyProportions(null);
       return;
     }
-    const sideFromFacing = facingDirectionToLeg(facingDirection);
+    const sideFromFacing = facingDirectionToLeg(primaryFacingDirection);
     const activeSide = kneeTrackingSide ?? sideFromFacing;
     if (!kneeTrackingSide) {
       setKneeTrackingSide(sideFromFacing);
@@ -2160,7 +2247,7 @@ export default function App() {
     setCurrentLiveHipAngle(activeSide ? getHipAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
     setCurrentLiveBackAngle(activeSide ? getBackAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
     setLiveBodyProportions(activeSide ? getBodyProportions(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
-  }, [poseEnabled, poseKeypoints, currentTime, videoSrc, kneeTrackingSide, facingDirection]);
+  }, [poseEnabled, poseKeypoints, currentTime, videoSrc, kneeTrackingSide, primaryFacingDirection]);
 
   useEffect(() => {
     if (!poseEnabled) {
@@ -2180,7 +2267,7 @@ export default function App() {
       return;
     }
 
-    const sideFromFacing = facingDirectionToLeg(facingDirection);
+    const sideFromFacing = facingDirectionToLeg(compareFacingDirection);
     const activeSide = compareKneeTrackingSide ?? sideFromFacing;
     if (!compareKneeTrackingSide) {
       setCompareKneeTrackingSide(sideFromFacing);
@@ -2200,7 +2287,7 @@ export default function App() {
     setCompareCurrentLiveHipAngle(activeSide ? getHipAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
     setCompareCurrentLiveBackAngle(activeSide ? getBackAngle(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
     setCompareLiveBodyProportions(activeSide ? getBodyProportions(kps, activeSide, MIN_POSE_VISIBILITY, liveAr) : null);
-  }, [poseEnabled, comparePoseKeypoints, compareCurrentTime, compareVideoSrc, compareImageSrc, compareKneeTrackingSide, facingDirection]);
+  }, [poseEnabled, comparePoseKeypoints, compareCurrentTime, compareVideoSrc, compareImageSrc, compareKneeTrackingSide, compareFacingDirection]);
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
@@ -2670,11 +2757,12 @@ export default function App() {
       panelLiveDepth: number | null,
       panelLiveHip: number | null,
       panelLiveBack: number | null,
+      panelFacing: FacingDirection,
     ) => {
       const panelAllMaxima = isSquat ? [] : detectKneeAngleMaxima(panelSeries, {
         lowerAngle: angleLowerBound,
         upperAngle: angleUpperBound,
-        facing: facingDirection,
+        facing: panelFacing,
       });
       const panelMaxima = panelAllMaxima.filter((p) => p.direction === extensionFilter);
       const panelOtherMaxima = panelAllMaxima.filter((p) => p.direction !== extensionFilter);
@@ -2749,6 +2837,7 @@ export default function App() {
       currentLiveDepthAngle,
       currentLiveHipAngle,
       currentLiveBackAngle,
+      primaryFacingDirection,
     );
     const compareStats = hasCompareMedia
       ? computePanelStats(
@@ -2758,6 +2847,7 @@ export default function App() {
         compareCurrentLiveDepthAngle,
         compareCurrentLiveHipAngle,
         compareCurrentLiveBackAngle,
+        compareFacingDirection,
       )
       : null;
 
@@ -3307,34 +3397,37 @@ export default function App() {
         {isSquat ? (
           <div className={`mt-2 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
             <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
-              <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Primary</p>
-              <div className="grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
-                <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(currentKneeDisplay)}</p>
+              <div className="grid grid-cols-5 gap-x-3 text-xs text-[var(--color-text-light)]">
                 <p className="font-medium text-[var(--color-accent)]">Depth (coach): {formatAngle(currentDepthAngle)}</p>
+                <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(currentKneeDisplay)}</p>
                 <p className="font-medium text-[var(--color-accent)]">Hip flex*: {formatAngle(currentHipDisplay)}</p>
                 <p className="font-medium text-[var(--color-accent)]">Trunk lean: {formatAngle(currentBackAngle)}</p>
+                <p className="font-medium text-[var(--color-accent)]">Reps: {valleys.length}</p>
               </div>
-              <div className="mt-1 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
-                <p>Avg: {formatAngle(avgKneeDisplay)}</p>
+              <div className="mt-1 grid grid-cols-5 gap-x-3 text-xs text-[var(--color-text-light)]">
                 <p>Avg: {formatAngle(avgDepthAngle)}</p>
+                <p>Avg: {formatAngle(avgKneeDisplay)}</p>
                 <p>Avg: {formatAngle(avgHipDisplay)}</p>
                 <p>Avg: {formatAngle(avgRepBackAngle)}</p>
+                <p>Below parallel: {belowParallelCount}/{valleys.length}</p>
               </div>
             </div>
             {hasCompareMedia && (
               <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
                 <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
-                <div className="grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
-                  <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(compareStats?.currentKneeDisplay ?? null)}</p>
+                <div className="grid grid-cols-5 gap-x-3 text-xs text-[var(--color-text-light)]">
                   <p className="font-medium text-[var(--color-accent)]">Depth (coach): {formatAngle(compareStats?.currentDepthAngle ?? null)}</p>
+                  <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(compareStats?.currentKneeDisplay ?? null)}</p>
                   <p className="font-medium text-[var(--color-accent)]">Hip flex*: {formatAngle(compareStats?.currentHipDisplay ?? null)}</p>
                   <p className="font-medium text-[var(--color-accent)]">Trunk lean: {formatAngle(compareStats?.currentBackAngle ?? null)}</p>
+                  <p className="font-medium text-[var(--color-accent)]">Reps: {compareStats?.valleys.length ?? 0}</p>
                 </div>
-                <div className="mt-1 grid grid-cols-4 gap-x-3 text-xs text-[var(--color-text-light)]">
-                  <p>Avg: {formatAngle(compareStats?.avgKneeDisplay ?? null)}</p>
+                <div className="mt-1 grid grid-cols-5 gap-x-3 text-xs text-[var(--color-text-light)]">
                   <p>Avg: {formatAngle(compareStats?.avgDepthAngle ?? null)}</p>
+                  <p>Avg: {formatAngle(compareStats?.avgKneeDisplay ?? null)}</p>
                   <p>Avg: {formatAngle(compareStats?.avgHipDisplay ?? null)}</p>
                   <p>Avg: {formatAngle(compareStats?.avgRepBackAngle ?? null)}</p>
+                  <p>Below parallel: {(compareStats?.belowParallelCount ?? 0)}/{compareStats?.valleys.length ?? 0}</p>
                 </div>
               </div>
             )}
@@ -3342,7 +3435,6 @@ export default function App() {
         ) : (
           <div className={`mt-2 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
             <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
-              <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Primary</p>
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
                 <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
                 <p>Samples: {series.length}</p>
@@ -3423,37 +3515,7 @@ export default function App() {
             <span className="text-xs">analyzing...</span>
           </div>
         )}
-        {isSquat && showRepDetails && (
-          <div className={`mt-1.5 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
-            <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2 text-xs text-[var(--color-text-light)]">
-              <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60">Primary rep details</p>
-              <p>Reps: {valleys.length}</p>
-              <p style={{color: valleys.length > 0 ? (belowParallelCount === valleys.length ? '#52c41a' : belowParallelCount > 0 ? '#faad14' : '#ff4d4f') : undefined}}>
-                Below parallel: {belowParallelCount}/{valleys.length}
-              </p>
-            </div>
-            {hasCompareMedia && (
-              <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2 text-xs text-[var(--color-text-light)]">
-                <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60">Compare rep details</p>
-                <p>Reps: {compareStats?.valleys.length ?? 0}</p>
-                <p
-                  style={{
-                    color: (compareStats?.valleys.length ?? 0) > 0
-                      ? ((compareStats?.belowParallelCount ?? 0) === (compareStats?.valleys.length ?? 0)
-                        ? '#52c41a'
-                        : (compareStats?.belowParallelCount ?? 0) > 0
-                          ? '#faad14'
-                          : '#ff4d4f')
-                      : undefined,
-                  }}
-                >
-                  Below parallel: {compareStats?.belowParallelCount ?? 0}/{compareStats?.valleys.length ?? 0}
-                </p>
-              </div>
-            )}
-          </div>
-        )}
-        {isSquat && (() => {
+        {isSquat && showBiomechanics && (() => {
           const primaryProfile = bodyProportions;
           const primaryLive = liveBodyProportions;
           const primaryShowLive = !primaryProfile && primaryLive;
@@ -3469,59 +3531,67 @@ export default function App() {
           if (!primaryDisplay || !primaryProps) return null;
 
           type SegCat = ProportionProfile['femurCategory'];
-          const catColor = (cat: SegCat, favorable: 'short' | 'long') => {
-            const favorMap: Record<string, number> = {short: -2, 'slightly-short': -1, average: 0, 'slightly-long': 1, long: 2};
-            const dir = favorable === 'short' ? -1 : 1;
-            const score = (favorMap[cat] ?? 0) * dir;
-            if (score >= 2) return '#52c41a';
-            if (score >= 1) return '#8bc34a';
-            if (score <= -2) return '#ff4d4f';
-            if (score <= -1) return '#ff9800';
-            return '#faad14';
+          const catColor = (cat: SegCat) => {
+            const deviationMap: Record<SegCat, number> = {
+              short: 2,
+              'slightly-short': 1,
+              average: 0,
+              'slightly-long': 1,
+              long: 2,
+            };
+            const deviation = deviationMap[cat];
+            if (deviation === 0) return '#52c41a';
+            if (deviation === 1) return '#faad14';
+            return '#ff4d4f';
           };
 
-          const renderProportionCard = (
-            title: string,
-            profile: ProportionProfile,
-            props: BodyProportions,
-            showLive: BodyProportions | false | null,
-          ) => {
+          const renderProportionCard = (profile: ProportionProfile, props: BodyProportions, showLive: BodyProportions | false | null) => {
             const leanDeg = profile.estimatedLeanDeg;
-            const leanColor = leanDeg < 40 ? '#52c41a' : leanDeg < 48 ? '#faad14' : '#ff4d4f';
+            const parallelKneeFlex = profile.estimatedParallelKneeFlexDeg;
+            const parallelHipFlex = profile.estimatedParallelHipFlexDeg;
             return (
               <div className="rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-3">
-                <div className="mb-2 flex items-center justify-between">
-                  <h4 className="text-xs font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
-                    {title} proportions {showLive ? <span className="text-[10px] font-normal opacity-50">(snapshot)</span> : <span className="text-[10px] font-normal opacity-50">(average)</span>}
-                  </h4>
+                <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
+                  Biomechanical @ parallel
+                </p>
+                <div className="mb-2.5 grid grid-cols-1 gap-2 text-center text-[11px] text-[var(--color-text-light)] sm:grid-cols-3">
+                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                    <p className="text-[9px] uppercase tracking-wider opacity-50">Knee flex @ parallel</p>
+                    <p className="text-sm font-semibold text-[var(--color-accent)]">{parallelKneeFlex.toFixed(1)}°</p>
+                  </div>
+                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                    <p className="text-[9px] uppercase tracking-wider opacity-50">Hip flex* @ parallel</p>
+                    <p className="text-sm font-semibold text-[var(--color-accent)]">{parallelHipFlex.toFixed(1)}°</p>
+                  </div>
+                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                    <p className="text-[9px] uppercase tracking-wider opacity-50">Trunk lean @ parallel</p>
+                    <p className="text-sm font-semibold text-[var(--color-accent)]">{leanDeg.toFixed(1)}°</p>
+                  </div>
                 </div>
 
-                <div className="mb-3 flex items-baseline gap-2">
-                  <span className="text-2xl font-bold" style={{color: leanColor}}>
-                    ~{Math.round(leanDeg)}°
-                  </span>
-                  <span className="text-[10px] text-[var(--color-text-light)] opacity-70">
-                    forward lean at parallel (from vertical)
-                  </span>
-                </div>
-
+                <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
+                  Proportions {showLive ? <span className="font-normal opacity-55">(snapshot)</span> : <span className="font-normal opacity-55">(average)</span>}
+                </p>
                 <div className="mb-2.5 grid grid-cols-2 gap-2 text-center text-[11px] text-[var(--color-text-light)]">
                   <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
                     <p className="text-[9px] uppercase tracking-wider opacity-50">Femur / Torso</p>
                     <p className="text-sm font-semibold text-[var(--color-accent)]">{props.femurToTorso.toFixed(2)}</p>
-                    <p className="text-[9px] font-medium" style={{color: catColor(profile.femurCategory, 'short')}}>
+                    <p className="text-[9px] font-medium" style={{color: catColor(profile.femurCategory)}}>
                       {profile.femurCategory.replace('-', ' ')} femurs
                     </p>
                   </div>
                   <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
                     <p className="text-[9px] uppercase tracking-wider opacity-50">Tibia / Femur</p>
                     <p className="text-sm font-semibold text-[var(--color-accent)]">{props.tibiaToFemur.toFixed(2)}</p>
-                    <p className="text-[9px] font-medium" style={{color: catColor(profile.tibiaCategory, 'long')}}>
+                    <p className="text-[9px] font-medium" style={{color: catColor(profile.tibiaCategory)}}>
                       {profile.tibiaCategory.replace('-', ' ')} tibias
                     </p>
                   </div>
                 </div>
 
+                <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
+                  Advice
+                </p>
                 <div className="space-y-1">
                   {profile.insights.map((insight, i) => (
                     <p key={i} className="text-[10px] leading-snug text-[var(--color-text-light)]">
@@ -3535,9 +3605,9 @@ export default function App() {
 
           return (
             <div className={`mt-3 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
-              {renderProportionCard('Primary', primaryDisplay, primaryProps, primaryShowLive)}
+              {renderProportionCard(primaryDisplay, primaryProps, primaryShowLive)}
               {hasCompareMedia && compareDisplay && compareProps
-                ? renderProportionCard('Compare', compareDisplay, compareProps, compareShowLive)
+                ? renderProportionCard(compareDisplay, compareProps, compareShowLive)
                 : null}
             </div>
           );
@@ -3553,28 +3623,44 @@ export default function App() {
           {isSquat && (
             <button
               type="button"
-              onClick={() => setShowRepDetails((v) => !v)}
+              onClick={() => setShowBiomechanics((v) => !v)}
               className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
             >
-              {showRepDetails ? 'Hide rep details' : 'Show rep details'}
+              {showBiomechanics ? 'Hide biomechanics' : 'Show biomechanics'}
             </button>
           )}
           <button
             type="button"
             onClick={() => {
-              const next: FacingDirection = facingDirection === 'right' ? 'left' : 'right';
-              setFacingDirection(next);
+              const next: FacingDirection = primaryFacingDirection === 'right' ? 'left' : 'right';
+              setPrimaryFacingDirection(next);
               setKneeTrackingSide(facingDirectionToLeg(next));
-              setCompareKneeTrackingSide(facingDirectionToLeg(next));
             }}
             className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
-            title={`Facing ${facingDirection} (auto-detected) — click to override`}
+            title={`Primary facing ${primaryFacingDirection} (auto-detected) — click to override`}
           >
-            {facingDirection === 'right'
-              ? <><span>Facing</span><ChevronRight className="h-3 w-3" /></>
-              : <><ChevronLeft className="h-3 w-3" /><span>Facing</span></>
+            {primaryFacingDirection === 'right'
+              ? <><span>Primary facing</span><ChevronRight className="h-3 w-3" /></>
+              : <><ChevronLeft className="h-3 w-3" /><span>Primary facing</span></>
             }
           </button>
+          {hasCompareMedia && (
+            <button
+              type="button"
+              onClick={() => {
+                const next: FacingDirection = compareFacingDirection === 'right' ? 'left' : 'right';
+                setCompareFacingDirection(next);
+                setCompareKneeTrackingSide(facingDirectionToLeg(next));
+              }}
+              className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
+              title={`Compare facing ${compareFacingDirection} (auto-detected) — click to override`}
+            >
+              {compareFacingDirection === 'right'
+                ? <><span>Compare facing</span><ChevronRight className="h-3 w-3" /></>
+                : <><ChevronLeft className="h-3 w-3" /><span>Compare facing</span></>
+              }
+            </button>
+          )}
         </div>
       </section>
     );
