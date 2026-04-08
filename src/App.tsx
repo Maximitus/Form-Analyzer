@@ -3876,50 +3876,99 @@ export default function App() {
 
     return (
       <section className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}>
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
+        <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)] shrink-0">
             {isSquat ? 'Squat Depth — Below Parallel' : 'Knee Angle (Hip-Knee-Ankle)'}
           </h3>
-          <div className="flex items-center gap-2">
-            {!isSquat && (
+          <div className="flex min-w-0 w-full flex-1 flex-col gap-2 min-[480px]:flex-row min-[480px]:items-center min-[480px]:justify-between">
+            <div className="flex flex-wrap items-center gap-2">
+              {!isSquat && (
+                <button
+                  type="button"
+                  onClick={() => setExtensionFilter((prev) => (prev === 'forward' ? 'behind' : 'forward'))}
+                  className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
+                  title="Toggle forward / behind extension filter"
+                >
+                  {extensionFilter === 'forward' ? 'Forward' : 'Behind'}
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => setExtensionFilter((prev) => (prev === 'forward' ? 'behind' : 'forward'))}
-                className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
-                title="Toggle forward / behind extension filter"
+                onClick={() => {
+                  const next: FacingDirection = primaryFacingDirection === 'right' ? 'left' : 'right';
+                  setPrimaryFacingDirection(next);
+                  setKneeTrackingSide(facingDirectionToLeg(next));
+                }}
+                className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
+                title={`Primary facing ${primaryFacingDirection} (auto-detected) — click to override`}
               >
-                {extensionFilter === 'forward' ? 'Forward' : 'Behind'}
-              </button>
-            )}
-            <div className="flex rounded-md border border-[var(--color-accent)]/20 overflow-hidden">
-              <button
-                type="button"
-                onClick={() => handleAnalysisModeSwitch('stride')}
-                className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-                title="Stride analysis — track extension peaks"
-              >
-                Stride
-              </button>
-              <button
-                type="button"
-                onClick={() => handleAnalysisModeSwitch('squat')}
-                className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-                title="Squat analysis — track depth valleys and 90° threshold"
-              >
-                Squat
+                {primaryFacingDirection === 'right'
+                  ? <><span>Primary facing</span><ChevronRight className="h-3 w-3" /></>
+                  : <><ChevronLeft className="h-3 w-3" /><span>Primary facing</span></>
+                }
               </button>
             </div>
-            {videoSrc ? (
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 self-end min-[480px]:self-auto">
+              {isSquat && (
+                <button
+                  type="button"
+                  onClick={() => setShowBiomechanics((v) => !v)}
+                  className={`rounded-md border px-2 py-1 text-xs text-[var(--color-accent)] transition-colors hover:bg-[var(--color-panel-hover)] ${
+                    showBiomechanics
+                      ? 'border-[var(--color-accent)]/50 bg-[var(--color-accent)]/10'
+                      : 'border-[var(--color-accent)]/20'
+                  }`}
+                  title="Proportions, parallel lean, coaching notes"
+                  aria-label={showBiomechanics ? 'Hide biomechanics panel' : 'Show biomechanics panel'}
+                  aria-pressed={showBiomechanics}
+                >
+                  Biomechanics
+                </button>
+              )}
               <button
                 type="button"
-                onClick={runGraphAnalysis}
-                className="rounded-md border border-[var(--color-accent)]/20 p-1.5 hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
-                title="Analyze graph"
-                aria-label="Analyze graph"
+                onClick={() => setShowAngleGuide((v) => !v)}
+                className={`rounded-md border px-2 py-1 text-xs text-[var(--color-accent)] transition-colors hover:bg-[var(--color-panel-hover)] ${
+                  showAngleGuide
+                    ? 'border-[var(--color-accent)]/50 bg-[var(--color-accent)]/10'
+                    : 'border-[var(--color-accent)]/20'
+                }`}
+                title="Angle reference — knee, depth, toe, trunk labels"
+                aria-label={showAngleGuide ? 'Hide angle guide' : 'Show angle guide'}
+                aria-pressed={showAngleGuide}
               >
-                <LineChart className="h-4 w-4" />
+                Guide
               </button>
-            ) : null}
+              <div className="flex rounded-md border border-[var(--color-accent)]/20 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => handleAnalysisModeSwitch('stride')}
+                  className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+                  title="Stride analysis — track extension peaks"
+                >
+                  Stride
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleAnalysisModeSwitch('squat')}
+                  className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+                  title="Squat analysis — track depth valleys and 90° threshold"
+                >
+                  Squat
+                </button>
+              </div>
+              {videoSrc ? (
+                <button
+                  type="button"
+                  onClick={runGraphAnalysis}
+                  className="rounded-md border border-[var(--color-accent)]/20 p-1.5 hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
+                  title="Analyze graph"
+                  aria-label="Analyze graph"
+                >
+                  <LineChart className="h-4 w-4" />
+                </button>
+              ) : null}
+            </div>
           </div>
         </div>
         {videoSrc ? (
@@ -4585,39 +4634,8 @@ export default function App() {
             </div>
           );
         })()}
-        <div className="mt-2 flex flex-wrap items-center justify-end gap-2 border-t border-[var(--color-accent)]/10 pt-2 text-[10px]">
-          <button
-            type="button"
-            onClick={() => setShowAngleGuide((v) => !v)}
-            className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
-          >
-            {showAngleGuide ? 'Hide guide' : 'Show guide'}
-          </button>
-          {isSquat && (
-            <button
-              type="button"
-              onClick={() => setShowBiomechanics((v) => !v)}
-              className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
-            >
-              {showBiomechanics ? 'Hide biomechanics' : 'Show biomechanics'}
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={() => {
-              const next: FacingDirection = primaryFacingDirection === 'right' ? 'left' : 'right';
-              setPrimaryFacingDirection(next);
-              setKneeTrackingSide(facingDirectionToLeg(next));
-            }}
-            className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
-            title={`Primary facing ${primaryFacingDirection} (auto-detected) — click to override`}
-          >
-            {primaryFacingDirection === 'right'
-              ? <><span>Primary facing</span><ChevronRight className="h-3 w-3" /></>
-              : <><ChevronLeft className="h-3 w-3" /><span>Primary facing</span></>
-            }
-          </button>
-          {hasCompareMedia && (
+        {hasCompareMedia && (
+          <div className="mt-2 flex flex-wrap items-center justify-end gap-2 border-t border-[var(--color-accent)]/10 pt-2 text-[10px]">
             <button
               type="button"
               onClick={() => {
@@ -4633,8 +4651,8 @@ export default function App() {
                 : <><ChevronLeft className="h-3 w-3" /><span>Compare facing</span></>
               }
             </button>
-          )}
-        </div>
+          </div>
+        )}
       </section>
     );
   };
