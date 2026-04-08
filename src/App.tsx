@@ -4905,11 +4905,11 @@ export default function App() {
                 {renderOverlayToolbelt()}
                 {renderMeasurementOverlay()}
                 <div
-                  className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'md:grid-cols-2 md:gap-0' : 'grid-cols-1 gap-0'}`}
+                  className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'grid-cols-2 gap-0' : 'grid-cols-1 gap-0'}`}
                 >
                   {/* Side-by-side: align portrait media to the inner seam (object-contain letterboxing otherwise sits in the middle). */}
                   <div
-                    className={`flex min-w-0 flex-col gap-2 ${hasCompareMedia ? 'md:items-end' : 'items-center'}`}
+                    className={`flex min-w-0 flex-col gap-2 ${hasCompareMedia ? 'items-end' : 'items-center'}`}
                   >
                     <div
                       ref={mediaWrapRef}
@@ -4954,7 +4954,7 @@ export default function App() {
                     </div>
                   </div>
                   {hasCompareMedia ? (
-                    <div className="flex min-w-0 flex-col gap-2 md:items-start">
+                    <div className="flex min-w-0 flex-col gap-2 items-start">
                       <div
                         ref={compareMediaWrapRef}
                         className="relative inline-block min-w-0 max-w-full overflow-hidden"
@@ -5057,7 +5057,7 @@ export default function App() {
                       <ChevronRight className="w-5 h-5" />
                     </button>
                   </div>
-                  <div className={`pointer-events-auto grid gap-2 ${compareVideoSrc ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
+                  <div className={`pointer-events-auto grid gap-2 ${compareVideoSrc ? 'grid-cols-2' : 'grid-cols-1'}`}>
                     <input
                       type="range"
                       min="0"
@@ -5105,9 +5105,9 @@ export default function App() {
                 {renderOverlayToolbelt()}
                 {renderMeasurementOverlay()}
                 <div
-                  className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'md:grid-cols-2 md:gap-0' : 'grid-cols-1 gap-0'}`}
+                  className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'grid-cols-2 gap-0' : 'grid-cols-1 gap-0'}`}
                 >
-                  <div className={`min-w-0 ${hasCompareMedia ? 'md:flex md:flex-col md:items-end' : 'flex flex-col items-center'}`}>
+                  <div className={`min-w-0 ${hasCompareMedia ? 'flex flex-col items-end' : 'flex flex-col items-center'}`}>
                     <div
                       ref={mediaWrapRef}
                       className={`relative inline-block min-w-0 max-w-full overflow-hidden ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
@@ -5151,7 +5151,7 @@ export default function App() {
                   </div>
                   </div>
                   {hasCompareMedia ? (
-                    <div className={`min-w-0 ${hasCompareMedia ? 'md:flex md:flex-col md:items-start' : ''}`}>
+                    <div className="min-w-0 flex flex-col items-start">
                     <div
                       ref={compareMediaWrapRef}
                       className="relative inline-block min-w-0 max-w-full overflow-hidden"
