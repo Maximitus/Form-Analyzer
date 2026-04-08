@@ -3882,31 +3882,44 @@ export default function App() {
           </h3>
           <div className="flex min-w-0 w-full flex-1 flex-col gap-2 min-[480px]:flex-row min-[480px]:items-center min-[480px]:justify-between">
             <div className="flex flex-wrap items-center gap-2">
-              {!isSquat && (
+              <div className="flex shrink-0 items-center gap-1">
                 <button
                   type="button"
-                  onClick={() => setExtensionFilter((prev) => (prev === 'forward' ? 'behind' : 'forward'))}
-                  className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
-                  title="Toggle forward / behind extension filter"
+                  onClick={() => {
+                    const next: FacingDirection = primaryFacingDirection === 'right' ? 'left' : 'right';
+                    setPrimaryFacingDirection(next);
+                    setKneeTrackingSide(facingDirectionToLeg(next));
+                  }}
+                  className="flex items-center justify-center rounded-md border border-[var(--color-accent)]/20 p-1.5 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
+                  title={`Primary facing ${primaryFacingDirection} (auto-detected) — click to override`}
+                  aria-label={`Primary facing ${primaryFacingDirection} (auto-detected). Click to flip.`}
                 >
-                  {extensionFilter === 'forward' ? 'Forward' : 'Behind'}
+                  {primaryFacingDirection === 'right' ? (
+                    <ChevronRight className="h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <ChevronLeft className="h-3.5 w-3.5" aria-hidden />
+                  )}
                 </button>
-              )}
-              <button
-                type="button"
-                onClick={() => {
-                  const next: FacingDirection = primaryFacingDirection === 'right' ? 'left' : 'right';
-                  setPrimaryFacingDirection(next);
-                  setKneeTrackingSide(facingDirectionToLeg(next));
-                }}
-                className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
-                title={`Primary facing ${primaryFacingDirection} (auto-detected) — click to override`}
-              >
-                {primaryFacingDirection === 'right'
-                  ? <><span>Primary facing</span><ChevronRight className="h-3 w-3" /></>
-                  : <><ChevronLeft className="h-3 w-3" /><span>Primary facing</span></>
-                }
-              </button>
+                {hasCompareMedia ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next: FacingDirection = compareFacingDirection === 'right' ? 'left' : 'right';
+                      setCompareFacingDirection(next);
+                      setCompareKneeTrackingSide(facingDirectionToLeg(next));
+                    }}
+                    className="flex items-center justify-center rounded-md border border-[var(--color-accent)]/20 p-1.5 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
+                    title={`Compare facing ${compareFacingDirection} (auto-detected) — click to override`}
+                    aria-label={`Compare facing ${compareFacingDirection} (auto-detected). Click to flip.`}
+                  >
+                    {compareFacingDirection === 'right' ? (
+                      <ChevronRight className="h-3.5 w-3.5" aria-hidden />
+                    ) : (
+                      <ChevronLeft className="h-3.5 w-3.5" aria-hidden />
+                    )}
+                  </button>
+                ) : null}
+              </div>
             </div>
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 self-end min-[480px]:self-auto">
               {isSquat && (
@@ -3923,6 +3936,16 @@ export default function App() {
                   aria-pressed={showBiomechanics}
                 >
                   Biomechanics
+                </button>
+              )}
+              {!isSquat && (
+                <button
+                  type="button"
+                  onClick={() => setExtensionFilter((prev) => (prev === 'forward' ? 'behind' : 'forward'))}
+                  className="rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-xs hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
+                  title="Toggle forward / behind extension filter"
+                >
+                  {extensionFilter === 'forward' ? 'Forward' : 'Behind'}
                 </button>
               )}
               <button
@@ -4388,7 +4411,6 @@ export default function App() {
             </div>
             {hasCompareMedia && (
               <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
-                <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
                 <div className="grid grid-cols-5 gap-x-3 text-xs text-[var(--color-text-light)]">
                   <p className="font-medium text-[var(--color-accent)]">Depth (coach): {formatAngle(compareStats?.currentDepthAngle ?? null)}</p>
                   <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(compareStats?.currentKneeDisplay ?? null)}</p>
@@ -4437,7 +4459,6 @@ export default function App() {
             </div>
             {hasCompareMedia && (
               <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
-                <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
                 <div className="grid grid-cols-3 gap-x-2 gap-y-1 text-xs text-[var(--color-text-light)]">
                   <p className="font-medium text-[var(--color-accent)]" title="Hip–knee–ankle at playhead">
                     Knee angle: {compareCurrentKneeAngle !== null ? `${compareCurrentKneeAngle.toFixed(1)}°` : '—'}
@@ -4634,25 +4655,6 @@ export default function App() {
             </div>
           );
         })()}
-        {hasCompareMedia && (
-          <div className="mt-2 flex flex-wrap items-center justify-end gap-2 border-t border-[var(--color-accent)]/10 pt-2 text-[10px]">
-            <button
-              type="button"
-              onClick={() => {
-                const next: FacingDirection = compareFacingDirection === 'right' ? 'left' : 'right';
-                setCompareFacingDirection(next);
-                setCompareKneeTrackingSide(facingDirectionToLeg(next));
-              }}
-              className="flex items-center gap-0.5 rounded-md border border-[var(--color-accent)]/20 px-2 py-1 text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)] transition-colors"
-              title={`Compare facing ${compareFacingDirection} (auto-detected) — click to override`}
-            >
-              {compareFacingDirection === 'right'
-                ? <><span>Compare facing</span><ChevronRight className="h-3 w-3" /></>
-                : <><ChevronLeft className="h-3 w-3" /><span>Compare facing</span></>
-              }
-            </button>
-          </div>
-        )}
       </section>
     );
   };
