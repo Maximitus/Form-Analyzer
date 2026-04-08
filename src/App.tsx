@@ -109,15 +109,49 @@ const ZOOM_MAX_SCALE = 8;
 const ZOOM_BUTTON_FACTOR = 1.25;
 const FRAME_STEP_SECONDS = 1 / 30; // approx single frame at 30fps
 const SLIDER_SCRUB_STEP_SECONDS = 1 / 60; // smaller increments for smoother scrubbing
-const POSE_TRACKED_IDS = [11, 12, 13, 14, 15, 16, 5, 6, 7, 8, 9, 10];
-const POSE_LEFT_SIDE_IDS = new Set([5, 7, 9, 11, 13, 15]);
-const POSE_RIGHT_SIDE_IDS = new Set([6, 8, 10, 12, 14, 16]);
+/**
+ * COCO-style IDs kept for all math and overlays. 17–20 are our extensions for
+ * heel / toe (BlazePose only); MoveNet had no foot landmarks beyond the ankle.
+ */
+const POSE_NOSE_ID = 0;
+const POSE_TRACKED_IDS = [
+  POSE_NOSE_ID,
+  11, 12, 13, 14, 15, 16, 5, 6, 7, 8, 9, 10, 17, 18, 19, 20,
+];
+/** Maps each COCO-style id to BlazePose keypoint index (model output order). */
+const COCO_ID_TO_BLAZEPOSE_INDEX: Record<number, number> = {
+  0: 0,
+  5: 11,
+  6: 12,
+  7: 13,
+  8: 14,
+  9: 15,
+  10: 16,
+  11: 23,
+  12: 24,
+  13: 25,
+  14: 26,
+  15: 27,
+  16: 28,
+  17: 29,
+  18: 30,
+  19: 31,
+  20: 32,
+};
+const POSE_LEFT_SIDE_IDS = new Set([5, 7, 9, 11, 13, 15, 17, 19]);
+const POSE_RIGHT_SIDE_IDS = new Set([6, 8, 10, 12, 14, 16, 18, 20]);
 const POSE_ARM_IDS = new Set([7, 8, 9, 10]);
 const POSE_BODY_CONNECTIONS: [number, number][] = [
+  [POSE_NOSE_ID, 5],
+  [POSE_NOSE_ID, 6],
   [11, 13],
   [13, 15],
+  [15, 17],
+  [17, 19],
   [12, 14],
   [14, 16],
+  [16, 18],
+  [18, 20],
   [11, 12],
   [5, 11],
   [6, 12],
@@ -130,11 +164,59 @@ const POSE_BODY_CONNECTIONS: [number, number][] = [
 const MIN_POSE_VISIBILITY = 0.25;
 const KNEE_SAMPLE_EPSILON_SECONDS = 1 / 1000;
 const POSE_INFERENCE_HZ = 24;
+
+function keypointsFromBlazePoseOutput(
+  keypoints: poseDetection.Keypoint[] | undefined,
+  sourceWidth: number,
+  sourceHeight: number,
+): {x: number; y: number; v: number}[] {
+  if (!keypoints || keypoints.length === 0 || sourceWidth <= 0 || sourceHeight <= 0) {
+    return [];
+  }
+  return POSE_TRACKED_IDS.map((cocoId) => {
+    const bpIdx = COCO_ID_TO_BLAZEPOSE_INDEX[cocoId];
+    const p = keypoints[bpIdx];
+    if (!p) return {x: 0, y: 0, v: 0};
+    const score = p.score ?? 0;
+    return {x: p.x / sourceWidth, y: p.y / sourceHeight, v: score};
+  });
+}
+
+/**
+ * BlazePose TF.js uses getImageSize(input) which reads HTMLVideoElement.width/height,
+ * not videoWidth/videoHeight — those are often 0 or wrong, collapsing landmarks.
+ * Copy the current frame to a canvas sized to the intrinsic video dimensions so
+ * the model and our normalization share one coordinate system.
+ */
+function blazeposeVideoFrameCanvas(
+  video: HTMLVideoElement,
+  canvas: HTMLCanvasElement,
+): HTMLCanvasElement | null {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (vw <= 0 || vh <= 0) return null;
+  if (canvas.width !== vw || canvas.height !== vh) {
+    canvas.width = vw;
+    canvas.height = vh;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0, vw, vh);
+  return canvas;
+}
 const KNEE_MAXIMA_MIN_SAMPLES = 3;
-const KNEE_MAXIMA_MIN_GAP_SECONDS = 0.1;
+const KNEE_MAXIMA_MIN_GAP_SECONDS = 0.15;
+/** Min prominence (°): peak must stand this far above the higher adjacent "valley" baseline (filters slope noise). */
+const KNEE_MAXIMA_MIN_PROMINENCE = 5;
+/** Peak must be >= every sample in ±radius (stricter than single-neighbor local max). */
+const KNEE_MAXIMA_NEIGHBOR_RADIUS = 2;
 const KNEE_MINIMA_MIN_SAMPLES = 3;
 const KNEE_MINIMA_MIN_GAP_SECONDS = 0.3;
 const KNEE_MINIMA_DEFAULT_PROMINENCE = 15;
+/** Stride: first sample after peak where knee bends this much below peak angle ≈ landing flexion (earlier than mid-stance min). */
+const STRIDE_FLEX_ONSET_DEG = 2;
+/** Search only the first ~120ms after extension peak for contact (avoids late mid-stance). */
+const STRIDE_CONTACT_SEARCH_SEC = 0.12;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -347,14 +429,40 @@ function getBodyProportions(
     const p = keypoints[i];
     if (p) byId.set(id, p);
   });
-  const shoulder = side === 'left' ? byId.get(5) : byId.get(6);
-  const hip = side === 'left' ? byId.get(11) : byId.get(12);
+  const leftShoulder = byId.get(5);
+  const rightShoulder = byId.get(6);
+  const leftHip = byId.get(11);
+  const rightHip = byId.get(12);
+  const hip = side === 'left' ? leftHip : rightHip;
   const knee = side === 'left' ? byId.get(13) : byId.get(14);
   const ankle = side === 'left' ? byId.get(15) : byId.get(16);
-  if (!shoulder || !hip || !knee || !ankle) return null;
-  if (Math.min(shoulder.v, hip.v, knee.v, ankle.v) < visibilityThreshold) return null;
+  if (!leftShoulder || !rightShoulder || !leftHip || !rightHip || !hip || !knee || !ankle) return null;
+  if (
+    Math.min(
+      leftShoulder.v,
+      rightShoulder.v,
+      leftHip.v,
+      rightHip.v,
+      hip.v,
+      knee.v,
+      ankle.v,
+    ) < visibilityThreshold
+  ) {
+    return null;
+  }
 
-  const torsoLen = segmentLength(shoulder, hip, aspectRatio);
+  // Mid-shoulder → mid-hip: stable trunk line vs one glenohumeral point. Ipsilateral
+  // shoulder–hip stretches when the shoulder rolls forward in a squat, inflating
+  // "torso" and biasing femur/torso toward "short femur."
+  const midShoulder = {
+    x: (leftShoulder.x + rightShoulder.x) / 2,
+    y: (leftShoulder.y + rightShoulder.y) / 2,
+  };
+  const midHip = {
+    x: (leftHip.x + rightHip.x) / 2,
+    y: (leftHip.y + rightHip.y) / 2,
+  };
+  const torsoLen = segmentLength(midShoulder, midHip, aspectRatio);
   const femurLen = segmentLength(hip, knee, aspectRatio);
   const tibiaLen = segmentLength(knee, ankle, aspectRatio);
 
@@ -374,6 +482,56 @@ function getBodyProportions(
     }
   }
 
+  return {
+    torsoLen,
+    femurLen,
+    tibiaLen,
+    femurToTorso: femurLen / torsoLen,
+    tibiaToFemur: tibiaLen / femurLen,
+    legToTorso: (femurLen + tibiaLen) / torsoLen,
+  };
+}
+
+/**
+ * Linear correction of raw 2D segment lengths from BlazePose so ratios sit closer to
+ * joint-center anthropometry (Drillis-style). Low hip landmarks shorten measured femur
+ * and inflate tibia/femur; midline torso is still a bit long vs true trunk height.
+ * Category bands and the parallel lean model then use **calibrated** lengths.
+ */
+const POSE_SEGMENT_FEMUR_LEN_SCALE = 1.06;
+const POSE_SEGMENT_TORSO_LEN_SCALE = 0.99;
+const POSE_SEGMENT_TIBIA_LEN_SCALE = 1;
+
+/**
+ * Tape-measured reference (same units, any unit — only ratios matter). Tunes 2D pose
+ * segment ratios toward real segment lengths without extra UI inputs.
+ * Ref values: app “Proportions (average)” before this layer (~0.87 F/T, ~1.03 T/F).
+ */
+const VALIDATION_TORSO_LEN = 21;
+const VALIDATION_FEMUR_LEN = 20;
+const VALIDATION_TIBIA_LEN = 20;
+const VALIDATION_REF_FEMUR_TO_TORSO = 0.87;
+const VALIDATION_REF_TIBIA_TO_FEMUR = 1.03;
+
+const VALIDATION_TARGET_FEMUR_TO_TORSO = VALIDATION_FEMUR_LEN / VALIDATION_TORSO_LEN;
+const VALIDATION_TARGET_TIBIA_TO_FEMUR = VALIDATION_TIBIA_LEN / VALIDATION_FEMUR_LEN;
+/** Multiply femur length vs torso so (femur/torso) moves ref → target. */
+const RATIO_FIX_FEMUR_VS_TORSO = VALIDATION_TARGET_FEMUR_TO_TORSO / VALIDATION_REF_FEMUR_TO_TORSO;
+/** Multiply tibia vs femur so (tibia/femur) moves ref → target (applied after femur fix). */
+const RATIO_FIX_TIBIA_VS_FEMUR = VALIDATION_TARGET_TIBIA_TO_FEMUR / VALIDATION_REF_TIBIA_TO_FEMUR;
+
+function calibrateBodyProportions(raw: BodyProportions): BodyProportions {
+  const torsoLen = raw.torsoLen * POSE_SEGMENT_TORSO_LEN_SCALE;
+  const femurLen =
+    raw.femurLen * POSE_SEGMENT_FEMUR_LEN_SCALE * RATIO_FIX_FEMUR_VS_TORSO;
+  const tibiaLen =
+    raw.tibiaLen
+    * POSE_SEGMENT_TIBIA_LEN_SCALE
+    * RATIO_FIX_FEMUR_VS_TORSO
+    * RATIO_FIX_TIBIA_VS_FEMUR;
+  if (torsoLen < 1e-9 || femurLen < 1e-9 || tibiaLen < 1e-9) {
+    return raw;
+  }
   return {
     torsoLen,
     femurLen,
@@ -429,23 +587,30 @@ function estimateParallelFlexionAngles(
   return {kneeFlexDeg, hipFlexProxyDeg};
 }
 
-function classifyProportions(p: BodyProportions): ProportionProfile {
-  // Population averages from Drillis & Contini (1966) joint-center-to-joint-center
-  // segment data: femur/torso ≈ 0.85, tibia/femur ≈ 1.00.
-  // 5-tier scale so borderline lifters get structure-specific advice instead of
-  // being lumped into "average." Outer thresholds at ~±8% (biomechanically
-  // meaningful lean change of ~3-5°); inner thresholds at ~±4% from center.
+/** Drillis-style population bands on **calibrated** femur/torso and tibia/femur ratios. */
+const PROP_FEMUR_TORSO_SHORT = 0.78;
+const PROP_FEMUR_TORSO_SLIGHTLY_SHORT = 0.82;
+const PROP_FEMUR_TORSO_SLIGHTLY_LONG = 0.88;
+const PROP_FEMUR_TORSO_LONG = 0.92;
+const PROP_TIBIA_FEMUR_SHORT = 0.92;
+const PROP_TIBIA_FEMUR_SLIGHTLY_SHORT = 0.96;
+const PROP_TIBIA_FEMUR_SLIGHTLY_LONG = 1.04;
+const PROP_TIBIA_FEMUR_LONG = 1.08;
+
+function classifyProportions(raw: BodyProportions): ProportionProfile {
+  const p = calibrateBodyProportions(raw);
+
   const femurCategory: ProportionProfile['femurCategory'] =
-    p.femurToTorso < 0.78 ? 'short'
-    : p.femurToTorso < 0.82 ? 'slightly-short'
-    : p.femurToTorso > 0.92 ? 'long'
-    : p.femurToTorso > 0.88 ? 'slightly-long'
+    p.femurToTorso < PROP_FEMUR_TORSO_SHORT ? 'short'
+    : p.femurToTorso < PROP_FEMUR_TORSO_SLIGHTLY_SHORT ? 'slightly-short'
+    : p.femurToTorso > PROP_FEMUR_TORSO_LONG ? 'long'
+    : p.femurToTorso > PROP_FEMUR_TORSO_SLIGHTLY_LONG ? 'slightly-long'
     : 'average';
   const tibiaCategory: ProportionProfile['tibiaCategory'] =
-    p.tibiaToFemur < 0.92 ? 'short'
-    : p.tibiaToFemur < 0.96 ? 'slightly-short'
-    : p.tibiaToFemur > 1.08 ? 'long'
-    : p.tibiaToFemur > 1.04 ? 'slightly-long'
+    p.tibiaToFemur < PROP_TIBIA_FEMUR_SHORT ? 'short'
+    : p.tibiaToFemur < PROP_TIBIA_FEMUR_SLIGHTLY_SHORT ? 'slightly-short'
+    : p.tibiaToFemur > PROP_TIBIA_FEMUR_LONG ? 'long'
+    : p.tibiaToFemur > PROP_TIBIA_FEMUR_SLIGHTLY_LONG ? 'slightly-long'
     : 'average';
 
   const estimatedLeanDeg = estimateForwardLean(p);
@@ -555,6 +720,10 @@ type PoseFrameSample = {
   hipX: number;
   ankleX: number;
   extension: number;
+  /** Nose Y in normalized frame coords (0 top, 1 bottom). */
+  headY: number | null;
+  /** Nose→lowest foot (heel/toe) vertical gap in normalized coords; scales head metrics vs “ground”. */
+  headToGroundY: number | null;
   keypoints: PosePoint[];
 };
 type FacingDirection = 'right' | 'left';
@@ -621,9 +790,15 @@ function detectKneeAngleMaxima(
     lowerAngle: number;
     upperAngle: number;
     facing: FacingDirection;
+    minProminence?: number;
+    neighborRadius?: number;
   },
 ): KneeAnglePeak[] {
   if (series.length < KNEE_MAXIMA_MIN_SAMPLES) return [];
+  const minProm = options.minProminence ?? KNEE_MAXIMA_MIN_PROMINENCE;
+  const radius = options.neighborRadius ?? KNEE_MAXIMA_NEIGHBOR_RADIUS;
+  const angleOnly = series.map((s) => ({angle: s.angle}));
+
   const candidates: {index: number; angle: number; direction: ExtensionDirection}[] = [];
   for (let i = 1; i < series.length - 1; i += 1) {
     const prev = series[i - 1]!.angle;
@@ -631,6 +806,9 @@ function detectKneeAngleMaxima(
     const next = series[i + 1]!.angle;
     const isPeak = (current >= prev && current > next) || (current > prev && current >= next);
     if (!isPeak || current < options.lowerAngle || current > options.upperAngle) continue;
+    if (!isNeighborhoodMaximum(angleOnly, i, radius)) continue;
+    if (peakProminence(angleOnly, i) < minProm) continue;
+
     const s = series[i]!;
     const delta = s.ankleX - s.hipX;
     const isForward = options.facing === 'left' ? delta < 0 : delta > 0;
@@ -667,6 +845,49 @@ function valleyProminence(
     if (series[i]!.angle < valleyAngle) break;
   }
   return Math.min(leftMax, rightMax) - valleyAngle;
+}
+
+/** Vertical prominence of a knee-extension peak (°): height above the higher of the two adjacent trough baselines. */
+function peakProminence(
+  series: {angle: number}[],
+  peakIdx: number,
+): number {
+  const p = series[peakIdx]!.angle;
+  let leftMin = p;
+  for (let i = peakIdx - 1; i >= 0; i--) {
+    if (series[i]!.angle >= p) {
+      break;
+    }
+    if (series[i]!.angle < leftMin) {
+      leftMin = series[i]!.angle;
+    }
+  }
+  let rightMin = p;
+  for (let i = peakIdx + 1; i < series.length; i++) {
+    if (series[i]!.angle >= p) {
+      break;
+    }
+    if (series[i]!.angle < rightMin) {
+      rightMin = series[i]!.angle;
+    }
+  }
+  return p - Math.max(leftMin, rightMin);
+}
+
+function isNeighborhoodMaximum(
+  series: {angle: number}[],
+  idx: number,
+  radius: number,
+): boolean {
+  const p = series[idx]!.angle;
+  const lo = Math.max(0, idx - radius);
+  const hi = Math.min(series.length - 1, idx + radius);
+  for (let j = lo; j <= hi; j++) {
+    if (j !== idx && series[j]!.angle > p) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function detectKneeAngleMinima(
@@ -736,6 +957,181 @@ function findNearestCachedPose(
   const distLo = Math.abs(time - cache[lower]!.time);
   const distHi = Math.abs(time - cache[upper]!.time);
   return distLo <= distHi ? cache[lower]!.keypoints : cache[upper]!.keypoints;
+}
+
+const FOOT_INCL_MIN_VIS = 0.2;
+
+/**
+ * Acute angle (0–90°) between heel→toe and image horizontal. ~0° when the sole is level in the
+ * frame (flat foot in side view with level camera). Uses |dx|,|dy| so left/right foot direction
+ * does not flip the sign; atan2(signed dy, signed dx) was reporting ~180° for toes-behind-heel.
+ */
+function getFootInclinationVsHorizontalDeg(
+  keypoints: PosePoint[],
+  side: KneeSide,
+  aspectRatio = 1,
+  visibilityThreshold = FOOT_INCL_MIN_VIS,
+): number | null {
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const byId = new Map<number, PosePoint>();
+  POSE_TRACKED_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const heel = side === 'left' ? byId.get(17) : byId.get(18);
+  const toe = side === 'left' ? byId.get(19) : byId.get(20);
+  if (!heel || !toe) return null;
+  if (Math.min(heel.v, toe.v) < visibilityThreshold) return null;
+  const dx = (toe.x - heel.x) * aspectRatio;
+  const dy = toe.y - heel.y;
+  if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) return null;
+  return Math.atan2(Math.abs(dy), Math.abs(dx)) * (180 / Math.PI);
+}
+
+/** Nose Y in normalized image coords (0 = top); used for head height and per-stride vertical movement. */
+function getHeadNormYFromKeypoints(
+  keypoints: {x: number; y: number; v: number}[],
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+): number | null {
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const i = POSE_TRACKED_IDS.indexOf(POSE_NOSE_ID);
+  if (i < 0) return null;
+  const p = keypoints[i];
+  if (!p || p.v < visibilityThreshold) return null;
+  return p.y;
+}
+
+/**
+ * Vertical gap nose → lowest foot point (max of heel/toe Y) in normalized coords.
+ * Ground proxy uses the same heel/toe landmarks as the toe-angle calc (side view).
+ */
+function getHeadToGroundNormGap(
+  keypoints: {x: number; y: number; v: number}[],
+  side: KneeSide,
+  visibilityThreshold = MIN_POSE_VISIBILITY,
+): number | null {
+  const ny = getHeadNormYFromKeypoints(keypoints, visibilityThreshold);
+  if (ny === null) return null;
+  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
+  const byId = new Map<number, {x: number; y: number; v: number}>();
+  POSE_TRACKED_IDS.forEach((id, i) => {
+    const p = keypoints[i];
+    if (p) byId.set(id, p);
+  });
+  const heel = side === 'left' ? byId.get(17) : byId.get(18);
+  const toe = side === 'left' ? byId.get(19) : byId.get(20);
+  if (!heel || !toe) return null;
+  if (Math.min(heel.v, toe.v) < visibilityThreshold) return null;
+  const groundY = Math.max(heel.y, toe.y);
+  const g = groundY - ny;
+  return g > 1e-9 ? g : null;
+}
+
+function medianFinite(values: number[]): number | null {
+  const v = values.filter((x) => Number.isFinite(x));
+  if (v.length === 0) return null;
+  const s = [...v].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+}
+
+function nearestPoseFrameByTime(frames: PoseFrameSample[], time: number): PoseFrameSample | null {
+  if (frames.length === 0) return null;
+  let best = frames[0]!;
+  let bestDt = Math.abs(best.time - time);
+  for (let i = 1; i < frames.length; i += 1) {
+    const f = frames[i]!;
+    const dt = Math.abs(f.time - time);
+    if (dt < bestDt) {
+      best = f;
+      bestDt = dt;
+    }
+  }
+  return best;
+}
+
+/**
+ * Mean head oscillation per stride as % of mean nose→foot (ground) distance within that stride.
+ * Stride windows: contact-to-contact, else peak-to-peak.
+ */
+function computeAvgHeadMovementPerStrideVsGroundPct(
+  poseFrames: PoseFrameSample[],
+  contactTimes: number[],
+  peakTimes: number[],
+): number | null {
+  if (poseFrames.length === 0) return null;
+  const sorted = [...poseFrames].sort((a, b) => a.time - b.time);
+  const boundaries =
+    contactTimes.length >= 2
+      ? [...new Set(contactTimes)].sort((a, b) => a - b)
+      : peakTimes.length >= 2
+        ? [...new Set(peakTimes)].sort((a, b) => a - b)
+        : [];
+  if (boundaries.length < 2) return null;
+  const ratios: number[] = [];
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    const t0 = boundaries[i]!;
+    const t1 = boundaries[i + 1]!;
+    const slice = sorted.filter((f) => f.time >= t0 && f.time <= t1);
+    const headYs = slice
+      .map((f) => f.headY)
+      .filter((y): y is number => y !== null && y !== undefined && Number.isFinite(y));
+    const gaps = slice
+      .map((f) => f.headToGroundY)
+      .filter((g): g is number => g !== null && g !== undefined && g > 1e-9 && Number.isFinite(g));
+    if (headYs.length < 2 || gaps.length === 0) continue;
+    const R = Math.max(...headYs) - Math.min(...headYs);
+    const meanGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+    if (meanGap < 1e-9) continue;
+    ratios.push((R / meanGap) * 100);
+  }
+  return ratios.length > 0 ? ratios.reduce((a, b) => a + b, 0) / ratios.length : null;
+}
+
+/**
+ * Contact proxy: first clear knee flexion after extension peak (within ~120ms), not mid-stance min.
+ * Uses nearest-sample angle at peak vs STRIDE_FLEX_ONSET_DEG drop; else first post-peak sample.
+ */
+function findContactTimeAfterExtensionPeak(
+  panelSeries: PoseAngleSample[],
+  peakTime: number,
+): number | null {
+  if (panelSeries.length < 2) return null;
+  const sorted = [...panelSeries].sort((a, b) => a.time - b.time);
+  const atPeak = sorted.reduce((best, s) =>
+    Math.abs(s.time - peakTime) < Math.abs(best.time - peakTime) ? s : best,
+  );
+  const peakAngle = atPeak.angle;
+
+  for (let i = 0; i < sorted.length; i += 1) {
+    const s = sorted[i]!;
+    if (s.time <= peakTime) continue;
+    if (s.time > peakTime + STRIDE_CONTACT_SEARCH_SEC) break;
+    if (s.angle < peakAngle - STRIDE_FLEX_ONSET_DEG) {
+      return s.time;
+    }
+  }
+
+  const firstAfter = sorted.find((s) => s.time > peakTime);
+  if (firstAfter && firstAfter.time <= peakTime + STRIDE_CONTACT_SEARCH_SEC) {
+    return firstAfter.time;
+  }
+
+  const slice = sorted.filter(
+    (s) => s.time > peakTime && s.time <= peakTime + STRIDE_CONTACT_SEARCH_SEC,
+  );
+  if (slice.length >= 3) {
+    for (let i = 1; i < slice.length - 1; i += 1) {
+      const prev = slice[i - 1]!.angle;
+      const cur = slice[i]!.angle;
+      const next = slice[i + 1]!.angle;
+      if (cur <= prev && cur < next) {
+        return slice[i]!.time;
+      }
+    }
+  }
+  if (slice.length > 0) return slice[0]!.time;
+  return peakTime + 1 / 30;
 }
 
 /** Media/content coordinates → overlay (viewport) pixels — identity when not zoomed. */
@@ -846,6 +1242,7 @@ export default function App() {
   const [compareCurrentLiveBackAngle, setCompareCurrentLiveBackAngle] = useState<number | null>(null);
   const [compareKneeAngleSeries, setCompareKneeAngleSeries] = useState<PoseAngleSample[]>([]);
   const [posePointSeries, setPosePointSeries] = useState<PoseFrameSample[]>([]);
+  const [comparePosePointSeries, setComparePosePointSeries] = useState<PoseFrameSample[]>([]);
   const [bodyProportions, setBodyProportions] = useState<ProportionProfile | null>(null);
   const [liveBodyProportions, setLiveBodyProportions] = useState<BodyProportions | null>(null);
   const [compareBodyProportions, setCompareBodyProportions] = useState<ProportionProfile | null>(null);
@@ -872,6 +1269,8 @@ export default function App() {
   const [compareFacingDirection, setCompareFacingDirection] = useState<FacingDirection>('right');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('stride');
   const poseDetectorRef = useRef<poseDetection.PoseDetector | null>(null);
+  /** Reused frame buffer so BlazePose sees correct canvas dimensions for video. */
+  const poseFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const poseRafRef = useRef<number | null>(null);
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
   const [poseStatus, setPoseStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -1388,9 +1787,10 @@ export default function App() {
       }
       await tf.ready();
       const detector = await poseDetection.createDetector(
-        poseDetection.SupportedModels.MoveNet,
+        poseDetection.SupportedModels.BlazePose,
         {
-          modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER,
+          runtime: 'tfjs',
+          modelType: 'full',
           enableSmoothing: true,
         },
       );
@@ -1401,7 +1801,7 @@ export default function App() {
 
     const updatePoseFromResult = (
       poses: poseDetection.Pose[] | null | undefined,
-      source: HTMLVideoElement | HTMLImageElement | null,
+      source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null,
       setter: (next: {x: number; y: number; v: number}[]) => void,
       autoDetectFacing = false,
       onDetectFacing?: (facing: FacingDirection) => void,
@@ -1409,20 +1809,26 @@ export default function App() {
     ) => {
       const keypoints = poses?.[0]?.keypoints;
       const sourceWidth =
-        source instanceof HTMLVideoElement ? source.videoWidth : source instanceof HTMLImageElement ? source.naturalWidth : 0;
+        source instanceof HTMLCanvasElement
+          ? source.width
+          : source instanceof HTMLVideoElement
+            ? source.videoWidth
+            : source instanceof HTMLImageElement
+              ? source.naturalWidth
+              : 0;
       const sourceHeight =
-        source instanceof HTMLVideoElement ? source.videoHeight : source instanceof HTMLImageElement ? source.naturalHeight : 0;
+        source instanceof HTMLCanvasElement
+          ? source.height
+          : source instanceof HTMLVideoElement
+            ? source.videoHeight
+            : source instanceof HTMLImageElement
+              ? source.naturalHeight
+              : 0;
       if (!keypoints || keypoints.length === 0 || sourceWidth <= 0 || sourceHeight <= 0) {
         setter([]);
         return;
       }
-      const selected = POSE_TRACKED_IDS.map((id) => {
-        const p = keypoints[id];
-        if (!p) return {x: 0, y: 0, v: 0};
-        const score = p.score ?? 0;
-        const coords = p as {x: number; y: number};
-        return {x: coords.x / sourceWidth, y: coords.y / sourceHeight, v: score};
-      });
+      const selected = keypointsFromBlazePoseOutput(keypoints, sourceWidth, sourceHeight);
       setter(selected);
       if (autoDetectFacing) {
         const detected = detectFacingFromKeypoints(selected);
@@ -1505,6 +1911,10 @@ export default function App() {
         const tick = async () => {
           if (cancelled) return;
           const now = performance.now();
+          if (!poseFrameCanvasRef.current) {
+            poseFrameCanvasRef.current = document.createElement('canvas');
+          }
+          const frameCanvas = poseFrameCanvasRef.current;
 
           if (videoSrc && primaryVideo) {
             const v = primaryVideo;
@@ -1515,16 +1925,19 @@ export default function App() {
             ) {
               lastPrimaryVideoTime = v.currentTime;
               lastPrimaryInferenceTs = now;
-              const result = await detector.estimatePoses(v, {flipHorizontal: false});
-              if (!cancelled) {
-                updatePoseFromResult(
-                  result,
-                  v,
-                  setPoseKeypoints,
-                  true,
-                  setPrimaryFacingDirection,
-                  setKneeTrackingSide,
-                );
+              const blazeposeInput = blazeposeVideoFrameCanvas(v, frameCanvas);
+              if (blazeposeInput) {
+                const result = await detector.estimatePoses(blazeposeInput, {flipHorizontal: false});
+                if (!cancelled) {
+                  updatePoseFromResult(
+                    result,
+                    blazeposeInput,
+                    setPoseKeypoints,
+                    true,
+                    setPrimaryFacingDirection,
+                    setKneeTrackingSide,
+                  );
+                }
               }
             }
           }
@@ -1538,16 +1951,19 @@ export default function App() {
             ) {
               lastCompareVideoTime = v.currentTime;
               lastCompareInferenceTs = now;
-              const result = await detector.estimatePoses(v, {flipHorizontal: false});
-              if (!cancelled) {
-                updatePoseFromResult(
-                  result,
-                  v,
-                  setComparePoseKeypoints,
-                  true,
-                  setCompareFacingDirection,
-                  setCompareKneeTrackingSide,
-                );
+              const blazeposeInput = blazeposeVideoFrameCanvas(v, frameCanvas);
+              if (blazeposeInput) {
+                const result = await detector.estimatePoses(blazeposeInput, {flipHorizontal: false});
+                if (!cancelled) {
+                  updatePoseFromResult(
+                    result,
+                    blazeposeInput,
+                    setComparePoseKeypoints,
+                    true,
+                    setCompareFacingDirection,
+                    setCompareKneeTrackingSide,
+                  );
+                }
               }
             }
           }
@@ -1556,7 +1972,8 @@ export default function App() {
         };
 
         tick();
-      } catch {
+      } catch (e) {
+        console.error('Pose detector failed:', e);
         if (!cancelled) setPoseStatus('error');
       }
     };
@@ -1634,15 +2051,18 @@ export default function App() {
           trackedIds.has(aId) && trackedIds.has(bId);
         const isArmConnection = (aId: number, bId: number) =>
           POSE_ARM_IDS.has(aId) || POSE_ARM_IDS.has(bId);
+        const isHeadConnection = (aId: number, bId: number) =>
+          aId === POSE_NOSE_ID || bId === POSE_NOSE_ID;
 
         for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
           const a = byId.get(aId);
           const b = byId.get(bId);
           if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+          const head = isHeadConnection(aId, bId);
           const arm = isArmConnection(aId, bId);
-          const tracked = !arm && isTrackedConnection(aId, bId);
-          ctx.strokeStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
-          ctx.lineWidth = arm ? 1 : tracked ? 3 : 1.5;
+          const tracked = !arm && !head && isTrackedConnection(aId, bId);
+          ctx.strokeStyle = head ? 'rgba(0,210,255,0.15)' : arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+          ctx.lineWidth = head ? 1 : arm ? 1 : tracked ? 3 : 1.5;
           const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, videoRef.current ?? imageRef.current, canvasRef.current);
           const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, videoRef.current ?? imageRef.current, canvasRef.current);
           ctx.beginPath();
@@ -1654,11 +2074,12 @@ export default function App() {
           const p = overlayKps[i];
           if (!p || p.v < 0.25) return;
           const arm = POSE_ARM_IDS.has(id);
-          const tracked = !arm && trackedIds.has(id);
-          ctx.fillStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+          const nose = id === POSE_NOSE_ID;
+          const tracked = !arm && !nose && trackedIds.has(id);
+          ctx.fillStyle = nose ? 'rgba(0,210,255,0.4)' : arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
           const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, videoRef.current ?? imageRef.current, canvasRef.current);
           ctx.beginPath();
-          ctx.arc(o.x, o.y, arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
+          ctx.arc(o.x, o.y, nose ? 3 : arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
           ctx.fill();
         });
         ctx.restore();
@@ -1787,15 +2208,18 @@ export default function App() {
             trackedIds.has(aId) && trackedIds.has(bId);
           const isArmConnection = (aId: number, bId: number) =>
             POSE_ARM_IDS.has(aId) || POSE_ARM_IDS.has(bId);
+          const isHeadConnection = (aId: number, bId: number) =>
+            aId === POSE_NOSE_ID || bId === POSE_NOSE_ID;
 
           for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
             const a = byId.get(aId);
             const b = byId.get(bId);
             if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+            const head = isHeadConnection(aId, bId);
             const arm = isArmConnection(aId, bId);
-            const tracked = !arm && isTrackedConnection(aId, bId);
-            ctx.strokeStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
-            ctx.lineWidth = arm ? 1 : tracked ? 3 : 1.5;
+            const tracked = !arm && !head && isTrackedConnection(aId, bId);
+            ctx.strokeStyle = head ? 'rgba(0,210,255,0.15)' : arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+            ctx.lineWidth = head ? 1 : arm ? 1 : tracked ? 3 : 1.5;
             const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, media, canvas);
             const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, media, canvas);
             ctx.beginPath();
@@ -1808,11 +2232,12 @@ export default function App() {
             const p = overlayKps[i];
             if (!p || p.v < 0.25) return;
             const arm = POSE_ARM_IDS.has(id);
-            const tracked = !arm && trackedIds.has(id);
-            ctx.fillStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+            const nose = id === POSE_NOSE_ID;
+            const tracked = !arm && !nose && trackedIds.has(id);
+            ctx.fillStyle = nose ? 'rgba(0,210,255,0.4)' : arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
             const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, media, canvas);
             ctx.beginPath();
-            ctx.arc(o.x, o.y, arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
+            ctx.arc(o.x, o.y, nose ? 3 : arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
             ctx.fill();
           });
 
@@ -1994,6 +2419,7 @@ export default function App() {
     setPosePointSeries([]);
     setBodyProportions(null);
     setCompareKneeAngleSeries([]);
+    setComparePosePointSeries([]);
     setCompareBodyProportions(null);
     poseCacheRef.current = [];
     comparePoseCacheRef.current = [];
@@ -2046,13 +2472,17 @@ export default function App() {
     const averageProportions = (samples: BodyProportions[]): ProportionProfile | null => {
       if (samples.length === 0) return null;
       const n = samples.length;
+      const torsoLen = samples.reduce((s, p) => s + p.torsoLen, 0) / n;
+      const femurLen = samples.reduce((s, p) => s + p.femurLen, 0) / n;
+      const tibiaLen = samples.reduce((s, p) => s + p.tibiaLen, 0) / n;
+      if (torsoLen < 1e-9 || femurLen < 1e-9 || tibiaLen < 1e-9) return null;
       const avg: BodyProportions = {
-        torsoLen: samples.reduce((s, p) => s + p.torsoLen, 0) / n,
-        femurLen: samples.reduce((s, p) => s + p.femurLen, 0) / n,
-        tibiaLen: samples.reduce((s, p) => s + p.tibiaLen, 0) / n,
-        femurToTorso: samples.reduce((s, p) => s + p.femurToTorso, 0) / n,
-        tibiaToFemur: samples.reduce((s, p) => s + p.tibiaToFemur, 0) / n,
-        legToTorso: samples.reduce((s, p) => s + p.legToTorso, 0) / n,
+        torsoLen,
+        femurLen,
+        tibiaLen,
+        femurToTorso: femurLen / torsoLen,
+        tibiaToFemur: tibiaLen / femurLen,
+        legToTorso: (femurLen + tibiaLen) / torsoLen,
       };
       return classifyProportions(avg);
     };
@@ -2104,6 +2534,7 @@ export default function App() {
       const pointSeries: PoseFrameSample[] = [];
       const cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[] = [];
       const proportionSamples: BodyProportions[] = [];
+      const analysisPoseCanvas = document.createElement('canvas');
 
       let t = 0;
       let frameIdx = 0;
@@ -2118,16 +2549,17 @@ export default function App() {
           });
         }
 
-        const result = await detector.estimatePoses(sourceVideo, {flipHorizontal: false});
-        if (isStale()) break;
-        const keypoints = result?.[0]?.keypoints;
+        const blazeposeInput = blazeposeVideoFrameCanvas(sourceVideo, analysisPoseCanvas);
         let normalized: {x: number; y: number; v: number}[] = [];
-        if (keypoints && keypoints.length > 0 && sourceWidth > 0 && sourceHeight > 0) {
-          normalized = POSE_TRACKED_IDS.map((id) => {
-            const p = keypoints[id];
-            if (!p) return {x: 0, y: 0, v: 0};
-            return {x: p.x / sourceWidth, y: p.y / sourceHeight, v: p.score ?? 0};
-          });
+        if (blazeposeInput) {
+          const result = await detector.estimatePoses(blazeposeInput, {flipHorizontal: false});
+          if (isStale()) break;
+          const keypoints = result?.[0]?.keypoints;
+          const w = blazeposeInput.width;
+          const h = blazeposeInput.height;
+          if (keypoints && keypoints.length > 0 && w > 0 && h > 0) {
+            normalized = keypointsFromBlazePoseOutput(keypoints, w, h);
+          }
         }
         cache.push({time: t, keypoints: normalized});
 
@@ -2168,6 +2600,8 @@ export default function App() {
                 hipX: anchors.hipX,
                 ankleX: anchors.ankleX,
                 extension,
+                headY: getHeadNormYFromKeypoints(normalized),
+                headToGroundY: getHeadToGroundNormGap(normalized, activeLocalSide),
                 keypoints: normalized.map((p) => ({x: p.x, y: p.y, v: p.v})),
               });
             }
@@ -2218,6 +2652,7 @@ export default function App() {
         visibleVideo: compareMainVideo,
         initialSide: compareKneeTrackingSide ?? facingDirectionToLeg(compareFacingDirection),
         setSeries: setCompareKneeAngleSeries,
+        setPointSeries: setComparePosePointSeries,
         cacheRef: comparePoseCacheRef,
         setSide: setCompareKneeTrackingSide,
         setFacing: setCompareFacingDirection,
@@ -2227,6 +2662,7 @@ export default function App() {
       });
     } else if (!isStale()) {
       setCompareKneeAngleSeries([]);
+      setComparePosePointSeries([]);
       comparePoseCacheRef.current = [];
       setCompareBodyProportions(null);
     }
@@ -2310,6 +2746,7 @@ export default function App() {
       setCompareCurrentLiveHipAngle(null);
       setCompareCurrentLiveBackAngle(null);
       setCompareKneeAngleSeries([]);
+      setComparePosePointSeries([]);
       setCompareBodyProportions(null);
       setCompareLiveBodyProportions(null);
       poseCacheRef.current = [];
@@ -2330,6 +2767,7 @@ export default function App() {
     }
     if (!compareVideoSrc) {
       setCompareKneeAngleSeries([]);
+      setComparePosePointSeries([]);
       setCompareBodyProportions(null);
       comparePoseCacheRef.current = [];
     }
@@ -2355,6 +2793,7 @@ export default function App() {
     setCompareCurrentLiveHipAngle(null);
     setCompareCurrentLiveBackAngle(null);
     setCompareKneeAngleSeries([]);
+    setComparePosePointSeries([]);
     setCompareBodyProportions(null);
     setCompareLiveBodyProportions(null);
     poseCacheRef.current = [];
@@ -3057,6 +3496,9 @@ export default function App() {
       panelLiveHip: number | null,
       panelLiveBack: number | null,
       panelFacing: FacingDirection,
+      poseFrames: PoseFrameSample[],
+      trackSide: KneeSide,
+      videoAspect: number,
     ) => {
       const panelAllMaxima = isSquat ? [] : detectKneeAngleMaxima(panelSeries, {
         lowerAngle: angleLowerBound,
@@ -3107,6 +3549,53 @@ export default function App() {
       const panelCurrentHipAngle = panelLiveHip ?? panelNearest?.hipAngle ?? null;
       const panelCurrentBackAngle = panelLiveBack ?? panelNearest?.backAngle ?? null;
 
+      const contactToeMarkTimes: number[] = [];
+      if (!isSquat && panelMaxima.length > 0) {
+        for (const peak of panelMaxima) {
+          contactToeMarkTimes.push(
+            findContactTimeAfterExtensionPeak(panelSeries, peak.time) ?? peak.time,
+          );
+        }
+      }
+
+      let avgContactToeAngle: number | null = null;
+      if (!isSquat && poseFrames.length > 0 && panelMaxima.length > 0) {
+        const toeAngles: number[] = [];
+        for (const peak of panelMaxima) {
+          const contactT =
+            findContactTimeAfterExtensionPeak(panelSeries, peak.time) ?? peak.time;
+          const frame = nearestPoseFrameByTime(poseFrames, contactT);
+          if (!frame) continue;
+          const deg = getFootInclinationVsHorizontalDeg(frame.keypoints, trackSide, videoAspect);
+          if (deg !== null) toeAngles.push(deg);
+        }
+        avgContactToeAngle =
+          toeAngles.length > 0 ? toeAngles.reduce((a, b) => a + b, 0) / toeAngles.length : null;
+      }
+
+      let currentHeadVerticalPct: number | null = null;
+      let avgHeadMovementPerStridePct: number | null = null;
+      if (!isSquat && poseFrames.length > 0) {
+        const gapList = poseFrames
+          .map((f) => f.headToGroundY)
+          .filter((g): g is number => g !== null && g !== undefined && g > 1e-9 && Number.isFinite(g));
+        const medianGap = medianFinite(gapList);
+        const nf = nearestPoseFrameByTime(poseFrames, panelTime);
+        let curGap = nf?.headToGroundY ?? null;
+        if (curGap === null && nf?.keypoints.length === POSE_TRACKED_IDS.length) {
+          curGap = getHeadToGroundNormGap(nf.keypoints, trackSide);
+        }
+        currentHeadVerticalPct =
+          medianGap !== null && medianGap > 1e-9 && curGap !== null && curGap > 1e-9
+            ? (curGap / medianGap) * 100
+            : null;
+        avgHeadMovementPerStridePct = computeAvgHeadMovementPerStrideVsGroundPct(
+          poseFrames,
+          contactToeMarkTimes,
+          panelMaxima.map((p) => p.time),
+        );
+      }
+
       return {
         allMaxima: panelAllMaxima,
         maxima: panelMaxima,
@@ -3126,8 +3615,29 @@ export default function App() {
         avgKneeDisplay: toKneeFlexion(panelAvgRepKneeAngle),
         currentHipDisplay: toHipFlexionProxy(panelCurrentHipAngle),
         avgHipDisplay: toHipFlexionProxy(panelAvgRepHipAngle),
+        avgContactToeAngle,
+        contactToeMarkTimes,
+        currentHeadVerticalPct,
+        avgHeadMovementPerStridePct,
       };
     };
+
+    const primaryVideoAspect =
+      videoRef.current && videoRef.current.videoHeight > 0
+        ? videoRef.current.videoWidth / videoRef.current.videoHeight
+        : imageRef.current && imageRef.current.naturalHeight > 0
+          ? imageRef.current.naturalWidth / imageRef.current.naturalHeight
+          : 1;
+    const compareVideoAspect =
+      compareVideoRef.current && compareVideoRef.current.videoHeight > 0
+        ? compareVideoRef.current.videoWidth / compareVideoRef.current.videoHeight
+        : compareImageRef.current && compareImageRef.current.naturalHeight > 0
+          ? compareImageRef.current.naturalWidth / compareImageRef.current.naturalHeight
+          : 1;
+
+    const primaryTrackSide = kneeTrackingSide ?? facingDirectionToLeg(primaryFacingDirection);
+    const compareTrackSide =
+      compareKneeTrackingSide ?? facingDirectionToLeg(compareFacingDirection);
 
     const primaryStats = computePanelStats(
       series,
@@ -3137,6 +3647,9 @@ export default function App() {
       currentLiveHipAngle,
       currentLiveBackAngle,
       primaryFacingDirection,
+      posePointSeries,
+      primaryTrackSide,
+      primaryVideoAspect,
     );
     const compareStats = hasCompareMedia
       ? computePanelStats(
@@ -3147,6 +3660,9 @@ export default function App() {
         compareCurrentLiveHipAngle,
         compareCurrentLiveBackAngle,
         compareFacingDirection,
+        comparePosePointSeries,
+        compareTrackSide,
+        compareVideoAspect,
       )
       : null;
 
@@ -3171,6 +3687,46 @@ export default function App() {
     const compareMaxima = compareStats?.maxima ?? [];
     const compareOtherMaxima = compareStats?.otherMaxima ?? [];
     const compareValleys = compareStats?.valleys ?? [];
+    const avgContactToeAngle = primaryStats.avgContactToeAngle;
+    const compareAvgContactToeAngle = compareStats?.avgContactToeAngle ?? null;
+    const contactToeMarkTimes = primaryStats.contactToeMarkTimes;
+    const compareContactToeMarkTimes = compareStats?.contactToeMarkTimes ?? [];
+    const currentHeadVerticalPct = primaryStats.currentHeadVerticalPct;
+    const avgHeadMovementPerStridePct = primaryStats.avgHeadMovementPerStridePct;
+    const compareCurrentHeadVerticalPct = compareStats?.currentHeadVerticalPct ?? null;
+    const compareAvgHeadMovementPerStridePct = compareStats?.avgHeadMovementPerStridePct ?? null;
+
+    const primaryToeAtPlayhead = !isSquat
+      ? (() => {
+          if (posePointSeries.length > 0) {
+            const nf = nearestPoseFrameByTime(posePointSeries, currentTime);
+            if (nf && nf.keypoints.length === POSE_TRACKED_IDS.length) {
+              const d = getFootInclinationVsHorizontalDeg(nf.keypoints, primaryTrackSide, primaryVideoAspect);
+              if (d !== null) return d;
+            }
+          }
+          if (poseKeypoints.length === POSE_TRACKED_IDS.length) {
+            return getFootInclinationVsHorizontalDeg(poseKeypoints, primaryTrackSide, primaryVideoAspect);
+          }
+          return null;
+        })()
+      : null;
+    const compareToeAtPlayhead =
+      hasCompareMedia && !isSquat
+        ? (() => {
+            if (comparePosePointSeries.length > 0) {
+              const nf = nearestPoseFrameByTime(comparePosePointSeries, compareCurrentTime);
+              if (nf && nf.keypoints.length === POSE_TRACKED_IDS.length) {
+                const d = getFootInclinationVsHorizontalDeg(nf.keypoints, compareTrackSide, compareVideoAspect);
+                if (d !== null) return d;
+              }
+            }
+            if (comparePoseKeypoints.length === POSE_TRACKED_IDS.length) {
+              return getFootInclinationVsHorizontalDeg(comparePoseKeypoints, compareTrackSide, compareVideoAspect);
+            }
+            return null;
+          })()
+        : null;
 
     const compareSeries = compareKneeAngleSeries;
     const seriesEndTime = series.length > 0 ? series[series.length - 1]!.time : 0;
@@ -3459,6 +4015,25 @@ export default function App() {
                     />
                   );
                 })}
+                {!isSquat &&
+                  contactToeMarkTimes.map((t, i) => {
+                    const x = maxTime > 0 ? (t / maxTime) * 100 : 0;
+                    return (
+                      <line
+                        key={`contact-toe-${i}-${t.toFixed(4)}`}
+                        x1={x}
+                        y1={0}
+                        x2={x}
+                        y2={graphHeight}
+                        stroke="#facc15"
+                        strokeWidth={0.35}
+                        strokeDasharray="1.25 1.15"
+                        opacity={0.92}
+                        vectorEffect="non-scaling-stroke"
+                        style={{ pointerEvents: 'none' }}
+                      />
+                    );
+                  })}
                 {isSquat && valleys.map((valley) => {
                   const x = (valley.time / maxTime) * 100;
                   return (
@@ -3517,6 +4092,22 @@ export default function App() {
                 <div className="pointer-events-none absolute bottom-1 right-1 flex items-center gap-2 rounded bg-black/20 px-1.5 py-0.5 text-[10px] text-[var(--color-text-light)]">
                   <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#52c41a'}} /> below</span>
                   <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#ff4d4f'}} /> above</span>
+                </div>
+              )}
+              {!isSquat && series.length >= 2 && (
+                <div className="pointer-events-none absolute bottom-1 right-1 flex flex-wrap items-center justify-end gap-x-3 gap-y-1 rounded bg-black/25 px-1.5 py-0.5 text-[10px] text-[var(--color-text-light)]">
+                  <span className="flex items-center gap-1">
+                    <svg width={28} height={10} viewBox="0 0 28 10" className="shrink-0" aria-hidden>
+                      <line x1={0} y1={5} x2={28} y2={5} stroke="#00d2ff" strokeWidth={2} strokeDasharray="4 3" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+                    </svg>
+                    extension peak
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <svg width={28} height={10} viewBox="0 0 28 10" className="shrink-0" aria-hidden>
+                      <line x1={0} y1={5} x2={28} y2={5} stroke="#facc15" strokeWidth={2} strokeDasharray="4 3" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+                    </svg>
+                    toe @ contact
+                  </span>
                 </div>
               )}
               </>
@@ -3604,6 +4195,25 @@ export default function App() {
                           />
                         );
                       })}
+                      {!isSquat &&
+                        compareContactToeMarkTimes.map((t, i) => {
+                          const x = compareMaxTime > 0 ? (t / compareMaxTime) * 100 : 0;
+                          return (
+                            <line
+                              key={`compare-contact-toe-${i}-${t.toFixed(4)}`}
+                              x1={x}
+                              y1={0}
+                              x2={x}
+                              y2={graphHeight}
+                              stroke="#facc15"
+                              strokeWidth={0.35}
+                              strokeDasharray="1.25 1.15"
+                              opacity={0.92}
+                              vectorEffect="non-scaling-stroke"
+                              style={{ pointerEvents: 'none' }}
+                            />
+                          );
+                        })}
                       {isSquat && compareValleys.map((valley) => {
                         const x = (valley.time / compareMaxTime) * 100;
                         return (
@@ -3662,6 +4272,22 @@ export default function App() {
                       <div className="pointer-events-none absolute bottom-1 right-1 flex items-center gap-2 rounded bg-black/20 px-1.5 py-0.5 text-[10px] text-[var(--color-text-light)]">
                         <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#52c41a'}} /> below</span>
                         <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm" style={{background: '#ff4d4f'}} /> above</span>
+                      </div>
+                    )}
+                    {!isSquat && compareSeries.length >= 2 && (
+                      <div className="pointer-events-none absolute bottom-1 right-1 flex flex-wrap items-center justify-end gap-x-3 gap-y-1 rounded bg-black/25 px-1.5 py-0.5 text-[10px] text-[var(--color-text-light)]">
+                        <span className="flex items-center gap-1">
+                          <svg width={28} height={10} viewBox="0 0 28 10" className="shrink-0" aria-hidden>
+                            <line x1={0} y1={5} x2={28} y2={5} stroke="#00d2ff" strokeWidth={2} strokeDasharray="4 3" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+                          </svg>
+                          extension peak
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <svg width={28} height={10} viewBox="0 0 28 10" className="shrink-0" aria-hidden>
+                            <line x1={0} y1={5} x2={28} y2={5} stroke="#facc15" strokeWidth={2} strokeDasharray="4 3" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+                          </svg>
+                          toe @ contact
+                        </span>
                       </div>
                     )}
                   </>
@@ -3734,25 +4360,59 @@ export default function App() {
         ) : (
           <div className={`mt-2 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
             <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
-                <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
-                <p>Samples: {series.length}</p>
-                <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {maxima.length}</p>
-                <p>Avg peak: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}</p>
-                <p>Max peak: {maxPeakAngle !== null ? `${maxPeakAngle.toFixed(1)}°` : '—'}</p>
-                <p>Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°</p>
+              <div className="grid grid-cols-3 gap-x-2 gap-y-1 text-xs text-[var(--color-text-light)]">
+                <p className="font-medium text-[var(--color-accent)]" title="Hip–knee–ankle at playhead">
+                  Knee angle: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}
+                </p>
+                <p className="font-medium text-[var(--color-accent)]" title="Heel–toe vs horizon at playhead">
+                  Toe angle: {formatAngle(primaryToeAtPlayhead)}
+                </p>
+                <p
+                  className="font-medium text-[var(--color-accent)]"
+                  title="Nose→foot (lower heel/toe) gap vs median gap in this run (100 ≈ typical)"
+                >
+                  Head vs ground: {currentHeadVerticalPct !== null ? `${currentHeadVerticalPct.toFixed(1)}%` : '—'}
+                </p>
+              </div>
+              <div className="mt-1 grid grid-cols-3 gap-x-2 gap-y-1 text-xs text-[var(--color-text-light)]">
+                <p title="Mean knee angle at extension peaks (filtered)">
+                  Avg at extension: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}
+                </p>
+                <p title="Mean toe angle at ground contact (after each peak)">
+                  Avg at contact: {formatAngle(avgContactToeAngle)}
+                </p>
+                <p title="Mean head bob per stride as % of mean nose→foot distance in that stride">
+                  Avg movement / stride: {avgHeadMovementPerStridePct !== null ? `${avgHeadMovementPerStridePct.toFixed(1)}%` : '—'}
+                </p>
               </div>
             </div>
             {hasCompareMedia && (
               <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
                 <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
-                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
-                  <p>Current: {compareCurrentKneeAngle !== null ? `${compareCurrentKneeAngle.toFixed(1)}°` : '—'}</p>
-                  <p>Samples: {compareKneeAngleSeries.length}</p>
-                  <p>{extensionFilter === 'forward' ? 'Forward' : 'Behind'} peaks: {compareStats?.maxima.length ?? 0}</p>
-                  <p>Avg peak: {compareStats?.avgPeakAngle !== null && compareStats?.avgPeakAngle !== undefined ? `${compareStats.avgPeakAngle.toFixed(1)}°` : '—'}</p>
-                  <p>Max peak: {compareStats?.maxPeakAngle !== null && compareStats?.maxPeakAngle !== undefined ? `${compareStats.maxPeakAngle.toFixed(1)}°` : '—'}</p>
-                  <p>Bounds: {angleLowerBound.toFixed(0)}° – {angleUpperBound.toFixed(0)}°</p>
+                <div className="grid grid-cols-3 gap-x-2 gap-y-1 text-xs text-[var(--color-text-light)]">
+                  <p className="font-medium text-[var(--color-accent)]" title="Hip–knee–ankle at playhead">
+                    Knee angle: {compareCurrentKneeAngle !== null ? `${compareCurrentKneeAngle.toFixed(1)}°` : '—'}
+                  </p>
+                  <p className="font-medium text-[var(--color-accent)]" title="Heel–toe vs horizon at playhead">
+                    Toe angle: {formatAngle(compareToeAtPlayhead)}
+                  </p>
+                  <p
+                    className="font-medium text-[var(--color-accent)]"
+                    title="Nose→foot (lower heel/toe) gap vs median gap in this run (100 ≈ typical)"
+                  >
+                    Head vs ground: {compareCurrentHeadVerticalPct !== null ? `${compareCurrentHeadVerticalPct.toFixed(1)}%` : '—'}
+                  </p>
+                </div>
+                <div className="mt-1 grid grid-cols-3 gap-x-2 gap-y-1 text-xs text-[var(--color-text-light)]">
+                  <p title="Mean knee angle at extension peaks (filtered)">
+                    Avg at extension: {compareStats?.avgPeakAngle !== null && compareStats?.avgPeakAngle !== undefined ? `${compareStats.avgPeakAngle.toFixed(1)}°` : '—'}
+                  </p>
+                  <p title="Mean toe angle at ground contact (after each peak)">
+                    Avg at contact: {formatAngle(compareAvgContactToeAngle)}
+                  </p>
+                  <p title="Mean head bob per stride as % of mean nose→foot distance in that stride">
+                    Avg movement / stride: {compareAvgHeadMovementPerStridePct !== null ? `${compareAvgHeadMovementPerStridePct.toFixed(1)}%` : '—'}
+                  </p>
                 </div>
               </div>
             )}
@@ -3789,21 +4449,26 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div className="grid gap-2 text-[10px] text-[var(--color-text-light)] md:grid-cols-2 xl:grid-cols-3">
+            <div className="grid gap-2 text-[10px] text-[var(--color-text-light)] md:grid-cols-3">
               <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
-                <p className="font-semibold text-[var(--color-accent)]">Knee angle (hip-knee-ankle)</p>
-                <p className="opacity-75">Primary stride angle. Peaks represent extension events over time.</p>
+                <p className="font-semibold text-[var(--color-accent)]">Knee angle @ extension</p>
+                <p className="opacity-75">Current at playhead; average is mean knee angle at extension peaks (direction filter).</p>
                 <p className="mt-1 font-mono opacity-60">hip •───∠knee───• ankle</p>
               </div>
               <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
-                <p className="font-semibold text-[var(--color-accent)]">Forward / behind peaks</p>
-                <p className="opacity-75">Classifies peak extension direction relative to hip-ankle geometry.</p>
-                <p className="mt-1 font-mono opacity-60">forward ↗ or behind ↖</p>
+                <p className="font-semibold text-[var(--color-accent)]">Toe @ ground contact</p>
+                <p className="opacity-75">
+                  Acute heel–toe vs horizon at contact (first knee flex after each peak). Average is over contacts.
+                </p>
+                <p className="mt-1 font-mono opacity-60">heel ●──→ toe vs ────</p>
               </div>
               <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
-                <p className="font-semibold text-[var(--color-accent)]">Bounds</p>
-                <p className="opacity-75">Green/red threshold window used to count valid stride peaks.</p>
-                <p className="mt-1 font-mono opacity-60">green upper / red lower</p>
+                <p className="font-semibold text-[var(--color-accent)]">Head vs ground / stride</p>
+                <p className="opacity-75">
+                  Ground = lowest heel/toe Y (same as toe calc). Head vs ground compares nose→foot gap to the median gap
+                  in this clip. Movement per stride is head bob divided by mean nose→foot distance within that stride.
+                </p>
+                <p className="mt-1 font-mono opacity-60">nose→foot gap · bob / gap</p>
               </div>
             </div>
           )}
@@ -3817,15 +4482,15 @@ export default function App() {
         {isSquat && showBiomechanics && (() => {
           const primaryProfile = bodyProportions;
           const primaryLive = liveBodyProportions;
-          const primaryShowLive = !primaryProfile && primaryLive;
-          const primaryProps = primaryProfile?.proportions ?? primaryLive;
           const primaryDisplay = primaryProfile ?? (primaryLive ? classifyProportions(primaryLive) : null);
+          const primaryProps = primaryDisplay?.proportions;
+          const primaryShowLive = !primaryProfile && primaryLive;
 
           const compareProfile = compareBodyProportions;
           const compareLive = compareLiveBodyProportions;
-          const compareShowLive = !compareProfile && compareLive;
-          const compareProps = compareProfile?.proportions ?? compareLive;
           const compareDisplay = compareProfile ?? (compareLive ? classifyProportions(compareLive) : null);
+          const compareProps = compareDisplay?.proportions;
+          const compareShowLive = !compareProfile && compareLive;
 
           if (!primaryDisplay || !primaryProps) return null;
 
@@ -3844,25 +4509,34 @@ export default function App() {
             return '#ff4d4f';
           };
 
+          const bioPanelClass = `rounded-lg border p-3 ${
+            isFullscreen
+              ? 'border-transparent bg-black/50 backdrop-blur-md'
+              : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50'
+          }`;
+          const bioInnerCellClass = `rounded-md border border-[var(--color-accent)]/10 px-2 py-1.5 ${
+            isFullscreen ? 'bg-[var(--color-bg-dark)]/50' : 'bg-[var(--color-bg-dark)]'
+          }`;
+
           const renderProportionCard = (profile: ProportionProfile, props: BodyProportions, showLive: BodyProportions | false | null) => {
             const leanDeg = profile.estimatedLeanDeg;
             const parallelKneeFlex = profile.estimatedParallelKneeFlexDeg;
             const parallelHipFlex = profile.estimatedParallelHipFlexDeg;
             return (
-              <div className="rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-3">
+              <div className={bioPanelClass}>
                 <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
                   Biomechanical @ parallel
                 </p>
                 <div className="mb-2.5 grid grid-cols-1 gap-2 text-center text-[11px] text-[var(--color-text-light)] sm:grid-cols-3">
-                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                  <div className={bioInnerCellClass}>
                     <p className="text-[9px] uppercase tracking-wider opacity-50">Knee flex @ parallel</p>
                     <p className="text-sm font-semibold text-[var(--color-accent)]">{parallelKneeFlex.toFixed(1)}°</p>
                   </div>
-                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                  <div className={bioInnerCellClass}>
                     <p className="text-[9px] uppercase tracking-wider opacity-50">Hip flex* @ parallel</p>
                     <p className="text-sm font-semibold text-[var(--color-accent)]">{parallelHipFlex.toFixed(1)}°</p>
                   </div>
-                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                  <div className={bioInnerCellClass}>
                     <p className="text-[9px] uppercase tracking-wider opacity-50">Trunk lean @ parallel</p>
                     <p className="text-sm font-semibold text-[var(--color-accent)]">{leanDeg.toFixed(1)}°</p>
                   </div>
@@ -3872,14 +4546,14 @@ export default function App() {
                   Proportions {showLive ? <span className="font-normal opacity-55">(snapshot)</span> : <span className="font-normal opacity-55">(average)</span>}
                 </p>
                 <div className="mb-2.5 grid grid-cols-2 gap-2 text-center text-[11px] text-[var(--color-text-light)]">
-                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                  <div className={bioInnerCellClass}>
                     <p className="text-[9px] uppercase tracking-wider opacity-50">Femur / Torso</p>
                     <p className="text-sm font-semibold text-[var(--color-accent)]">{props.femurToTorso.toFixed(2)}</p>
                     <p className="text-[9px] font-medium" style={{color: catColor(profile.femurCategory)}}>
                       {profile.femurCategory.replace('-', ' ')} femurs
                     </p>
                   </div>
-                  <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] px-2 py-1.5">
+                  <div className={bioInnerCellClass}>
                     <p className="text-[9px] uppercase tracking-wider opacity-50">Tibia / Femur</p>
                     <p className="text-sm font-semibold text-[var(--color-accent)]">{props.tibiaToFemur.toFixed(2)}</p>
                     <p className="text-[9px] font-medium" style={{color: catColor(profile.tibiaCategory)}}>
