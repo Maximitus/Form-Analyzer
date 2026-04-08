@@ -12,6 +12,7 @@ import {
   ChangeEvent,
   MutableRefObject,
   PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from 'react';
 import {
   Play,
@@ -21,7 +22,7 @@ import {
   Hand,
   Maximize,
   Minimize,
-  Ruler,
+  Minus,
   Trash,
   ZoomIn,
   ZoomOut,
@@ -37,6 +38,24 @@ import * as tf from '@tensorflow/tfjs-core';
 import '@tensorflow/tfjs-backend-webgl';
 import SettingsMenu from './SettingsMenu';
 import { useTheme } from './theme';
+
+/** Toolbar icon: two rays meeting at a vertex (angle measure). */
+function AngleMeasureIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M6 18 12 6 18 18" />
+    </svg>
+  );
+}
 
 function pickVideoRecorderMimeType(): string | undefined {
   if (typeof MediaRecorder === 'undefined') return undefined;
@@ -769,14 +788,19 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  type Measurement = { points: { x: number; y: number }[]; angle: number | null };
+  type Measurement = {
+    points: { x: number; y: number }[];
+    kind: 'angle' | 'line';
+    angle: number | null;
+    length: number | null;
+    viewport: ViewportTarget;
+  };
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [activeMeasurementIdx, setActiveMeasurementIdx] = useState<number | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
 
   const points = activeMeasurementIdx !== null ? (measurements[activeMeasurementIdx]?.points ?? []) : [];
   const angle = activeMeasurementIdx !== null ? (measurements[activeMeasurementIdx]?.angle ?? null) : null;
-  const allAngles = measurements.filter(m => m.angle !== null).map(m => m.angle!);
   const setPoints = (updater: { x: number; y: number }[] | ((prev: { x: number; y: number }[]) => { x: number; y: number }[])) => {
     if (activeMeasurementIdx === null) return;
     setMeasurements(prev => {
@@ -795,6 +819,16 @@ export default function App() {
       const m = copy[activeMeasurementIdx];
       if (!m) return prev;
       copy[activeMeasurementIdx] = { ...m, angle: v };
+      return copy;
+    });
+  };
+  const setLength = (v: number | null) => {
+    if (activeMeasurementIdx === null) return;
+    setMeasurements(prev => {
+      const copy = [...prev];
+      const m = copy[activeMeasurementIdx];
+      if (!m) return prev;
+      copy[activeMeasurementIdx] = { ...m, length: v };
       return copy;
     });
   };
@@ -874,8 +908,8 @@ export default function App() {
     };
   };
 
-  /** `ruler` = angle tool, `pan` = drag viewport while zoomed */
-  type AnalysisTool = 'ruler' | 'pan' | null;
+  /** `angle` = three-point angle, `line` = two-point distance, `pan` = drag viewport while zoomed */
+  type AnalysisTool = 'angle' | 'line' | 'pan' | null;
   const [activeTool, setActiveTool] = useState<AnalysisTool>(null);
   const [activeViewport, setActiveViewport] = useState<ViewportTarget>('primary');
   const [appliedZoom, setAppliedZoom] = useState<{x: number; y: number; s: number} | null>(null);
@@ -1569,7 +1603,8 @@ export default function App() {
       ctx.fillStyle = accent;
       ctx.lineWidth = 3;
 
-      for (const m of measurements) {
+      const primaryMeasurements = measurements.filter(m => m.viewport === 'primary');
+      for (const m of primaryMeasurements) {
         if (m.points.length > 0) {
           ctx.fillStyle = accent;
           m.points.forEach(p => {
@@ -1629,8 +1664,24 @@ export default function App() {
         ctx.restore();
       }
 
-      for (const m of measurements) {
-        if (m.points.length >= 2) {
+      for (const m of primaryMeasurements) {
+        if (m.kind === 'line' && m.points.length >= 2) {
+          ctx.strokeStyle = accent;
+          ctx.lineWidth = 3;
+          const o0 = contentToOverlay(m.points[0].x, m.points[0].y, zMap);
+          const o1 = contentToOverlay(m.points[1].x, m.points[1].y, zMap);
+          ctx.beginPath();
+          ctx.moveTo(o0.x, o0.y);
+          ctx.lineTo(o1.x, o1.y);
+          ctx.stroke();
+          if (m.length !== null) {
+            const midX = (o0.x + o1.x) / 2;
+            const midY = (o0.y + o1.y) / 2;
+            ctx.font = '20px Space Grotesk';
+            ctx.fillStyle = accent;
+            ctx.fillText(`${m.length.toFixed(0)} px`, midX + 8, midY - 8);
+          }
+        } else if (m.kind === 'angle' && m.points.length >= 2) {
           ctx.strokeStyle = accent;
           ctx.lineWidth = 3;
           const o0 = contentToOverlay(m.points[0].x, m.points[0].y, zMap);
@@ -1693,69 +1744,128 @@ export default function App() {
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (!poseEnabled) return;
 
-      const overlayTime = compareVideoRef.current?.currentTime ?? 0;
-      const overlayKps = comparePoseCacheRef.current.length > 0
-        ? findNearestCachedPose(comparePoseCacheRef.current, overlayTime) ?? comparePoseKeypoints
-        : comparePoseKeypoints;
-      if (overlayKps.length !== POSE_TRACKED_IDS.length) return;
+      const accent =
+        getComputedStyle(document.documentElement).getPropertyValue('--color-accent').trim() ||
+        '#ff8800';
 
-      const media = (compareVideoRef.current ?? compareImageRef.current) as HTMLVideoElement | HTMLImageElement;
-      const byId = new Map<number, {x: number; y: number; v: number}>();
-      POSE_TRACKED_IDS.forEach((id, i) => {
-        const p = overlayKps[i];
-        if (p) byId.set(id, p);
-      });
+      const cZMap: AppliedZoomMap | null = compareAppliedZoom
+        ? {x: compareAppliedZoom.x, y: compareAppliedZoom.y, s: compareAppliedZoom.s}
+        : null;
 
-      ctx.save();
-      const sideFromFacing = facingDirectionToLeg(compareFacingDirection);
-      const trackedSide = compareKneeTrackingSide ?? sideFromFacing;
-      const trackedIds = trackedSide === 'left' ? POSE_LEFT_SIDE_IDS : POSE_RIGHT_SIDE_IDS;
-      const isTrackedConnection = (aId: number, bId: number) =>
-        trackedIds.has(aId) && trackedIds.has(bId);
-      const isArmConnection = (aId: number, bId: number) =>
-        POSE_ARM_IDS.has(aId) || POSE_ARM_IDS.has(bId);
-
-      for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
-        const a = byId.get(aId);
-        const b = byId.get(bId);
-        if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
-        const arm = isArmConnection(aId, bId);
-        const tracked = !arm && isTrackedConnection(aId, bId);
-        ctx.strokeStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
-        ctx.lineWidth = arm ? 1 : tracked ? 3 : 1.5;
-        const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, media, canvas);
-        const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, media, canvas);
-        ctx.beginPath();
-        ctx.moveTo(aPx.x, aPx.y);
-        ctx.lineTo(bPx.x, bPx.y);
-        ctx.stroke();
+      const compareMeasurements = measurements.filter(m => m.viewport === 'compare');
+      for (const m of compareMeasurements) {
+        if (m.points.length > 0) {
+          ctx.fillStyle = accent;
+          m.points.forEach(p => {
+            const o = contentToOverlay(p.x, p.y, cZMap);
+            ctx.beginPath();
+            ctx.arc(o.x, o.y, 5, 0, Math.PI * 2);
+            ctx.fill();
+          });
+        }
       }
 
-      POSE_TRACKED_IDS.forEach((id, i) => {
-        const p = overlayKps[i];
-        if (!p || p.v < 0.25) return;
-        const arm = POSE_ARM_IDS.has(id);
-        const tracked = !arm && trackedIds.has(id);
-        ctx.fillStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
-        const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, media, canvas);
-        ctx.beginPath();
-        ctx.arc(o.x, o.y, arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
-        ctx.fill();
-      });
+      if (poseEnabled) {
+        const overlayTime = compareVideoRef.current?.currentTime ?? 0;
+        const overlayKps = comparePoseCacheRef.current.length > 0
+          ? findNearestCachedPose(comparePoseCacheRef.current, overlayTime) ?? comparePoseKeypoints
+          : comparePoseKeypoints;
+        if (overlayKps.length === POSE_TRACKED_IDS.length) {
+          const media = (compareVideoRef.current ?? compareImageRef.current) as HTMLVideoElement | HTMLImageElement;
+          const byId = new Map<number, {x: number; y: number; v: number}>();
+          POSE_TRACKED_IDS.forEach((id, i) => {
+            const p = overlayKps[i];
+            if (p) byId.set(id, p);
+          });
 
-      ctx.restore();
+          ctx.save();
+          const sideFromFacing = facingDirectionToLeg(compareFacingDirection);
+          const trackedSide = compareKneeTrackingSide ?? sideFromFacing;
+          const trackedIds = trackedSide === 'left' ? POSE_LEFT_SIDE_IDS : POSE_RIGHT_SIDE_IDS;
+          const isTrackedConnection = (aId: number, bId: number) =>
+            trackedIds.has(aId) && trackedIds.has(bId);
+          const isArmConnection = (aId: number, bId: number) =>
+            POSE_ARM_IDS.has(aId) || POSE_ARM_IDS.has(bId);
+
+          for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
+            const a = byId.get(aId);
+            const b = byId.get(bId);
+            if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+            const arm = isArmConnection(aId, bId);
+            const tracked = !arm && isTrackedConnection(aId, bId);
+            ctx.strokeStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+            ctx.lineWidth = arm ? 1 : tracked ? 3 : 1.5;
+            const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, media, canvas);
+            const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, media, canvas);
+            ctx.beginPath();
+            ctx.moveTo(aPx.x, aPx.y);
+            ctx.lineTo(bPx.x, bPx.y);
+            ctx.stroke();
+          }
+
+          POSE_TRACKED_IDS.forEach((id, i) => {
+            const p = overlayKps[i];
+            if (!p || p.v < 0.25) return;
+            const arm = POSE_ARM_IDS.has(id);
+            const tracked = !arm && trackedIds.has(id);
+            ctx.fillStyle = arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+            const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, media, canvas);
+            ctx.beginPath();
+            ctx.arc(o.x, o.y, arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
+            ctx.fill();
+          });
+
+          ctx.restore();
+        }
+      }
+
+      for (const m of compareMeasurements) {
+        if (m.kind === 'line' && m.points.length >= 2) {
+          ctx.strokeStyle = accent;
+          ctx.lineWidth = 3;
+          const o0 = contentToOverlay(m.points[0].x, m.points[0].y, cZMap);
+          const o1 = contentToOverlay(m.points[1].x, m.points[1].y, cZMap);
+          ctx.beginPath();
+          ctx.moveTo(o0.x, o0.y);
+          ctx.lineTo(o1.x, o1.y);
+          ctx.stroke();
+          if (m.length !== null) {
+            const midX = (o0.x + o1.x) / 2;
+            const midY = (o0.y + o1.y) / 2;
+            ctx.font = '20px Space Grotesk';
+            ctx.fillStyle = accent;
+            ctx.fillText(`${m.length.toFixed(0)} px`, midX + 8, midY - 8);
+          }
+        } else if (m.kind === 'angle' && m.points.length >= 2) {
+          ctx.strokeStyle = accent;
+          ctx.lineWidth = 3;
+          const o0 = contentToOverlay(m.points[0].x, m.points[0].y, cZMap);
+          const o1 = contentToOverlay(m.points[1].x, m.points[1].y, cZMap);
+          ctx.beginPath();
+          ctx.moveTo(o0.x, o0.y);
+          ctx.lineTo(o1.x, o1.y);
+          if (m.points.length === 3) {
+            const o2 = contentToOverlay(m.points[2].x, m.points[2].y, cZMap);
+            ctx.lineTo(o2.x, o2.y);
+            ctx.font = '20px Space Grotesk';
+            ctx.fillStyle = accent;
+            ctx.fillText(`${m.angle?.toFixed(1)}°`, o1.x + 10, o1.y - 10);
+          }
+          ctx.stroke();
+        }
+      }
     };
 
     draw();
 
-    if (compareVideoSrc && poseEnabled) {
+    const hasMeasurements = measurements.some(m => m.viewport === 'compare');
+    if (compareVideoSrc && (poseEnabled || hasMeasurements)) {
       let rafId: number | null = null;
       let lastDrawnTime = -1;
       const loop = () => {
         const vt = compareVideoRef.current?.currentTime ?? -1;
-        if (vt !== lastDrawnTime) {
+        if (vt !== lastDrawnTime || hasMeasurements) {
           lastDrawnTime = vt;
           draw();
         }
@@ -1766,7 +1876,7 @@ export default function App() {
         if (rafId !== null) cancelAnimationFrame(rafId);
       };
     }
-  }, [comparePoseKeypoints, compareVideoSrc, compareImageSrc, compareMediaLayoutVersion, poseEnabled, compareKneeTrackingSide, compareFacingDirection]);
+  }, [comparePoseKeypoints, compareVideoSrc, compareImageSrc, compareMediaLayoutVersion, poseEnabled, compareKneeTrackingSide, compareFacingDirection, measurements, compareAppliedZoom]);
 
   const [draggingPointIndex, setDraggingPointIndex] = useState<number | null>(null);
   const [compareCurrentTime, setCompareCurrentTime] = useState(0);
@@ -2404,12 +2514,14 @@ export default function App() {
     return overlayToContent(ox, oy, zMap);
   };
 
-  const getPointAtOverlay = (ox: number, oy: number): { mIdx: number; pIdx: number } | null => {
-    const zMap: AppliedZoomMap | null = appliedZoom
-      ? {x: appliedZoom.x, y: appliedZoom.y, s: appliedZoom.s}
+  const getPointAtOverlay = (ox: number, oy: number, viewport: ViewportTarget = 'primary'): { mIdx: number; pIdx: number } | null => {
+    const zoom = viewport === 'primary' ? appliedZoom : compareAppliedZoom;
+    const zMap: AppliedZoomMap | null = zoom
+      ? {x: zoom.x, y: zoom.y, s: zoom.s}
       : null;
     for (let mIdx = 0; mIdx < measurements.length; mIdx++) {
       const m = measurements[mIdx];
+      if (m.viewport !== viewport) continue;
       const pIdx = m.points.findIndex(p => {
         const o = contentToOverlay(p.x, p.y, zMap);
         return Math.hypot(o.x - ox, o.y - oy) < 15;
@@ -2493,27 +2605,61 @@ export default function App() {
     zoomAt(target, factor, anchor.x, anchor.y);
   };
 
-  const toggleRulerTool = () => {
+  const measurementNeedsNewSlot = (tool: 'angle' | 'line') => {
+    const m = activeMeasurementIdx !== null ? measurements[activeMeasurementIdx] : null;
+    if (m === null) return true;
+    if (m.kind !== tool || m.viewport !== activeViewport) return true;
+    if (tool === 'angle') return m.points.length >= 3;
+    return m.points.length >= 2;
+  };
+
+  const toggleAngleTool = () => {
     setActiveTool((prev) => {
-      if (prev === 'ruler') {
-        const currentComplete = activeMeasurementIdx !== null && (measurements[activeMeasurementIdx]?.points.length ?? 0) >= 3;
+      if (prev === 'angle') {
+        const m = activeMeasurementIdx !== null ? measurements[activeMeasurementIdx] : null;
+        const currentComplete = m?.kind === 'angle' && (m.points.length ?? 0) >= 3;
         if (currentComplete) {
           const newIdx = measurements.length;
-          setMeasurements(m => [...m, { points: [], angle: null }]);
+          setMeasurements(m_ => [...m_, { points: [], angle: null, length: null, kind: 'angle', viewport: activeViewport }]);
           setActiveMeasurementIdx(newIdx);
           setIsDrawing(true);
-          return 'ruler';
+          return 'angle';
         }
         setIsDrawing(false);
         return null;
       }
-      if (activeMeasurementIdx === null || (measurements[activeMeasurementIdx]?.points.length ?? 0) >= 3) {
+      if (measurementNeedsNewSlot('angle')) {
         const newIdx = measurements.length;
-        setMeasurements(m => [...m, { points: [], angle: null }]);
+        setMeasurements(m_ => [...m_, { points: [], angle: null, length: null, kind: 'angle', viewport: activeViewport }]);
         setActiveMeasurementIdx(newIdx);
       }
       setIsDrawing(true);
-      return 'ruler';
+      return 'angle';
+    });
+  };
+
+  const toggleLineTool = () => {
+    setActiveTool((prev) => {
+      if (prev === 'line') {
+        const m = activeMeasurementIdx !== null ? measurements[activeMeasurementIdx] : null;
+        const currentComplete = m?.kind === 'line' && (m.points.length ?? 0) >= 2;
+        if (currentComplete) {
+          const newIdx = measurements.length;
+          setMeasurements(m_ => [...m_, { points: [], angle: null, length: null, kind: 'line', viewport: activeViewport }]);
+          setActiveMeasurementIdx(newIdx);
+          setIsDrawing(true);
+          return 'line';
+        }
+        setIsDrawing(false);
+        return null;
+      }
+      if (measurementNeedsNewSlot('line')) {
+        const newIdx = measurements.length;
+        setMeasurements(m_ => [...m_, { points: [], angle: null, length: null, kind: 'line', viewport: activeViewport }]);
+        setActiveMeasurementIdx(newIdx);
+      }
+      setIsDrawing(true);
+      return 'line';
     });
   };
 
@@ -2569,7 +2715,7 @@ export default function App() {
       return;
     }
 
-    const hit = getPointAtOverlay(ox, oy);
+    const hit = getPointAtOverlay(ox, oy, 'primary');
     if (hit) {
       e.currentTarget.setPointerCapture(e.pointerId);
       setActiveMeasurementIdx(hit.mIdx);
@@ -2577,16 +2723,35 @@ export default function App() {
       return;
     }
 
-    if (!isDrawing || activeTool !== 'ruler') return;
+    if (!isDrawing || (activeTool !== 'angle' && activeTool !== 'line')) return;
 
-    /* Keep a completed 3-point angle until trash clears it — ignore extra taps (e.g. mobile pan). */
-    if (points.length >= 3) return;
+    const currentMeasurement = activeMeasurementIdx !== null ? measurements[activeMeasurementIdx] : null;
+    const tool = activeTool as 'angle' | 'line';
+    const needNewMeasurement =
+      !currentMeasurement ||
+      currentMeasurement.viewport !== 'primary' ||
+      currentMeasurement.kind !== tool ||
+      (tool === 'angle' && currentMeasurement.points.length >= 3) ||
+      (tool === 'line' && currentMeasurement.points.length >= 2);
+    if (needNewMeasurement) {
+      const newIdx = measurements.length;
+      setMeasurements(m => [
+        ...m,
+        { points: [{ x, y }], angle: null, length: null, kind: tool, viewport: 'primary' },
+      ]);
+      setActiveMeasurementIdx(newIdx);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
 
     e.currentTarget.setPointerCapture(e.pointerId);
     setPoints(prev => {
       const newPoints = [...prev, { x, y }];
-      if (newPoints.length === 3) {
+      if (tool === 'angle' && newPoints.length === 3) {
         calculateAngle(newPoints);
+      }
+      if (tool === 'line' && newPoints.length === 2) {
+        calculateLineLength(newPoints);
       }
       return newPoints;
     });
@@ -2646,8 +2811,12 @@ export default function App() {
     setPoints(prev => {
       const newPoints = [...prev];
       newPoints[draggingPointIndex] = { x, y };
-      if (newPoints.length === 3) {
+      const m = activeMeasurementIdx !== null ? measurements[activeMeasurementIdx] : null;
+      if (m?.kind === 'angle' && newPoints.length === 3) {
         calculateAngle(newPoints);
+      }
+      if (m?.kind === 'line' && newPoints.length === 2) {
+        calculateLineLength(newPoints);
       }
       return newPoints;
     });
@@ -2716,7 +2885,52 @@ export default function App() {
       };
       setIsComparePanning(true);
       e.currentTarget.setPointerCapture(e.pointerId);
+      return;
     }
+
+    const {ox, oy} = pointerToOverlayPx(e.clientX, e.clientY, canvas);
+    const {x, y} = pointerToCompareContent(e.clientX, e.clientY);
+
+    const hit = getPointAtOverlay(ox, oy, 'compare');
+    if (hit) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+      setActiveMeasurementIdx(hit.mIdx);
+      setDraggingPointIndex(hit.pIdx);
+      return;
+    }
+
+    if (!isDrawing || (activeTool !== 'angle' && activeTool !== 'line')) return;
+
+    const currentMeasurement = activeMeasurementIdx !== null ? measurements[activeMeasurementIdx] : null;
+    const tool = activeTool as 'angle' | 'line';
+    const needNewMeasurement =
+      !currentMeasurement ||
+      currentMeasurement.viewport !== 'compare' ||
+      currentMeasurement.kind !== tool ||
+      (tool === 'angle' && currentMeasurement.points.length >= 3) ||
+      (tool === 'line' && currentMeasurement.points.length >= 2);
+    if (needNewMeasurement) {
+      const newIdx = measurements.length;
+      setMeasurements(m => [
+        ...m,
+        { points: [{ x, y }], angle: null, length: null, kind: tool, viewport: 'compare' },
+      ]);
+      setActiveMeasurementIdx(newIdx);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setPoints(prev => {
+      const newPoints = [...prev, { x, y }];
+      if (tool === 'angle' && newPoints.length === 3) {
+        calculateAngle(newPoints);
+      }
+      if (tool === 'line' && newPoints.length === 2) {
+        calculateLineLength(newPoints);
+      }
+      return newPoints;
+    });
   };
 
   const handleCompareCanvasPointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -2762,7 +2976,29 @@ export default function App() {
       setCompareAppliedZoom(
         clampZoomViewport(drag.startX - dx / compareScale, drag.startY - dy / compareScale, compareScale, size.w, size.h),
       );
+      return;
     }
+
+    if (draggingPointIndex === null) return;
+
+    const {ox: _ox, oy: _oy} = pointerToOverlayPx(e.clientX, e.clientY, canvas);
+    const compareZMap: AppliedZoomMap | null = compareAppliedZoom
+      ? {x: compareAppliedZoom.x, y: compareAppliedZoom.y, s: compareAppliedZoom.s}
+      : null;
+    const contentPt = overlayToContent(_ox, _oy, compareZMap);
+
+    setPoints(prev => {
+      const newPoints = [...prev];
+      newPoints[draggingPointIndex] = { x: contentPt.x, y: contentPt.y };
+      const m = activeMeasurementIdx !== null ? measurements[activeMeasurementIdx] : null;
+      if (m?.kind === 'angle' && newPoints.length === 3) {
+        calculateAngle(newPoints);
+      }
+      if (m?.kind === 'line' && newPoints.length === 2) {
+        calculateLineLength(newPoints);
+      }
+      return newPoints;
+    });
   };
 
   const handleCompareCanvasPointerUp = (e: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -2779,11 +3015,18 @@ export default function App() {
     } catch {
       /* ignore if not captured */
     }
+    setDraggingPointIndex(null);
   };
 
   const calculateAngle = (pts: { x: number; y: number }[]) => {
     const [p1, p2, p3] = pts;
     setAngle(calculateJointAngle(p1, p2, p3));
+  };
+
+  const calculateLineLength = (pts: { x: number; y: number }[]) => {
+    if (pts.length < 2) return;
+    const [p0, p1] = pts;
+    setLength(Math.hypot(p1.x - p0.x, p1.y - p0.y));
   };
 
   const handleAnalysisModeSwitch = (mode: AnalysisMode) => {
@@ -3076,7 +3319,7 @@ export default function App() {
     const compareLinePath = makeLinePath(compareSeries, compareMaxTime);
 
     return (
-      <section className="rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4">
+      <section className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}>
         <div className="mb-2 flex items-center justify-between gap-2">
           <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
             {isSquat ? 'Squat Depth — Below Parallel' : 'Knee Angle (Hip-Knee-Ankle)'}
@@ -3125,7 +3368,7 @@ export default function App() {
         </div>
         {videoSrc ? (
           <div className={`grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
-            <div className="relative rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
+            <div className={`relative rounded-lg border ${isFullscreen ? 'border-transparent bg-black/40' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70'}`}>
             {series.length >= 2 ? (
               <>
               <svg
@@ -3286,7 +3529,7 @@ export default function App() {
             )}
             </div>
             {hasCompareMedia && (
-              <div className="relative rounded-lg border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70">
+              <div className={`relative rounded-lg border ${isFullscreen ? 'border-transparent bg-black/40' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/70'}`}>
                 {compareSeries.length >= 2 ? (
                   <>
                     <svg
@@ -3452,7 +3695,7 @@ export default function App() {
         )}
         {isSquat ? (
           <div className={`mt-2 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
-            <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+            <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
               <div className="grid grid-cols-5 gap-x-3 text-xs text-[var(--color-text-light)]">
                 <p className="font-medium text-[var(--color-accent)]">Depth (coach): {formatAngle(currentDepthAngle)}</p>
                 <p className="font-medium text-[var(--color-accent)]">Knee flex: {formatAngle(currentKneeDisplay)}</p>
@@ -3469,7 +3712,7 @@ export default function App() {
               </div>
             </div>
             {hasCompareMedia && (
-              <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+              <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
                 <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
                 <div className="grid grid-cols-5 gap-x-3 text-xs text-[var(--color-text-light)]">
                   <p className="font-medium text-[var(--color-accent)]">Depth (coach): {formatAngle(compareStats?.currentDepthAngle ?? null)}</p>
@@ -3490,7 +3733,7 @@ export default function App() {
           </div>
         ) : (
           <div className={`mt-2 grid gap-2 ${hasCompareMedia ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
-            <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+            <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
                 <p>Current: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}</p>
                 <p>Samples: {series.length}</p>
@@ -3501,7 +3744,7 @@ export default function App() {
               </div>
             </div>
             {hasCompareMedia && (
-              <div className="rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+              <div className={`rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
                 <p className="mb-1 text-[10px] uppercase tracking-wide opacity-60 text-[var(--color-text-light)]">Compare</p>
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
                   <p>Current: {compareCurrentKneeAngle !== null ? `${compareCurrentKneeAngle.toFixed(1)}°` : '—'}</p>
@@ -3516,7 +3759,7 @@ export default function App() {
           </div>
         )}
         {showAngleGuide && (
-          <div className="mt-2 rounded-md border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40 p-2.5">
+          <div className={`mt-2 rounded-md border p-2.5 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'}`}>
             <div className="mb-1.5 flex items-center justify-between">
               <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
                 Angle guide
@@ -3725,17 +3968,37 @@ export default function App() {
   const mediaMaxClass =
     'max-h-[min(88dvh,1400px)] md:max-h-[min(85dvh,1400px)] lg:max-h-[min(84dvh,1500px)]';
 
-  const renderAngleOverlay = () =>
-    allAngles.length > 0 ? (
+  const renderMeasurementOverlay = () => {
+    const angleMs = measurements.filter(m => m.kind === 'angle' && m.angle !== null);
+    const lineMs = measurements.filter(m => m.kind === 'line' && m.length !== null && m.points.length === 2);
+    const nodes: ReactNode[] = [];
+    measurements.forEach((m, i) => {
+      if (m.kind === 'angle' && m.angle !== null) {
+        const idx = angleMs.indexOf(m) + 1;
+        nodes.push(
+          <div key={`angle-${i}`} className="rounded-xl px-3 py-1.5 bg-black/50 backdrop-blur-md">
+            <p className="text-[10px] text-white/60">{angleMs.length > 1 ? `Angle ${idx}` : 'Angle'}</p>
+            <p className="text-xl font-bold text-[var(--color-accent)]">{m.angle.toFixed(1)}°</p>
+          </div>,
+        );
+      }
+      if (m.kind === 'line' && m.length !== null && m.points.length === 2) {
+        const idx = lineMs.indexOf(m) + 1;
+        nodes.push(
+          <div key={`line-${i}`} className="rounded-xl px-3 py-1.5 bg-black/50 backdrop-blur-md">
+            <p className="text-[10px] text-white/60">{lineMs.length > 1 ? `Line ${idx}` : 'Line'}</p>
+            <p className="text-xl font-bold text-[var(--color-accent)]">{m.length.toFixed(0)} px</p>
+          </div>,
+        );
+      }
+    });
+    if (nodes.length === 0) return null;
+    return (
       <div className="pointer-events-none absolute left-3 top-3 z-20 flex flex-col gap-1">
-        {allAngles.map((a, i) => (
-          <div key={i} className="rounded-xl bg-black/50 px-3 py-1.5 backdrop-blur-md">
-            <p className="text-[10px] text-white/60">{allAngles.length > 1 ? `Angle ${i + 1}` : 'Angle'}</p>
-            <p className="text-xl font-bold text-[var(--color-accent)]">{a.toFixed(1)}°</p>
-          </div>
-        ))}
+        {nodes}
       </div>
-    ) : null;
+    );
+  };
 
   const renderOverlayToolbelt = () => (
     <div className="pointer-events-none absolute inset-y-0 right-0 z-20 flex items-center">
@@ -3761,13 +4024,23 @@ export default function App() {
         </button>
         <button
           type="button"
-          onClick={toggleRulerTool}
+          onClick={toggleAngleTool}
           disabled={!isMediaLoaded}
-          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'ruler' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title="Angle ruler"
-          aria-label="Angle ruler"
+          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'angle' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
+          title="Angle measure (three points)"
+          aria-label="Angle measure"
         >
-          <Ruler className="w-5 h-5" />
+          <AngleMeasureIcon className="w-5 h-5" />
+        </button>
+        <button
+          type="button"
+          onClick={toggleLineTool}
+          disabled={!isMediaLoaded}
+          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'line' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
+          title="Line measure (distance between two points)"
+          aria-label="Line measure"
+        >
+          <Minus className="w-5 h-5" />
         </button>
         <button
           type="button"
@@ -3938,7 +4211,7 @@ export default function App() {
                 className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'h-full w-full rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
                 {renderOverlayToolbelt()}
-                {renderAngleOverlay()}
+                {renderMeasurementOverlay()}
                 <div
                   className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'md:grid-cols-2 md:gap-0' : 'grid-cols-1 gap-0'}`}
                 >
@@ -4031,7 +4304,7 @@ export default function App() {
                           className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
                           style={{
                             touchAction: 'none',
-                            cursor: isComparePanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : 'default',
+                            cursor: isComparePanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : activeTool === 'angle' || activeTool === 'line' ? 'crosshair' : 'default',
                           }}
                           onPointerDown={handleCompareCanvasPointerDown}
                           onPointerMove={handleCompareCanvasPointerMove}
@@ -4044,8 +4317,9 @@ export default function App() {
                   ) : null}
                 </div>
 
-                {/* Playback controls overlay at bottom of media container */}
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col gap-1 px-3 pb-3 pt-8 bg-gradient-to-t from-black/50 to-transparent rounded-b-xl">
+                {/* Playback controls overlay at bottom of media container — hidden in fullscreen when analysis is open */}
+                {!(isFullscreen && showAnalysis) && (
+                <div className={`pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col gap-1 px-3 pb-3 pt-8 rounded-b-xl ${isFullscreen ? 'bg-transparent' : 'bg-gradient-to-t from-black/50 to-transparent'}`}>
                   <div className="pointer-events-auto flex items-center gap-1">
                     <button
                       type="button"
@@ -4119,14 +4393,14 @@ export default function App() {
                     ) : null}
                   </div>
                 </div>
-              </div>
-              {showAnalysis ? (
-                isFullscreen ? (
-                  <div className="absolute inset-x-0 bottom-0 z-30 max-h-[50dvh] overflow-y-auto rounded-t-2xl bg-black/60 backdrop-blur-lg p-4">
+                )}
+                {isFullscreen && showAnalysis && (
+                  <div className="absolute inset-x-0 bottom-0 z-30 max-h-[50dvh] overflow-y-auto rounded-t-2xl bg-transparent p-4">
                     {renderKneeAnglePanel()}
                   </div>
-                ) : renderKneeAnglePanel()
-              ) : null}
+                )}
+              </div>
+              {!isFullscreen && showAnalysis ? renderKneeAnglePanel() : null}
             </div>
           ) : imageSrc ? (
             <div
@@ -4137,7 +4411,7 @@ export default function App() {
                 className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'h-full w-full rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
                 {renderOverlayToolbelt()}
-                {renderAngleOverlay()}
+                {renderMeasurementOverlay()}
                 <div
                   className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'md:grid-cols-2 md:gap-0' : 'grid-cols-1 gap-0'}`}
                 >
@@ -4227,7 +4501,7 @@ export default function App() {
                         className="pointer-events-auto absolute inset-0 z-10 h-full w-full touch-none"
                         style={{
                           touchAction: 'none',
-                          cursor: isComparePanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : 'default',
+                          cursor: isComparePanning ? 'grabbing' : activeTool === 'pan' ? 'grab' : activeTool === 'angle' || activeTool === 'line' ? 'crosshair' : 'default',
                         }}
                         onPointerDown={handleCompareCanvasPointerDown}
                         onPointerMove={handleCompareCanvasPointerMove}
@@ -4239,15 +4513,13 @@ export default function App() {
                     </div>
                   ) : null}
                 </div>
-              </div>
-
-              {showAnalysis ? (
-                isFullscreen ? (
-                  <div className="absolute inset-x-0 bottom-0 z-30 max-h-[50dvh] overflow-y-auto rounded-t-2xl bg-black/60 backdrop-blur-lg p-4">
+                {isFullscreen && showAnalysis && (
+                  <div className="absolute inset-x-0 bottom-0 z-30 max-h-[50dvh] overflow-y-auto rounded-t-2xl bg-transparent p-4">
                     {renderKneeAnglePanel()}
                   </div>
-                ) : renderKneeAnglePanel()
-              ) : null}
+                )}
+              </div>
+              {!isFullscreen && showAnalysis ? renderKneeAnglePanel() : null}
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-64 rounded-xl border-2 border-dashed border-[var(--color-accent)]/20 bg-[var(--color-bg-dark)] p-8 text-center">
