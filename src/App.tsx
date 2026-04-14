@@ -37,6 +37,7 @@ import * as poseDetection from '@tensorflow-models/pose-detection';
 import * as tf from '@tensorflow/tfjs-core';
 import '@tensorflow/tfjs-backend-webgl';
 import SettingsMenu from './SettingsMenu';
+import SisterAppsMenu from './SisterAppsMenu';
 import { useTheme } from './theme';
 
 /** Toolbar icon: two rays meeting at a vertex (angle measure). */
@@ -4793,9 +4794,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[var(--color-bg-dark)] text-fg font-sans blueprint-bg">
       <header className="mb-5 flex items-center justify-between gap-4 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
-        <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
-          Form Analyzer
-        </h1>
+        <SisterAppsMenu currentSlug="formanalyzer" title="Form Analyzer" />
         <SettingsMenu />
       </header>
 
