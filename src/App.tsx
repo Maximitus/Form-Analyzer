@@ -32,6 +32,7 @@ import {
   Video,
   Activity,
   LineChart,
+  Flag,
 } from 'lucide-react';
 import SettingsMenu from './SettingsMenu';
 import { useTheme } from './theme';
@@ -1167,6 +1168,7 @@ export default function App() {
   const [compareVideoSrc, setCompareVideoSrc] = useState<string | null>(null);
   const [compareImageSrc, setCompareImageSrc] = useState<string | null>(null);
   const [showAnalysis, setShowAnalysis] = useState(true);
+  const analysisPanelRef = useRef<HTMLElement | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const compareVideoRef = useRef<HTMLVideoElement>(null);
@@ -3661,58 +3663,97 @@ export default function App() {
 
   const handleAnalysisModeSwitch = (mode: AnalysisMode) => {
     setAnalysisMode(mode);
+    setShowAnalysis(true);
     if (mode === 'golf') {
       setPoseEnabled(true);
       golfSessionRef.current.reset();
       golfClubPrevRef.current = null;
       rtmposeClientRef.current?.resetClub();
       setGolfMetrics(null);
-      return;
-    }
-    if (mode === 'squat') {
+    } else if (mode === 'squat') {
       setAngleLowerBound(40);
       setAngleUpperBound(120);
     } else {
       setAngleLowerBound(100);
       setAngleUpperBound(180);
     }
+    requestAnimationFrame(() => {
+      analysisPanelRef.current?.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+    });
   };
 
-  const renderKneeAnglePanel = () => {
-    if (!isMediaLoaded) return null;
+  const renderAnalysisModeSwitcher = (compact = false) => (
+    <div
+      className={`flex overflow-hidden rounded-md border border-[var(--color-accent)]/20 ${compact ? 'flex-col' : ''}`}
+      role="group"
+      aria-label="Analysis mode"
+    >
+      <button
+        type="button"
+        onClick={() => handleAnalysisModeSwitch('stride')}
+        className={`${compact ? 'px-1.5 py-1' : 'px-2 py-1'} text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+        title="Stride analysis — track extension peaks"
+      >
+        Stride
+      </button>
+      <button
+        type="button"
+        onClick={() => handleAnalysisModeSwitch('squat')}
+        className={`${compact ? 'px-1.5 py-1' : 'px-2 py-1'} text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+        title="Squat analysis — track depth valleys and 90° threshold"
+      >
+        Squat
+      </button>
+      <button
+        type="button"
+        onClick={() => handleAnalysisModeSwitch('golf')}
+        className={`${compact ? 'px-1.5 py-1' : 'px-2 py-1'} text-xs transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+        title="Golf analysis — face-on or down-the-line, plus club-head tracking"
+      >
+        Golf
+      </button>
+    </div>
+  );
 
-    const modeSwitcher = (
-      <div className="flex overflow-hidden rounded-md border border-[var(--color-accent)]/20">
-        <button
-          type="button"
-          onClick={() => handleAnalysisModeSwitch('stride')}
-          className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-          title="Stride analysis — track extension peaks"
+  const renderKneeAnglePanel = () => {
+    const modeSwitcher = renderAnalysisModeSwitcher();
+
+    if (!isMediaLoaded) {
+      if (analysisMode !== 'golf') return null;
+      return (
+        <section
+          ref={analysisPanelRef}
+          className="rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4"
         >
-          Stride
-        </button>
-        <button
-          type="button"
-          onClick={() => handleAnalysisModeSwitch('squat')}
-          className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-          title="Squat analysis — track depth valleys and 90° threshold"
-        >
-          Squat
-        </button>
-        <button
-          type="button"
-          onClick={() => handleAnalysisModeSwitch('golf')}
-          className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-          title="Golf analysis — face-on or down-the-line, plus club-head tracking"
-        >
-          Golf
-        </button>
-      </div>
-    );
+          <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+            <h3 className="shrink-0 text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
+              Golf
+            </h3>
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">{modeSwitcher}</div>
+          </div>
+          <GolfPanel
+            metrics={null}
+            camera={golfCamera}
+            handedness={golfHandedness}
+            onCameraChange={(next) => {
+              setGolfCamera(next);
+              golfSessionRef.current.setCamera(next);
+            }}
+            onHandednessChange={(next) => {
+              setGolfHandedness(next);
+              golfSessionRef.current.setHandedness(next);
+            }}
+          />
+        </section>
+      );
+    }
 
     if (analysisMode === 'golf') {
       return (
-        <section className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}>
+        <section
+          ref={analysisPanelRef}
+          className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}
+        >
           <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
             <h3 className="shrink-0 text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
               Golf
@@ -4130,7 +4171,10 @@ export default function App() {
     const compareLinePath = makeLinePath(compareSeries, compareMaxTime);
 
     return (
-      <section className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}>
+      <section
+        ref={analysisPanelRef}
+        className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}
+      >
         <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
           <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)] shrink-0">
             {isSquat ? 'Squat Depth — Below Parallel' : 'Knee Angle (Hip-Knee-Ankle)'}
@@ -4217,32 +4261,7 @@ export default function App() {
               >
                 Guide
               </button>
-              <div className="flex rounded-md border border-[var(--color-accent)]/20 overflow-hidden">
-                <button
-                  type="button"
-                  onClick={() => handleAnalysisModeSwitch('stride')}
-                  className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-                  title="Stride analysis — track extension peaks"
-                >
-                  Stride
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleAnalysisModeSwitch('squat')}
-                  className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-                  title="Squat analysis — track depth valleys and 90° threshold"
-                >
-                  Squat
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleAnalysisModeSwitch('golf')}
-                  className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-                  title="Golf analysis — face-on or down-the-line, plus club-head tracking"
-                >
-                  Golf
-                </button>
-              </div>
+              {modeSwitcher}
               {videoSrc ? (
                 <button
                   type="button"
@@ -5011,6 +5030,16 @@ export default function App() {
         </button>
         <button
           type="button"
+          onClick={() => handleAnalysisModeSwitch(analysisMode === 'golf' ? 'stride' : 'golf')}
+          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${analysisMode === 'golf' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
+          title={analysisMode === 'golf' ? 'Golf analysis on — click for Stride' : 'Golf analysis'}
+          aria-label={analysisMode === 'golf' ? 'Switch from Golf to Stride' : 'Switch to Golf analysis'}
+          aria-pressed={analysisMode === 'golf'}
+        >
+          <Flag className="w-5 h-5" />
+        </button>
+        <button
+          type="button"
           onClick={() => zoomByButton(ZOOM_BUTTON_FACTOR)}
           disabled={!isMediaLoaded}
           className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} text-fg`}
@@ -5067,8 +5096,11 @@ export default function App() {
 
       <main className="grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5">
         <section className="glass p-6 rounded-2xl border border-[var(--color-accent)]/10 shadow-lg accent-glow">
-          <div className="flex justify-between items-center mb-6">
-            <h2 className="text-xl font-semibold text-fg brand-font">Media Analysis</h2>
+          <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 flex-wrap items-center gap-3">
+              <h2 className="text-xl font-semibold text-fg brand-font">Media Analysis</h2>
+              {renderAnalysisModeSwitcher()}
+            </div>
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
@@ -5482,6 +5514,7 @@ export default function App() {
               {!isFullscreen && showAnalysis ? renderKneeAnglePanel() : null}
             </div>
           ) : (
+            <>
             <div className="flex flex-col items-center justify-center h-64 rounded-xl border-2 border-dashed border-[var(--color-accent)]/20 bg-[var(--color-bg-dark)] p-8 text-center">
               <div className="mb-4 flex gap-3 text-[var(--color-accent)]/50">
                 <ImageGalleryIcon className="h-10 w-10" />
@@ -5489,9 +5522,13 @@ export default function App() {
                 <Video className="h-10 w-10" />
               </div>
               <p className="text-[var(--color-text-light)] max-w-sm">
-                Add media with the buttons above: gallery (images or videos), take a photo, or record video.
+                {analysisMode === 'golf'
+                  ? 'Golf mode is on. Add a swing video or photo, then play or scrub to sample pose and club.'
+                  : 'Add media with the buttons above: gallery (images or videos), take a photo, or record video. Use Stride, Squat, or Golf above to pick an analysis mode.'}
               </p>
             </div>
+            {showAnalysis ? renderKneeAnglePanel() : null}
+            </>
           )}
         </section>
 
