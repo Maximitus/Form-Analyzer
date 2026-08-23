@@ -31,6 +31,7 @@ import {
   Images,
   Video,
   Loader2,
+  FastForward,
 } from 'lucide-react';
 import SettingsMenu from './SettingsMenu';
 import { useTheme } from './theme';
@@ -39,6 +40,7 @@ import { poseFrameToTracked, trackedHasVisible } from './pose/toTracked';
 import { COCO_KEYPOINT_COUNT, type PoseFrame, type RtmposeVariant } from './types/pose';
 import { KeypointOneEuroFilter } from './utils/oneEuroFilter';
 import {
+  computeGolfFrontalMetrics,
   drawGolfOverlay,
   GolfPanel,
   GolfSession,
@@ -961,12 +963,12 @@ function detectKneeAngleMinima(
     });
 }
 
-function findNearestCachedPose(
+function findCacheBounds(
   cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[],
   time: number,
-): {x: number; y: number; v: number}[] | null {
+): {lower: number; upper: number} | null {
   if (cache.length === 0) return null;
-  if (cache.length === 1) return cache[0]!.keypoints;
+  if (cache.length === 1) return {lower: 0, upper: 0};
 
   let lo = 0;
   let hi = cache.length - 1;
@@ -978,11 +980,47 @@ function findNearestCachedPose(
 
   const upper = lo;
   const lower = lo > 0 ? lo - 1 : 0;
-  if (upper === lower) return cache[upper]!.keypoints;
+  return {lower, upper};
+}
 
-  const distLo = Math.abs(time - cache[lower]!.time);
-  const distHi = Math.abs(time - cache[upper]!.time);
-  return distLo <= distHi ? cache[lower]!.keypoints : cache[upper]!.keypoints;
+function findNearestCachedPose(
+  cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[],
+  time: number,
+): {x: number; y: number; v: number}[] | null {
+  const bounds = findCacheBounds(cache, time);
+  if (!bounds) return null;
+  if (bounds.upper === bounds.lower) return cache[bounds.upper]!.keypoints;
+
+  const distLo = Math.abs(time - cache[bounds.lower]!.time);
+  const distHi = Math.abs(time - cache[bounds.upper]!.time);
+  return distLo <= distHi ? cache[bounds.lower]!.keypoints : cache[bounds.upper]!.keypoints;
+}
+
+/** Blend neighboring cached poses so overlay tracks the playhead between analyzed frames. */
+function interpolateCachedPose(
+  cache: {time: number; keypoints: {x: number; y: number; v: number}[]}[],
+  time: number,
+): {x: number; y: number; v: number}[] | null {
+  const bounds = findCacheBounds(cache, time);
+  if (!bounds) return null;
+  const a = cache[bounds.lower]!;
+  const b = cache[bounds.upper]!;
+  const aVisible = a.keypoints.length === POSE_TRACKED_IDS.length && a.keypoints.some((p) => p.v >= OVERLAY_POSE_VISIBILITY);
+  const bVisible = b.keypoints.length === POSE_TRACKED_IDS.length && b.keypoints.some((p) => p.v >= OVERLAY_POSE_VISIBILITY);
+  if (!aVisible && !bVisible) return null;
+  if (!aVisible) return b.keypoints;
+  if (!bVisible || a.time === b.time || a.keypoints.length !== b.keypoints.length) return a.keypoints;
+
+  const span = b.time - a.time;
+  const t = span <= 1e-6 ? 0 : Math.min(1, Math.max(0, (time - a.time) / span));
+  return a.keypoints.map((p, i) => {
+    const q = b.keypoints[i] ?? p;
+    return {
+      x: p.x + (q.x - p.x) * t,
+      y: p.y + (q.y - p.y) * t,
+      v: p.v + (q.v - p.v) * t,
+    };
+  });
 }
 
 const FOOT_INCL_MIN_VIS = 0.2;
@@ -1246,6 +1284,7 @@ export default function App() {
   const [poseEnabled, setPoseEnabled] = useState(false);
   const [poseError, setPoseError] = useState<string | null>(null);
   const [poseSessionId, setPoseSessionId] = useState(0);
+  const [poseScrubbed, setPoseScrubbed] = useState(false);
   const [poseKeypoints, setPoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
   const [comparePoseKeypoints, setComparePoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
   const [currentKneeAngle, setCurrentKneeAngle] = useState<number | null>(null);
@@ -1298,6 +1337,10 @@ export default function App() {
   golfHandednessRef.current = golfHandedness;
   const golfCameraRef = useRef(golfCamera);
   golfCameraRef.current = golfCamera;
+  const poseScrubbedRef = useRef(false);
+  poseScrubbedRef.current = poseScrubbed;
+  const isPoseAnalyzingRef = useRef(false);
+  isPoseAnalyzingRef.current = isPoseAnalyzing;
   const rtmposeClientRef = useRef<RtmposeClient | null>(null);
   const primarySmoothRef = useRef(new KeypointOneEuroFilter(COCO_KEYPOINT_COUNT));
   const compareSmoothRef = useRef(new KeypointOneEuroFilter(COCO_KEYPOINT_COUNT));
@@ -1927,6 +1970,7 @@ export default function App() {
         const compareImage = compareImageRef.current;
         const hasAnyVideo = (!!videoSrc && !!primaryVideo) || (!!compareVideoSrc && !!compareVideo);
         const trackClub = () => analysisModeRef.current === 'golf';
+        const liveBlocked = () => poseScrubbedRef.current || isPoseAnalyzingRef.current;
         let submittingLive = false;
         let removeMediaListeners = () => {};
 
@@ -1957,6 +2001,7 @@ export default function App() {
               );
             }
           }
+          if (!cancelled) setPoseScrubbed(true);
           return;
         }
 
@@ -1997,6 +2042,7 @@ export default function App() {
           now: number,
         ) => {
           if (client.isBusy || submittingLive) return;
+          if (liveBlocked()) return;
           if (video.readyState < 2) return;
           if (now - lastTs.value < minInferenceIntervalMs) return;
           // Paused clips often decode a black first frame; keep sampling until a pose lands.
@@ -2023,7 +2069,7 @@ export default function App() {
         const compareLastTs = {value: lastCompareInferenceTs};
 
         const tick = () => {
-          if (cancelled) return;
+          if (cancelled || liveBlocked()) return;
           const now = performance.now();
           if (videoSrc && primaryVideo) {
             maybeInferVideo(
@@ -2183,11 +2229,9 @@ export default function App() {
       }
 
       const overlayTime = videoRef.current?.currentTime ?? 0;
-      const cachedPose = findNearestCachedPose(poseCacheRef.current, overlayTime);
       const overlayKps =
-        cachedPose && cachedPose.length === POSE_TRACKED_IDS.length && cachedPose.some((p) => p.v >= OVERLAY_POSE_VISIBILITY)
-          ? cachedPose
-          : poseKeypoints;
+        interpolateCachedPose(poseCacheRef.current, overlayTime) ??
+        (poseKeypoints.length === POSE_TRACKED_IDS.length ? poseKeypoints : []);
 
       if (poseEnabled && overlayKps.length === POSE_TRACKED_IDS.length) {
         const byId = new Map<number, {x: number; y: number; v: number}>();
@@ -2256,7 +2300,7 @@ export default function App() {
           ctx.arc(o.x, o.y, golfMode ? (nose ? 3.5 : 4) : nose ? 3 : arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
           ctx.fill();
         });
-        if (golfMode && golfMetrics) {
+        if (golfMode) {
           const media = videoRef.current ?? imageRef.current;
           const srcW =
             media instanceof HTMLVideoElement
@@ -2279,7 +2323,15 @@ export default function App() {
             p.x = o.x;
             p.y = o.y;
           }
-          drawGolfOverlay(ctx, overlayCoco, mapMetricsToOverlay(golfMetrics, mapper, srcW, srcH));
+          const cocoPx = trackedPoseToCoco(overlayKps, POSE_TRACKED_IDS, srcW, srcH);
+          const snap = computeGolfFrontalMetrics(
+            cocoPx,
+            golfHandedness,
+            golfMetrics?.phase ?? 'unknown',
+            null,
+            {camera: golfCamera, clubHead: golfMetrics?.clubHead},
+          );
+          drawGolfOverlay(ctx, overlayCoco, mapMetricsToOverlay(snap, mapper, srcW, srcH));
         }
         ctx.restore();
       }
@@ -2343,7 +2395,7 @@ export default function App() {
         if (rafId !== null) cancelAnimationFrame(rafId);
       };
     }
-  }, [measurements, videoSrc, imageSrc, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints, accentId, kneeTrackingSide, currentTime, analysisMode, golfMetrics]);
+  }, [measurements, videoSrc, imageSrc, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints, accentId, kneeTrackingSide, currentTime, analysisMode, golfMetrics, golfHandedness, golfCamera]);
 
   // Compare panel pose overlay (independent from primary zoom/pan)
   useEffect(() => {
@@ -2388,13 +2440,9 @@ export default function App() {
 
       if (poseEnabled) {
         const overlayTime = compareVideoRef.current?.currentTime ?? 0;
-        const cachedPose = findNearestCachedPose(comparePoseCacheRef.current, overlayTime);
         const overlayKps =
-          cachedPose &&
-          cachedPose.length === POSE_TRACKED_IDS.length &&
-          cachedPose.some((p) => p.v >= OVERLAY_POSE_VISIBILITY)
-            ? cachedPose
-            : comparePoseKeypoints;
+          interpolateCachedPose(comparePoseCacheRef.current, overlayTime) ??
+          (comparePoseKeypoints.length === POSE_TRACKED_IDS.length ? comparePoseKeypoints : []);
         if (overlayKps.length === POSE_TRACKED_IDS.length) {
           const media = (compareVideoRef.current ?? compareImageRef.current) as HTMLVideoElement | HTMLImageElement;
           const byId = new Map<number, {x: number; y: number; v: number}>();
@@ -2596,6 +2644,7 @@ export default function App() {
     if (!poseEnabled) {
       setIsPoseAnalyzing(false);
       setGraphAnalysisRequested(false);
+      setPoseScrubbed(false);
       analysisAbortRef.current = true;
       analysisGenRef.current += 1;
       setAnalysisProgress(null);
@@ -2605,9 +2654,15 @@ export default function App() {
   const runFrameByFrameAnalysis = useCallback(async () => {
     const bgVideo = bgVideoRef.current;
     const mainVideo = videoRef.current;
-    if (!bgVideo || !mainVideo) return;
+    if (!bgVideo || !mainVideo) {
+      setIsPoseAnalyzing(false);
+      return;
+    }
     const client = rtmposeClientRef.current;
-    if (!client) return;
+    if (!client) {
+      setIsPoseAnalyzing(false);
+      return;
+    }
 
     const targetDuration = Math.max(getReliableVideoDuration(mainVideo), mainVideo.duration || 0, 0);
     if (targetDuration <= 0) return;
@@ -2760,7 +2815,10 @@ export default function App() {
             bitmap = await mediaToBitmap(visibleVideo, analysisPoseCanvas);
           }
           if (bitmap) {
-            const pose = await client.inferOnce(bitmap, t, {trackClubHead: false});
+            const pose = await client.inferOnce(bitmap, t, {
+              trackClubHead: analysisModeRef.current === 'golf',
+              leadIsLeft: golfHandednessRef.current === 'right',
+            });
             if (isStale()) break;
             const mapped = poseFrameToTracked(pose, POSE_TRACKED_IDS);
             if (trackedHasVisible(mapped, MIN_POSE_VISIBILITY)) {
@@ -2880,6 +2938,7 @@ export default function App() {
       setIsPoseAnalyzing(false);
       setIsKneeGraphLocked(true);
       setAnalysisProgress(null);
+      setPoseScrubbed(true);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [primaryFacingDirection, compareFacingDirection, compareVideoSrc, compareKneeTrackingSide]);
@@ -2906,7 +2965,7 @@ export default function App() {
     setGraphAnalysisRequested(false);
     void runFrameByFrameAnalysis();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [poseEnabled, poseStatus, videoSrc, graphAnalysisRequested, runFrameByFrameAnalysis]);
+  }, [poseEnabled, poseStatus, videoSrc, graphAnalysisRequested, runFrameByFrameAnalysis, duration]);
 
   useEffect(() => {
     setCompareCurrentTime(0);
@@ -2965,6 +3024,7 @@ export default function App() {
       setIsKneeGraphLocked(false);
       setIsPoseAnalyzing(false);
       setAnalysisProgress(null);
+      setPoseScrubbed(false);
       analysisAbortRef.current = true;
       return;
     }
@@ -2973,6 +3033,7 @@ export default function App() {
       setPosePointSeries([]);
       setBodyProportions(null);
       poseCacheRef.current = [];
+      setPoseScrubbed(false);
     }
     if (!compareVideoSrc) {
       setCompareKneeAngleSeries([]);
@@ -3144,9 +3205,10 @@ export default function App() {
     setGraphAnalysisRequested(true);
   };
 
-  const startAnalysis = () => {
+  const startScrub = () => {
     setShowAnalysis(true);
     setPoseError(null);
+    setPoseScrubbed(false);
     if (poseStatus === 'error' || !rtmposeClientRef.current) {
       rtmposeClientRef.current?.stop();
       rtmposeClientRef.current = null;
@@ -3160,14 +3222,8 @@ export default function App() {
       setGolfMetrics(null);
     }
     setPoseEnabled(true);
-    const video = videoRef.current;
-    if (video && video.readyState >= 2) {
-      const nudge = Math.min(video.duration || video.currentTime + 0.04, video.currentTime + 0.04);
-      if (Number.isFinite(nudge) && Math.abs(nudge - video.currentTime) > 0.001) {
-        video.currentTime = nudge;
-      }
-    }
-    if (videoSrc && analysisMode !== 'golf') {
+    if (videoSrc) {
+      setIsPoseAnalyzing(true);
       analysisAbortRef.current = true;
       setIsKneeGraphLocked(false);
       setGraphAnalysisRequested(true);
@@ -4988,22 +5044,24 @@ export default function App() {
       poseEnabled &&
       poseStatus === 'ready' &&
       !analyzing &&
+      !poseScrubbed &&
       !trackedHasVisible(poseKeypoints, OVERLAY_POSE_VISIBILITY);
-    const showPlay = !drawingTool && (!poseEnabled || poseStatus === 'error');
-    if (!showPlay && !modelLoading && !analyzing && !waitingForPose && !poseError && !drawingTool) return null;
+    const showScrub =
+      !drawingTool && !analyzing && poseStatus !== 'loading' && (!poseScrubbed || poseStatus === 'error');
+    if (!showScrub && !modelLoading && !analyzing && !waitingForPose && !poseError && !drawingTool) return null;
 
     const statusLabel =
       poseStatus === 'error'
-        ? 'Retry pose lines'
+        ? 'Retry scrub'
         : modelLoading
           ? 'Loading pose model…'
           : analyzing
             ? analysisProgress !== null
-              ? `Analyzing ${analysisProgress}%`
-              : 'Analyzing…'
+              ? `Scrubbing ${analysisProgress}%`
+              : 'Scrubbing…'
             : waitingForPose
               ? 'Looking for a person…'
-              : 'Show pose lines';
+              : 'Scrub';
 
     if (drawingTool) {
       return (
@@ -5017,18 +5075,18 @@ export default function App() {
       );
     }
 
-    if (showPlay) {
+    if (showScrub) {
       return (
         <div className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/35">
           <button
             type="button"
-            onClick={startAnalysis}
+            onClick={startScrub}
             className="pointer-events-auto flex flex-col items-center gap-2 text-white transition hover:scale-[1.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]"
-            title={statusLabel}
-            aria-label={statusLabel}
+            title="Scrub the clip — precompute pose so playback stays fluid"
+            aria-label="Scrub the clip to precompute pose lines"
           >
             <span className="flex h-24 w-24 items-center justify-center rounded-full border-4 border-white/85 bg-[var(--color-accent)] shadow-xl shadow-black/40">
-              <Play className="h-12 w-12 translate-x-0.5 fill-white" aria-hidden />
+              <FastForward className="h-12 w-12 fill-white" aria-hidden />
             </span>
             <span className="rounded-full bg-black/55 px-3 py-1 text-sm font-semibold uppercase tracking-wide">
               {statusLabel}
@@ -5417,6 +5475,23 @@ export default function App() {
                     >
                       <ChevronRight className="w-5 h-5" />
                     </button>
+                    <button
+                      type="button"
+                      onClick={startScrub}
+                      disabled={isPoseAnalyzing}
+                      className={`ml-1 flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold uppercase tracking-wide hover:bg-white/15 ${
+                        poseScrubbed ? 'text-[var(--color-accent)]' : 'text-white'
+                      } ${isPoseAnalyzing ? 'opacity-50' : ''}`}
+                      title={
+                        poseScrubbed
+                          ? 'Re-scrub — recompute pose, then play with cached line work'
+                          : 'Scrub — precompute pose so video and line work play fluidly'
+                      }
+                      aria-label={poseScrubbed ? 'Re-scrub pose' : 'Scrub pose'}
+                    >
+                      <FastForward className="h-4 w-4" aria-hidden />
+                      Scrub
+                    </button>
                   </div>
                   <div className={`pointer-events-auto grid gap-2 ${compareVideoSrc ? 'grid-cols-2' : 'grid-cols-1'}`}>
                     <input
@@ -5586,7 +5661,7 @@ export default function App() {
                 <Video className="h-10 w-10" />
               </div>
               <p className="text-[var(--color-text-light)] max-w-sm">
-                Add media with the buttons above, pick Stride, Squat, or Golf in the header, then press the big play button to run analysis and show pose lines.
+                Add media with the buttons above, pick Stride, Squat, or Golf in the header, then press Scrub. After scrubbing, play the video — pose lines are cached so playback stays fluid.
               </p>
             </div>
             {showAnalysis ? renderKneeAnglePanel() : null}
