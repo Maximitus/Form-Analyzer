@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+public/models/*.onnx
+public/ort/*.wasm
+public/ort/*.mjs

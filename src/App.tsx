@@ -33,11 +33,22 @@ import {
   Activity,
   LineChart,
 } from 'lucide-react';
-import * as poseDetection from '@tensorflow-models/pose-detection';
-import * as tf from '@tensorflow/tfjs-core';
-import '@tensorflow/tfjs-backend-webgl';
 import SettingsMenu from './SettingsMenu';
 import { useTheme } from './theme';
+import { RtmposeClient } from './pose/rtmposeClient';
+import { poseFrameToTracked, trackedHasVisible } from './pose/toTracked';
+import { COCO_KEYPOINT_COUNT, type PoseFrame, type RtmposeVariant } from './types/pose';
+import { KeypointOneEuroFilter } from './utils/oneEuroFilter';
+import {
+  drawGolfOverlay,
+  GolfPanel,
+  GolfSession,
+  mapMetricsToOverlay,
+  trackedPoseToCoco,
+  type GolfCamera,
+  type GolfFrontalMetrics,
+  type GolfHandedness,
+} from './golf';
 
 /** Toolbar icon: two rays meeting at a vertex (angle measure). */
 function AngleMeasureIcon({ className }: { className?: string }) {
@@ -110,34 +121,15 @@ const ZOOM_BUTTON_FACTOR = 1.25;
 const FRAME_STEP_SECONDS = 1 / 30; // approx single frame at 30fps
 const SLIDER_SCRUB_STEP_SECONDS = 1 / 60; // smaller increments for smoother scrubbing
 /**
- * COCO-style IDs kept for all math and overlays. 17–20 are our extensions for
- * heel / toe (BlazePose only); MoveNet had no foot landmarks beyond the ankle.
+ * COCO-style IDs kept for all math and overlays. 17–20 were BlazePose heel/toe
+ * extensions. RTMPose is COCO-17 only, so those slots stay empty (v=0).
+ * Ground / stride height uses ankles; toe-angle readouts are hidden.
  */
 const POSE_NOSE_ID = 0;
 const POSE_TRACKED_IDS = [
   POSE_NOSE_ID,
   11, 12, 13, 14, 15, 16, 5, 6, 7, 8, 9, 10, 17, 18, 19, 20,
 ];
-/** Maps each COCO-style id to BlazePose keypoint index (model output order). */
-const COCO_ID_TO_BLAZEPOSE_INDEX: Record<number, number> = {
-  0: 0,
-  5: 11,
-  6: 12,
-  7: 13,
-  8: 14,
-  9: 15,
-  10: 16,
-  11: 23,
-  12: 24,
-  13: 25,
-  14: 26,
-  15: 27,
-  16: 28,
-  17: 29,
-  18: 30,
-  19: 31,
-  20: 32,
-};
 const POSE_LEFT_SIDE_IDS = new Set([5, 7, 9, 11, 13, 15, 17, 19]);
 const POSE_RIGHT_SIDE_IDS = new Set([6, 8, 10, 12, 14, 16, 18, 20]);
 const POSE_ARM_IDS = new Set([7, 8, 9, 10]);
@@ -165,30 +157,11 @@ const MIN_POSE_VISIBILITY = 0.25;
 const KNEE_SAMPLE_EPSILON_SECONDS = 1 / 1000;
 const POSE_INFERENCE_HZ = 24;
 
-function keypointsFromBlazePoseOutput(
-  keypoints: poseDetection.Keypoint[] | undefined,
-  sourceWidth: number,
-  sourceHeight: number,
-): {x: number; y: number; v: number}[] {
-  if (!keypoints || keypoints.length === 0 || sourceWidth <= 0 || sourceHeight <= 0) {
-    return [];
-  }
-  return POSE_TRACKED_IDS.map((cocoId) => {
-    const bpIdx = COCO_ID_TO_BLAZEPOSE_INDEX[cocoId];
-    const p = keypoints[bpIdx];
-    if (!p) return {x: 0, y: 0, v: 0};
-    const score = p.score ?? 0;
-    return {x: p.x / sourceWidth, y: p.y / sourceHeight, v: score};
-  });
-}
-
 /**
- * BlazePose TF.js uses getImageSize(input) which reads HTMLVideoElement.width/height,
- * not videoWidth/videoHeight — those are often 0 or wrong, collapsing landmarks.
  * Copy the current frame to a canvas sized to the intrinsic video dimensions so
  * the model and our normalization share one coordinate system.
  */
-function blazeposeVideoFrameCanvas(
+function captureVideoFrame(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
 ): HTMLCanvasElement | null {
@@ -204,6 +177,59 @@ function blazeposeVideoFrameCanvas(
   ctx.drawImage(video, 0, 0, vw, vh);
   return canvas;
 }
+
+async function mediaToBitmap(
+  source: HTMLCanvasElement | HTMLImageElement | HTMLVideoElement,
+  canvas: HTMLCanvasElement,
+): Promise<ImageBitmap | null> {
+  try {
+    if (source instanceof HTMLVideoElement) {
+      if (source.videoWidth > 0 && source.videoHeight > 0) {
+        try {
+          return await createImageBitmap(source);
+        } catch {
+          /* some browsers reject HTMLVideoElement; copy via canvas */
+        }
+      }
+      const frame = captureVideoFrame(source, canvas);
+      if (!frame) return null;
+      return await createImageBitmap(frame);
+    }
+    if (source instanceof HTMLCanvasElement) {
+      if (source.width <= 0 || source.height <= 0) return null;
+      return await createImageBitmap(source);
+    }
+    if (!source.complete || source.naturalWidth <= 0) return null;
+    return await createImageBitmap(source);
+  } catch {
+    return null;
+  }
+}
+
+function smoothPoseFrame(filter: KeypointOneEuroFilter, pose: PoseFrame): PoseFrame {
+  const xs = new Float32Array(COCO_KEYPOINT_COUNT);
+  const ys = new Float32Array(COCO_KEYPOINT_COUNT);
+  const scores = new Float32Array(COCO_KEYPOINT_COUNT);
+  for (let i = 0; i < COCO_KEYPOINT_COUNT; i++) {
+    const kp = pose.keypoints[i];
+    if (!kp) continue;
+    xs[i] = kp.x;
+    ys[i] = kp.y;
+    scores[i] = kp.score;
+  }
+  const timestamp = pose.mediaTime > 0 ? pose.mediaTime : performance.now() / 1000;
+  const smoothed = filter.apply(xs, ys, scores, timestamp);
+  return {
+    ...pose,
+    keypoints: pose.keypoints.map((kp, i) => ({
+      ...kp,
+      x: smoothed.xs[i] ?? kp.x,
+      y: smoothed.ys[i] ?? kp.y,
+      score: smoothed.scores[i] ?? kp.score,
+    })),
+  };
+}
+
 const KNEE_MAXIMA_MIN_SAMPLES = 3;
 const KNEE_MAXIMA_MIN_GAP_SECONDS = 0.15;
 /** Min prominence (°): peak must stand this far above the higher adjacent "valley" baseline (filters slope noise). */
@@ -493,7 +519,7 @@ function getBodyProportions(
 }
 
 /**
- * Linear correction of raw 2D segment lengths from BlazePose so ratios sit closer to
+ * Linear correction of raw 2D segment lengths from pose so ratios sit closer to
  * joint-center anthropometry (Drillis-style). Low hip landmarks shorten measured femur
  * and inflate tibia/femur; midline torso is still a bit long vs true trunk height.
  * Category bands and the parallel lean model then use **calibrated** lengths.
@@ -728,7 +754,7 @@ type PoseFrameSample = {
 };
 type FacingDirection = 'right' | 'left';
 type ExtensionDirection = 'forward' | 'behind';
-type AnalysisMode = 'stride' | 'squat';
+type AnalysisMode = 'stride' | 'squat' | 'golf';
 type KneeAnglePeak = {
   time: number;
   angle: number;
@@ -962,30 +988,16 @@ function findNearestCachedPose(
 const FOOT_INCL_MIN_VIS = 0.2;
 
 /**
- * Acute angle (0–90°) between heel→toe and image horizontal. ~0° when the sole is level in the
- * frame (flat foot in side view with level camera). Uses |dx|,|dy| so left/right foot direction
- * does not flip the sign; atan2(signed dy, signed dx) was reporting ~180° for toes-behind-heel.
+ * Heel→toe inclination is not available: RTMPose is COCO-17 and has no foot
+ * keypoints. Kept as a stub so stride UI can show an explicit n/a note.
  */
 function getFootInclinationVsHorizontalDeg(
-  keypoints: PosePoint[],
-  side: KneeSide,
-  aspectRatio = 1,
-  visibilityThreshold = FOOT_INCL_MIN_VIS,
+  _keypoints: PosePoint[],
+  _side: KneeSide,
+  _aspectRatio = 1,
+  _visibilityThreshold = FOOT_INCL_MIN_VIS,
 ): number | null {
-  if (keypoints.length !== POSE_TRACKED_IDS.length) return null;
-  const byId = new Map<number, PosePoint>();
-  POSE_TRACKED_IDS.forEach((id, i) => {
-    const p = keypoints[i];
-    if (p) byId.set(id, p);
-  });
-  const heel = side === 'left' ? byId.get(17) : byId.get(18);
-  const toe = side === 'left' ? byId.get(19) : byId.get(20);
-  if (!heel || !toe) return null;
-  if (Math.min(heel.v, toe.v) < visibilityThreshold) return null;
-  const dx = (toe.x - heel.x) * aspectRatio;
-  const dy = toe.y - heel.y;
-  if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) return null;
-  return Math.atan2(Math.abs(dy), Math.abs(dx)) * (180 / Math.PI);
+  return null;
 }
 
 /** Nose Y in normalized image coords (0 = top); used for head height and per-stride vertical movement. */
@@ -1002,8 +1014,8 @@ function getHeadNormYFromKeypoints(
 }
 
 /**
- * Vertical gap nose → lowest foot point (max of heel/toe Y) in normalized coords.
- * Ground proxy uses the same heel/toe landmarks as the toe-angle calc (side view).
+ * Vertical gap nose → ankle (ground proxy) in normalized coords.
+ * RTMPose has no heel/toe; ankles are the lowest COCO-17 landmarks.
  */
 function getHeadToGroundNormGap(
   keypoints: {x: number; y: number; v: number}[],
@@ -1018,11 +1030,13 @@ function getHeadToGroundNormGap(
     const p = keypoints[i];
     if (p) byId.set(id, p);
   });
-  const heel = side === 'left' ? byId.get(17) : byId.get(18);
-  const toe = side === 'left' ? byId.get(19) : byId.get(20);
-  if (!heel || !toe) return null;
-  if (Math.min(heel.v, toe.v) < visibilityThreshold) return null;
-  const groundY = Math.max(heel.y, toe.y);
+  const ankle = side === 'left' ? byId.get(15) : byId.get(16);
+  const otherAnkle = side === 'left' ? byId.get(16) : byId.get(15);
+  const candidates = [ankle, otherAnkle].filter(
+    (p): p is {x: number; y: number; v: number} => !!p && p.v >= visibilityThreshold,
+  );
+  if (candidates.length === 0) return null;
+  const groundY = Math.max(...candidates.map((p) => p.y));
   const g = groundY - ny;
   return g > 1e-9 ? g : null;
 }
@@ -1268,10 +1282,26 @@ export default function App() {
   const [primaryFacingDirection, setPrimaryFacingDirection] = useState<FacingDirection>('right');
   const [compareFacingDirection, setCompareFacingDirection] = useState<FacingDirection>('right');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('stride');
-  const poseDetectorRef = useRef<poseDetection.PoseDetector | null>(null);
-  /** Reused frame buffer so BlazePose sees correct canvas dimensions for video. */
+  const [golfCamera, setGolfCamera] = useState<GolfCamera>('face-on');
+  const [golfHandedness, setGolfHandedness] = useState<GolfHandedness>('right');
+  const [golfMetrics, setGolfMetrics] = useState<GolfFrontalMetrics | null>(null);
+  const [rtmposeVariant, setRtmposeVariant] = useState<RtmposeVariant>('s');
+  const [poseEngineLabel, setPoseEngineLabel] = useState('');
+  const golfSessionRef = useRef(new GolfSession('right', 'face-on'));
+  const golfClubPrevRef = useRef<{x: number; y: number} | null>(null);
+  const analysisModeRef = useRef(analysisMode);
+  analysisModeRef.current = analysisMode;
+  const golfHandednessRef = useRef(golfHandedness);
+  golfHandednessRef.current = golfHandedness;
+  const golfCameraRef = useRef(golfCamera);
+  golfCameraRef.current = golfCamera;
+  const rtmposeClientRef = useRef<RtmposeClient | null>(null);
+  const primarySmoothRef = useRef(new KeypointOneEuroFilter(COCO_KEYPOINT_COUNT));
+  const compareSmoothRef = useRef(new KeypointOneEuroFilter(COCO_KEYPOINT_COUNT));
+  /** Reused frame buffer so pose inference sees intrinsic video pixel size. */
   const poseFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const poseRafRef = useRef<number | null>(null);
+  const poseRvfcRef = useRef<{video: HTMLVideoElement; handle: number} | null>(null);
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
   const [poseStatus, setPoseStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const poseCacheRef = useRef<{time: number; keypoints: {x: number; y: number; v: number}[]}[]>([]);
@@ -1738,9 +1768,13 @@ export default function App() {
         cancelAnimationFrame(poseRafRef.current);
         poseRafRef.current = null;
       }
+      if (poseRvfcRef.current) {
+        poseRvfcRef.current.video.cancelVideoFrameCallback?.(poseRvfcRef.current.handle);
+        poseRvfcRef.current = null;
+      }
       analysisAbortRef.current = true;
-      poseDetectorRef.current?.dispose();
-      poseDetectorRef.current = null;
+      rtmposeClientRef.current?.stop();
+      rtmposeClientRef.current = null;
     };
   }, []);
 
@@ -1758,13 +1792,30 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!poseEnabled || (!videoSrc && !imageSrc && !compareVideoSrc && !compareImageSrc)) {
-      setPoseKeypoints([]);
-      setComparePoseKeypoints([]);
+    rtmposeClientRef.current?.stop();
+    rtmposeClientRef.current = null;
+    primarySmoothRef.current.reset();
+    compareSmoothRef.current.reset();
+    setPoseStatus('idle');
+    setPoseEngineLabel('');
+  }, [rtmposeVariant]);
+
+  useEffect(() => {
+    const stopLiveLoop = () => {
       if (poseRafRef.current !== null) {
         cancelAnimationFrame(poseRafRef.current);
         poseRafRef.current = null;
       }
+      if (poseRvfcRef.current) {
+        poseRvfcRef.current.video.cancelVideoFrameCallback?.(poseRvfcRef.current.handle);
+        poseRvfcRef.current = null;
+      }
+    };
+
+    if (!poseEnabled || (!videoSrc && !imageSrc && !compareVideoSrc && !compareImageSrc)) {
+      setPoseKeypoints([]);
+      setComparePoseKeypoints([]);
+      stopLiveLoop();
       return;
     }
 
@@ -1775,60 +1826,40 @@ export default function App() {
     let lastCompareInferenceTs = 0;
     const minInferenceIntervalMs = 1000 / POSE_INFERENCE_HZ;
 
-    const ensureDetector = async () => {
-      if (poseDetectorRef.current) return poseDetectorRef.current;
+    const ensureClient = async () => {
+      if (rtmposeClientRef.current) return rtmposeClientRef.current;
       setPoseStatus('loading');
-      if (tf.getBackend() !== 'webgl') {
-        try {
-          await tf.setBackend('webgl');
-        } catch {
-          // Fallback to whichever backend tfjs can initialize.
-        }
-      }
-      await tf.ready();
-      const detector = await poseDetection.createDetector(
-        poseDetection.SupportedModels.BlazePose,
-        {
-          runtime: 'tfjs',
-          modelType: 'full',
-          enableSmoothing: true,
+      const client = new RtmposeClient({
+        variant: rtmposeVariant,
+        onReady: ({executionProvider, inputWidth, inputHeight}) => {
+          setPoseEngineLabel(
+            `RTMPose-${rtmposeVariant} · ${executionProvider} · ${inputWidth}×${inputHeight}`,
+          );
         },
-      );
-      poseDetectorRef.current = detector;
+        onError: (message) => {
+          console.error('RTMPose worker:', message);
+        },
+      });
+      await client.start();
+      rtmposeClientRef.current = client;
       setPoseStatus('ready');
-      return detector;
+      return client;
     };
 
-    const updatePoseFromResult = (
-      poses: poseDetection.Pose[] | null | undefined,
-      source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null,
+    const applyPoseFrame = (
+      pose: PoseFrame,
       setter: (next: {x: number; y: number; v: number}[]) => void,
       autoDetectFacing = false,
       onDetectFacing?: (facing: FacingDirection) => void,
       onDetectSide?: (side: KneeSide) => void,
+      golfTime = 0,
+      applyGolf = false,
     ) => {
-      const keypoints = poses?.[0]?.keypoints;
-      const sourceWidth =
-        source instanceof HTMLCanvasElement
-          ? source.width
-          : source instanceof HTMLVideoElement
-            ? source.videoWidth
-            : source instanceof HTMLImageElement
-              ? source.naturalWidth
-              : 0;
-      const sourceHeight =
-        source instanceof HTMLCanvasElement
-          ? source.height
-          : source instanceof HTMLVideoElement
-            ? source.videoHeight
-            : source instanceof HTMLImageElement
-              ? source.naturalHeight
-              : 0;
-      if (!keypoints || keypoints.length === 0 || sourceWidth <= 0 || sourceHeight <= 0) {
+      const selected = poseFrameToTracked(pose, POSE_TRACKED_IDS);
+      if (!trackedHasVisible(selected, MIN_POSE_VISIBILITY)) {
         setter([]);
         return;
       }
-      const selected = keypointsFromBlazePoseOutput(keypoints, sourceWidth, sourceHeight);
       setter(selected);
       if (autoDetectFacing) {
         const detected = detectFacingFromKeypoints(selected);
@@ -1837,11 +1868,49 @@ export default function App() {
           onDetectSide?.(facingDirectionToLeg(detected));
         }
       }
+      if (applyGolf && analysisModeRef.current === 'golf') {
+        const cocoPx = trackedPoseToCoco(selected, POSE_TRACKED_IDS, pose.width, pose.height);
+        golfSessionRef.current.setHandedness(golfHandednessRef.current);
+        golfSessionRef.current.setCamera(golfCameraRef.current);
+        const rawClub = pose.clubHead
+          ? {
+              x: pose.clubHead.x,
+              y: pose.clubHead.y,
+              score: pose.clubHead.score,
+              gripX: pose.clubHead.gripX,
+              gripY: pose.clubHead.gripY,
+              method: pose.clubHead.method,
+            }
+          : undefined;
+        if (rawClub) golfClubPrevRef.current = {x: rawClub.x, y: rawClub.y};
+        setGolfMetrics(golfSessionRef.current.update(cocoPx, rawClub, golfTime));
+      }
     };
+
+    const inferSource = async (
+      client: RtmposeClient,
+      source: HTMLCanvasElement | HTMLImageElement | HTMLVideoElement,
+      mediaTime: number,
+      trackClubHead: boolean,
+      smoother?: KeypointOneEuroFilter,
+    ): Promise<PoseFrame | null> => {
+      if (!poseFrameCanvasRef.current) {
+        poseFrameCanvasRef.current = document.createElement('canvas');
+      }
+      const bitmap = await mediaToBitmap(source, poseFrameCanvasRef.current);
+      if (!bitmap) return null;
+      const pose = await client.inferOnce(bitmap, mediaTime, {
+        trackClubHead,
+        leadIsLeft: golfHandednessRef.current === 'right',
+      });
+      return smoother ? smoothPoseFrame(smoother, pose) : pose;
+    };
+
+    let liveCleanup: (() => void) | undefined;
 
     const run = async () => {
       try {
-        const detector = await ensureDetector();
+        const client = await ensureClient();
         if (cancelled) return;
 
         const primaryVideo = videoRef.current;
@@ -1849,27 +1918,30 @@ export default function App() {
         const primaryImage = imageRef.current;
         const compareImage = compareImageRef.current;
         const hasAnyVideo = (!!videoSrc && !!primaryVideo) || (!!compareVideoSrc && !!compareVideo);
+        const trackClub = () => analysisModeRef.current === 'golf';
+        let submittingLive = false;
+        let removeMediaListeners = () => {};
 
         if (!hasAnyVideo) {
           if (imageSrc && primaryImage) {
-            const result = await detector.estimatePoses(primaryImage, {flipHorizontal: false});
-            if (!cancelled) {
-              updatePoseFromResult(
-                result,
-                primaryImage,
+            const pose = await inferSource(client, primaryImage, 0, trackClub(), primarySmoothRef.current);
+            if (!cancelled && pose) {
+              applyPoseFrame(
+                pose,
                 setPoseKeypoints,
                 true,
                 setPrimaryFacingDirection,
                 setKneeTrackingSide,
+                0,
+                true,
               );
             }
           }
           if (compareImageSrc && compareImage) {
-            const result = await detector.estimatePoses(compareImage, {flipHorizontal: false});
-            if (!cancelled) {
-              updatePoseFromResult(
-                result,
-                compareImage,
+            const pose = await inferSource(client, compareImage, 0, false, compareSmoothRef.current);
+            if (!cancelled && pose) {
+              applyPoseFrame(
+                pose,
                 setComparePoseKeypoints,
                 true,
                 setCompareFacingDirection,
@@ -1881,25 +1953,24 @@ export default function App() {
         }
 
         if (imageSrc && primaryImage) {
-          // Primary is an image: detect once and keep it.
-          const result = await detector.estimatePoses(primaryImage, {flipHorizontal: false});
-          if (!cancelled) {
-            updatePoseFromResult(
-              result,
-              primaryImage,
+          const pose = await inferSource(client, primaryImage, 0, trackClub(), primarySmoothRef.current);
+          if (!cancelled && pose) {
+            applyPoseFrame(
+              pose,
               setPoseKeypoints,
               true,
               setPrimaryFacingDirection,
               setKneeTrackingSide,
+              0,
+              true,
             );
           }
         }
         if (compareImageSrc && compareImage) {
-          const result = await detector.estimatePoses(compareImage, {flipHorizontal: false});
-          if (!cancelled) {
-            updatePoseFromResult(
-              result,
-              compareImage,
+          const pose = await inferSource(client, compareImage, 0, false, compareSmoothRef.current);
+          if (!cancelled && pose) {
+            applyPoseFrame(
+              pose,
               setComparePoseKeypoints,
               true,
               setCompareFacingDirection,
@@ -1908,72 +1979,138 @@ export default function App() {
           }
         }
 
-        const tick = async () => {
-          if (cancelled) return;
-          const now = performance.now();
-          if (!poseFrameCanvasRef.current) {
-            poseFrameCanvasRef.current = document.createElement('canvas');
-          }
-          const frameCanvas = poseFrameCanvasRef.current;
-
-          if (videoSrc && primaryVideo) {
-            const v = primaryVideo;
-            if (
-              v.readyState >= 2 &&
-              (v.currentTime !== lastPrimaryVideoTime || !v.paused) &&
-              now - lastPrimaryInferenceTs >= minInferenceIntervalMs
-            ) {
-              lastPrimaryVideoTime = v.currentTime;
-              lastPrimaryInferenceTs = now;
-              const blazeposeInput = blazeposeVideoFrameCanvas(v, frameCanvas);
-              if (blazeposeInput) {
-                const result = await detector.estimatePoses(blazeposeInput, {flipHorizontal: false});
-                if (!cancelled) {
-                  updatePoseFromResult(
-                    result,
-                    blazeposeInput,
-                    setPoseKeypoints,
-                    true,
-                    setPrimaryFacingDirection,
-                    setKneeTrackingSide,
-                  );
-                }
-              }
+        const maybeInferVideo = (
+          video: HTMLVideoElement,
+          lastTime: {value: number},
+          lastTs: {value: number},
+          smoother: KeypointOneEuroFilter,
+          apply: (pose: PoseFrame) => void,
+          trackClubHead: boolean,
+          now: number,
+        ) => {
+          if (client.isBusy || submittingLive) return;
+          if (video.readyState < 2) return;
+          if (video.currentTime === lastTime.value && video.paused) return;
+          if (now - lastTs.value < minInferenceIntervalMs) return;
+          lastTime.value = video.currentTime;
+          lastTs.value = now;
+          submittingLive = true;
+          void (async () => {
+            try {
+              const pose = await inferSource(client, video, video.currentTime, trackClubHead, smoother);
+              if (!cancelled && pose) apply(pose);
+            } catch (err) {
+              if (!cancelled) console.error('RTMPose frame failed:', err);
+            } finally {
+              submittingLive = false;
             }
-          }
-
-          if (compareVideoSrc && compareVideo) {
-            const v = compareVideo;
-            if (
-              v.readyState >= 2 &&
-              (v.currentTime !== lastCompareVideoTime || !v.paused) &&
-              now - lastCompareInferenceTs >= minInferenceIntervalMs
-            ) {
-              lastCompareVideoTime = v.currentTime;
-              lastCompareInferenceTs = now;
-              const blazeposeInput = blazeposeVideoFrameCanvas(v, frameCanvas);
-              if (blazeposeInput) {
-                const result = await detector.estimatePoses(blazeposeInput, {flipHorizontal: false});
-                if (!cancelled) {
-                  updatePoseFromResult(
-                    result,
-                    blazeposeInput,
-                    setComparePoseKeypoints,
-                    true,
-                    setCompareFacingDirection,
-                    setCompareKneeTrackingSide,
-                  );
-                }
-              }
-            }
-          }
-
-          poseRafRef.current = requestAnimationFrame(tick);
+          })();
         };
 
-        tick();
+        const primaryLastTime = {value: lastPrimaryVideoTime};
+        const primaryLastTs = {value: lastPrimaryInferenceTs};
+        const compareLastTime = {value: lastCompareVideoTime};
+        const compareLastTs = {value: lastCompareInferenceTs};
+
+        const tick = () => {
+          if (cancelled) return;
+          const now = performance.now();
+          if (videoSrc && primaryVideo) {
+            maybeInferVideo(
+              primaryVideo,
+              primaryLastTime,
+              primaryLastTs,
+              primarySmoothRef.current,
+              (pose) =>
+                applyPoseFrame(
+                  pose,
+                  setPoseKeypoints,
+                  true,
+                  setPrimaryFacingDirection,
+                  setKneeTrackingSide,
+                  primaryVideo.currentTime,
+                  true,
+                ),
+              trackClub(),
+              now,
+            );
+          }
+          if (compareVideoSrc && compareVideo) {
+            maybeInferVideo(
+              compareVideo,
+              compareLastTime,
+              compareLastTs,
+              compareSmoothRef.current,
+              (pose) =>
+                applyPoseFrame(
+                  pose,
+                  setComparePoseKeypoints,
+                  true,
+                  setCompareFacingDirection,
+                  setCompareKneeTrackingSide,
+                ),
+              false,
+              now,
+            );
+          }
+        };
+
+        const schedule = () => {
+          if (cancelled) return;
+          tick();
+          const playingPrimary = !!primaryVideo && !primaryVideo.paused && !primaryVideo.ended;
+          if (
+            playingPrimary &&
+            primaryVideo &&
+            typeof primaryVideo.requestVideoFrameCallback === 'function'
+          ) {
+            const onFrame = () => {
+              if (cancelled) return;
+              tick();
+              poseRvfcRef.current = {
+                video: primaryVideo,
+                handle: primaryVideo.requestVideoFrameCallback(onFrame),
+              };
+            };
+            poseRvfcRef.current = {
+              video: primaryVideo,
+              handle: primaryVideo.requestVideoFrameCallback(onFrame),
+            };
+            return;
+          }
+          poseRafRef.current = requestAnimationFrame(schedule);
+        };
+
+        const onPlay = () => {
+          stopLiveLoop();
+          schedule();
+        };
+        const onPauseOrSeek = () => {
+          stopLiveLoop();
+          tick();
+          poseRafRef.current = requestAnimationFrame(schedule);
+        };
+
+        primaryVideo?.addEventListener('play', onPlay);
+        primaryVideo?.addEventListener('pause', onPauseOrSeek);
+        primaryVideo?.addEventListener('seeked', onPauseOrSeek);
+        compareVideo?.addEventListener('play', onPlay);
+        compareVideo?.addEventListener('pause', onPauseOrSeek);
+        compareVideo?.addEventListener('seeked', onPauseOrSeek);
+
+        schedule();
+
+        removeMediaListeners = () => {
+          primaryVideo?.removeEventListener('play', onPlay);
+          primaryVideo?.removeEventListener('pause', onPauseOrSeek);
+          primaryVideo?.removeEventListener('seeked', onPauseOrSeek);
+          compareVideo?.removeEventListener('play', onPlay);
+          compareVideo?.removeEventListener('pause', onPauseOrSeek);
+          compareVideo?.removeEventListener('seeked', onPauseOrSeek);
+        };
+        liveCleanup = removeMediaListeners;
       } catch (e) {
-        console.error('Pose detector failed:', e);
+        console.error('RTMPose failed to start:', e);
         if (!cancelled) setPoseStatus('error');
       }
     };
@@ -1982,12 +2119,10 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      if (poseRafRef.current !== null) {
-        cancelAnimationFrame(poseRafRef.current);
-        poseRafRef.current = null;
-      }
+      stopLiveLoop();
+      liveCleanup?.();
     };
-  }, [poseEnabled, videoSrc, imageSrc, compareVideoSrc, compareImageSrc]);
+  }, [poseEnabled, videoSrc, imageSrc, compareVideoSrc, compareImageSrc, analysisMode, golfHandedness, rtmposeVariant]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -2046,6 +2181,7 @@ export default function App() {
         });
 
         ctx.save();
+        const golfMode = analysisMode === 'golf';
         const trackedIds = kneeTrackingSide === 'left' ? POSE_LEFT_SIDE_IDS : POSE_RIGHT_SIDE_IDS;
         const isTrackedConnection = (aId: number, bId: number) =>
           trackedIds.has(aId) && trackedIds.has(bId);
@@ -2061,8 +2197,20 @@ export default function App() {
           const head = isHeadConnection(aId, bId);
           const arm = isArmConnection(aId, bId);
           const tracked = !arm && !head && isTrackedConnection(aId, bId);
-          ctx.strokeStyle = head ? 'rgba(0,210,255,0.15)' : arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
-          ctx.lineWidth = head ? 1 : arm ? 1 : tracked ? 3 : 1.5;
+          ctx.strokeStyle = golfMode
+            ? arm
+              ? '#00d2ff'
+              : head
+                ? 'rgba(0,210,255,0.35)'
+                : '#00d2ff'
+            : head
+              ? 'rgba(0,210,255,0.15)'
+              : arm
+                ? 'rgba(0,210,255,0.15)'
+                : tracked
+                  ? '#00d2ff'
+                  : 'rgba(0,210,255,0.25)';
+          ctx.lineWidth = golfMode ? (head ? 1.5 : 2.5) : head ? 1 : arm ? 1 : tracked ? 3 : 1.5;
           const aPx = mapPoseNormToCanvasOverlayPx(a.x, a.y, videoRef.current ?? imageRef.current, canvasRef.current);
           const bPx = mapPoseNormToCanvasOverlayPx(b.x, b.y, videoRef.current ?? imageRef.current, canvasRef.current);
           ctx.beginPath();
@@ -2076,12 +2224,47 @@ export default function App() {
           const arm = POSE_ARM_IDS.has(id);
           const nose = id === POSE_NOSE_ID;
           const tracked = !arm && !nose && trackedIds.has(id);
-          ctx.fillStyle = nose ? 'rgba(0,210,255,0.4)' : arm ? 'rgba(0,210,255,0.15)' : tracked ? '#00d2ff' : 'rgba(0,210,255,0.25)';
+          ctx.fillStyle = golfMode
+            ? arm || nose
+              ? '#00d2ff'
+              : '#00d2ff'
+            : nose
+              ? 'rgba(0,210,255,0.4)'
+              : arm
+                ? 'rgba(0,210,255,0.15)'
+                : tracked
+                  ? '#00d2ff'
+                  : 'rgba(0,210,255,0.25)';
           const o = mapPoseNormToCanvasOverlayPx(p.x, p.y, videoRef.current ?? imageRef.current, canvasRef.current);
           ctx.beginPath();
-          ctx.arc(o.x, o.y, nose ? 3 : arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
+          ctx.arc(o.x, o.y, golfMode ? (nose ? 3.5 : 4) : nose ? 3 : arm ? 2.5 : tracked ? 5 : 3.5, 0, Math.PI * 2);
           ctx.fill();
         });
+        if (golfMode && golfMetrics) {
+          const media = videoRef.current ?? imageRef.current;
+          const srcW =
+            media instanceof HTMLVideoElement
+              ? media.videoWidth
+              : media instanceof HTMLImageElement
+                ? media.naturalWidth
+                : 0;
+          const srcH =
+            media instanceof HTMLVideoElement
+              ? media.videoHeight
+              : media instanceof HTMLImageElement
+                ? media.naturalHeight
+                : 0;
+          const mapper = (xn: number, yn: number) =>
+            mapPoseNormToCanvasOverlayPx(xn, yn, media, canvasRef.current);
+          const overlayCoco = trackedPoseToCoco(overlayKps, POSE_TRACKED_IDS);
+          for (const p of overlayCoco) {
+            if (p.score < 0.25) continue;
+            const o = mapper(p.x, p.y);
+            p.x = o.x;
+            p.y = o.y;
+          }
+          drawGolfOverlay(ctx, overlayCoco, mapMetricsToOverlay(golfMetrics, mapper, srcW, srcH));
+        }
         ctx.restore();
       }
 
@@ -2144,7 +2327,7 @@ export default function App() {
         if (rafId !== null) cancelAnimationFrame(rafId);
       };
     }
-  }, [measurements, videoSrc, imageSrc, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints, accentId, kneeTrackingSide, currentTime]);
+  }, [measurements, videoSrc, imageSrc, mediaLayoutVersion, appliedZoom, poseEnabled, poseKeypoints, accentId, kneeTrackingSide, currentTime, analysisMode, golfMetrics]);
 
   // Compare panel pose overlay (independent from primary zoom/pan)
   useEffect(() => {
@@ -2403,8 +2586,8 @@ export default function App() {
     const bgVideo = bgVideoRef.current;
     const mainVideo = videoRef.current;
     if (!bgVideo || !mainVideo) return;
-    const detector = poseDetectorRef.current;
-    if (!detector) return;
+    const client = rtmposeClientRef.current;
+    if (!client) return;
 
     const targetDuration = Math.max(getReliableVideoDuration(mainVideo), mainVideo.duration || 0, 0);
     if (targetDuration <= 0) return;
@@ -2549,17 +2732,19 @@ export default function App() {
           });
         }
 
-        const blazeposeInput = blazeposeVideoFrameCanvas(sourceVideo, analysisPoseCanvas);
         let normalized: {x: number; y: number; v: number}[] = [];
-        if (blazeposeInput) {
-          const result = await detector.estimatePoses(blazeposeInput, {flipHorizontal: false});
-          if (isStale()) break;
-          const keypoints = result?.[0]?.keypoints;
-          const w = blazeposeInput.width;
-          const h = blazeposeInput.height;
-          if (keypoints && keypoints.length > 0 && w > 0 && h > 0) {
-            normalized = keypointsFromBlazePoseOutput(keypoints, w, h);
+        try {
+          const bitmap = await mediaToBitmap(sourceVideo, analysisPoseCanvas);
+          if (bitmap) {
+            const pose = await client.inferOnce(bitmap, t, {trackClubHead: false});
+            if (isStale()) break;
+            const mapped = poseFrameToTracked(pose, POSE_TRACKED_IDS);
+            if (trackedHasVisible(mapped, MIN_POSE_VISIBILITY)) {
+              normalized = mapped;
+            }
           }
+        } catch {
+          normalized = [];
         }
         cache.push({time: t, keypoints: normalized});
 
@@ -2684,7 +2869,7 @@ export default function App() {
       return;
     }
     if (poseStatus !== 'ready') return;
-    if (!poseDetectorRef.current || !videoRef.current || !bgVideoRef.current) return;
+    if (!rtmposeClientRef.current || !videoRef.current || !bgVideoRef.current) return;
 
     const mainVideo = videoRef.current;
     const targetDuration = Math.max(
@@ -2804,6 +2989,12 @@ export default function App() {
     setAnalysisProgress(null);
     analysisAbortRef.current = true;
     setIsPoseAnalyzing(false);
+    golfSessionRef.current.reset();
+    golfClubPrevRef.current = null;
+    rtmposeClientRef.current?.resetClub();
+    primarySmoothRef.current.reset();
+    compareSmoothRef.current.reset();
+    setGolfMetrics(null);
   }, [videoSrc, imageSrc, compareVideoSrc, compareImageSrc]);
 
   useEffect(() => {
@@ -3470,6 +3661,14 @@ export default function App() {
 
   const handleAnalysisModeSwitch = (mode: AnalysisMode) => {
     setAnalysisMode(mode);
+    if (mode === 'golf') {
+      setPoseEnabled(true);
+      golfSessionRef.current.reset();
+      golfClubPrevRef.current = null;
+      rtmposeClientRef.current?.resetClub();
+      setGolfMetrics(null);
+      return;
+    }
     if (mode === 'squat') {
       setAngleLowerBound(40);
       setAngleUpperBound(120);
@@ -3481,6 +3680,62 @@ export default function App() {
 
   const renderKneeAnglePanel = () => {
     if (!isMediaLoaded) return null;
+
+    const modeSwitcher = (
+      <div className="flex overflow-hidden rounded-md border border-[var(--color-accent)]/20">
+        <button
+          type="button"
+          onClick={() => handleAnalysisModeSwitch('stride')}
+          className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+          title="Stride analysis — track extension peaks"
+        >
+          Stride
+        </button>
+        <button
+          type="button"
+          onClick={() => handleAnalysisModeSwitch('squat')}
+          className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+          title="Squat analysis — track depth valleys and 90° threshold"
+        >
+          Squat
+        </button>
+        <button
+          type="button"
+          onClick={() => handleAnalysisModeSwitch('golf')}
+          className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+          title="Golf analysis — face-on or down-the-line, plus club-head tracking"
+        >
+          Golf
+        </button>
+      </div>
+    );
+
+    if (analysisMode === 'golf') {
+      return (
+        <section className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}>
+          <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+            <h3 className="shrink-0 text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
+              Golf
+            </h3>
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">{modeSwitcher}</div>
+          </div>
+          <GolfPanel
+            metrics={golfMetrics}
+            camera={golfCamera}
+            handedness={golfHandedness}
+            isFullscreen={isFullscreen}
+            onCameraChange={(next) => {
+              setGolfCamera(next);
+              golfSessionRef.current.setCamera(next);
+            }}
+            onHandednessChange={(next) => {
+              setGolfHandedness(next);
+              golfSessionRef.current.setHandedness(next);
+            }}
+          />
+        </section>
+      );
+    }
 
     const isSquat = analysisMode === 'squat';
     const series = kneeAngleSeries;
@@ -3979,6 +4234,14 @@ export default function App() {
                 >
                   Squat
                 </button>
+                <button
+                  type="button"
+                  onClick={() => handleAnalysisModeSwitch('golf')}
+                  className={`px-2 py-1 text-xs transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+                  title="Golf analysis — face-on or down-the-line, plus club-head tracking"
+                >
+                  Golf
+                </button>
               </div>
               {videoSrc ? (
                 <button
@@ -4178,7 +4441,7 @@ export default function App() {
                     <svg width={28} height={10} viewBox="0 0 28 10" className="shrink-0" aria-hidden>
                       <line x1={0} y1={5} x2={28} y2={5} stroke="#facc15" strokeWidth={2} strokeDasharray="4 3" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
                     </svg>
-                    toe @ contact
+                    toe @ contact (n/a)
                   </span>
                 </div>
               )}
@@ -4358,7 +4621,7 @@ export default function App() {
                           <svg width={28} height={10} viewBox="0 0 28 10" className="shrink-0" aria-hidden>
                             <line x1={0} y1={5} x2={28} y2={5} stroke="#facc15" strokeWidth={2} strokeDasharray="4 3" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
                           </svg>
-                          toe @ contact
+                          toe @ contact (n/a)
                         </span>
                       </div>
                     )}
@@ -4435,12 +4698,12 @@ export default function App() {
                 <p className="font-medium text-[var(--color-accent)]" title="Hip–knee–ankle at playhead">
                   Knee angle: {currentKneeAngle !== null ? `${currentKneeAngle.toFixed(1)}°` : '—'}
                 </p>
-                <p className="font-medium text-[var(--color-accent)]" title="Heel–toe vs horizon at playhead">
-                  Toe angle: {formatAngle(primaryToeAtPlayhead)}
+                <p className="font-medium text-[var(--color-accent)]" title="No foot keypoints in RTMPose (COCO-17 has ankles only)">
+                  Toe angle: n/a
                 </p>
                 <p
                   className="font-medium text-[var(--color-accent)]"
-                  title="Nose→foot (lower heel/toe) gap vs median gap in this run (100 ≈ typical)"
+                  title="Nose→ankle gap vs median gap in this run (100 ≈ typical). RTMPose has no heel/toe."
                 >
                   Head vs ground: {currentHeadVerticalPct !== null ? `${currentHeadVerticalPct.toFixed(1)}%` : '—'}
                 </p>
@@ -4449,10 +4712,10 @@ export default function App() {
                 <p title="Mean knee angle at extension peaks (filtered)">
                   Avg at extension: {avgPeakAngle !== null ? `${avgPeakAngle.toFixed(1)}°` : '—'}
                 </p>
-                <p title="Mean toe angle at ground contact (after each peak)">
-                  Avg at contact: {formatAngle(avgContactToeAngle)}
+                <p title="No foot keypoints in RTMPose">
+                  Avg at contact: n/a
                 </p>
-                <p title="Mean head bob per stride as % of mean nose→foot distance in that stride">
+                <p title="Mean head bob per stride as % of mean nose→ankle distance in that stride">
                   Avg movement / stride: {avgHeadMovementPerStridePct !== null ? `${avgHeadMovementPerStridePct.toFixed(1)}%` : '—'}
                 </p>
               </div>
@@ -4463,12 +4726,12 @@ export default function App() {
                   <p className="font-medium text-[var(--color-accent)]" title="Hip–knee–ankle at playhead">
                     Knee angle: {compareCurrentKneeAngle !== null ? `${compareCurrentKneeAngle.toFixed(1)}°` : '—'}
                   </p>
-                  <p className="font-medium text-[var(--color-accent)]" title="Heel–toe vs horizon at playhead">
-                    Toe angle: {formatAngle(compareToeAtPlayhead)}
+                  <p className="font-medium text-[var(--color-accent)]" title="No foot keypoints in RTMPose (COCO-17 has ankles only)">
+                    Toe angle: n/a
                   </p>
                   <p
                     className="font-medium text-[var(--color-accent)]"
-                    title="Nose→foot (lower heel/toe) gap vs median gap in this run (100 ≈ typical)"
+                    title="Nose→ankle gap vs median gap in this run (100 ≈ typical). RTMPose has no heel/toe."
                   >
                     Head vs ground: {compareCurrentHeadVerticalPct !== null ? `${compareCurrentHeadVerticalPct.toFixed(1)}%` : '—'}
                   </p>
@@ -4477,10 +4740,10 @@ export default function App() {
                   <p title="Mean knee angle at extension peaks (filtered)">
                     Avg at extension: {compareStats?.avgPeakAngle !== null && compareStats?.avgPeakAngle !== undefined ? `${compareStats.avgPeakAngle.toFixed(1)}°` : '—'}
                   </p>
-                  <p title="Mean toe angle at ground contact (after each peak)">
-                    Avg at contact: {formatAngle(compareAvgContactToeAngle)}
+                  <p title="No foot keypoints in RTMPose">
+                    Avg at contact: n/a
                   </p>
-                  <p title="Mean head bob per stride as % of mean nose→foot distance in that stride">
+                  <p title="Mean head bob per stride as % of mean nose→ankle distance in that stride">
                     Avg movement / stride: {compareAvgHeadMovementPerStridePct !== null ? `${compareAvgHeadMovementPerStridePct.toFixed(1)}%` : '—'}
                   </p>
                 </div>
@@ -4528,17 +4791,17 @@ export default function App() {
               <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
                 <p className="font-semibold text-[var(--color-accent)]">Toe @ ground contact</p>
                 <p className="opacity-75">
-                  Acute heel–toe vs horizon at contact (first knee flex after each peak). Average is over contacts.
+                  No foot keypoints in RTMPose (COCO-17). Heel/toe angle is not estimated from ankles.
                 </p>
-                <p className="mt-1 font-mono opacity-60">heel ●──→ toe vs ────</p>
+                <p className="mt-1 font-mono opacity-60">n/a · ankles only</p>
               </div>
               <div className="rounded border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/50 p-2">
                 <p className="font-semibold text-[var(--color-accent)]">Head vs ground / stride</p>
                 <p className="opacity-75">
-                  Ground = lowest heel/toe Y (same as toe calc). Head vs ground compares nose→foot gap to the median gap
-                  in this clip. Movement per stride is head bob divided by mean nose→foot distance within that stride.
+                  Ground = ankle Y (lowest COCO-17 landmark). Head vs ground compares nose→ankle gap to the median gap
+                  in this clip. Movement per stride is head bob divided by mean nose→ankle distance within that stride.
                 </p>
-                <p className="mt-1 font-mono opacity-60">nose→foot gap · bob / gap</p>
+                <p className="mt-1 font-mono opacity-60">nose→ankle gap · bob / gap</p>
               </div>
             </div>
           )}
@@ -4741,7 +5004,7 @@ export default function App() {
           onClick={() => setPoseEnabled((v) => !v)}
           disabled={!isMediaLoaded}
           className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title="Toggle pose overlay"
+          title={poseEnabled ? (poseEngineLabel || 'Toggle pose overlay') : 'Toggle pose overlay (RTMPose)'}
           aria-label="Toggle pose overlay"
         >
           <Activity className="w-5 h-5" />
@@ -4796,7 +5059,10 @@ export default function App() {
         <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
           Form Analyzer
         </h1>
-        <SettingsMenu />
+        <SettingsMenu
+          rtmposeVariant={rtmposeVariant}
+          onRtmposeVariantChange={setRtmposeVariant}
+        />
       </header>
 
       <main className="grid gap-6 px-4 pt-3 pb-12 md:px-8 md:pt-5">

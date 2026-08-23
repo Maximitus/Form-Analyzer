@@ -4,8 +4,15 @@
 import {useEffect, useState} from 'react';
 import {Moon, Settings, Sun} from 'lucide-react';
 import {ACCENT_PRESETS, type AccentPresetId, useTheme} from './theme';
+import type {RtmposeVariant} from './types/pose';
 
-export default function SettingsMenu() {
+export default function SettingsMenu({
+  rtmposeVariant = 's',
+  onRtmposeVariantChange,
+}: {
+  rtmposeVariant?: RtmposeVariant;
+  onRtmposeVariantChange?: (variant: RtmposeVariant) => void;
+}) {
   const {theme, setTheme, accentId, setAccentId} = useTheme();
   const [open, setOpen] = useState(false);
 
@@ -117,6 +124,39 @@ export default function SettingsMenu() {
                   })}
                 </div>
               </div>
+
+              {onRtmposeVariantChange && (
+                <div>
+                  <p className="mb-3 text-sm text-[#9ca3af]">Pose model (RTMPose)</p>
+                  <div className="flex rounded-full bg-[var(--color-surface)] p-1.5">
+                    <button
+                      type="button"
+                      onClick={() => onRtmposeVariantChange('s')}
+                      className={`flex flex-1 items-center justify-center rounded-full py-2.5 text-sm font-medium transition ${
+                        rtmposeVariant === 's'
+                          ? 'bg-[var(--color-accent)] text-white shadow-sm'
+                          : 'text-[var(--color-text-light)]'
+                      }`}
+                    >
+                      S (faster)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRtmposeVariantChange('m')}
+                      className={`flex flex-1 items-center justify-center rounded-full py-2.5 text-sm font-medium transition ${
+                        rtmposeVariant === 'm'
+                          ? 'bg-[var(--color-accent)] text-white shadow-sm'
+                          : 'text-[var(--color-text-light)]'
+                      }`}
+                    >
+                      M (more accurate)
+                    </button>
+                  </div>
+                  <p className="mt-2 text-xs text-[#9ca3af]">
+                    COCO-17 body keypoints via ONNX Runtime Web. No heel/toe landmarks.
+                  </p>
+                </div>
+              )}
             </div>
 
             <button
