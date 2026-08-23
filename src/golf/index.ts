@@ -2,6 +2,8 @@ export {estimateClubHead} from './clubHead';
 export {GolfPanel} from './GolfPanel';
 export {drawGolfOverlay} from './overlay';
 export {computeGolfFrontalMetrics} from './metrics';
+export {buildGolfSwingReport, formatEventTime} from './report';
+export type {GolfSwingEvent, GolfSwingEventId, GolfSwingReport} from './report';
 export {GolfSession} from './session';
 export {clubLandmarksFromCoco, mapMetricsToOverlay, mapPoint, trackedPoseToCoco} from './fromTrackedPose';
 export {GOLF_CAMERA_LABEL, GOLF_PHASE_LABEL} from './types';

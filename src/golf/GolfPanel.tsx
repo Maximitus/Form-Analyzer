@@ -1,13 +1,18 @@
 import {formatAngle, formatSignedAngle} from './kinematics';
-import {GOLF_CAMERA_LABEL, GOLF_PHASE_LABEL} from './types';
+import {formatEventTime} from './report';
+import {GOLF_CAMERA_LABEL} from './types';
 import type {GolfCamera, GolfFrontalMetrics, GolfHandedness} from './types';
+import type {GolfSwingReport} from './report';
 
 interface GolfPanelProps {
   metrics: GolfFrontalMetrics | null;
+  report: GolfSwingReport | null;
   camera: GolfCamera;
   handedness: GolfHandedness;
+  currentTime?: number;
   onCameraChange: (camera: GolfCamera) => void;
   onHandednessChange: (handedness: GolfHandedness) => void;
+  onJumpToTime?: (time: number) => void;
   isFullscreen?: boolean;
 }
 
@@ -21,16 +26,26 @@ function Metric({label, value, title}: {label: string; value: string; title?: st
 
 export function GolfPanel({
   metrics,
+  report,
   camera,
   handedness,
+  currentTime,
   onCameraChange,
   onHandednessChange,
+  onJumpToTime,
   isFullscreen = false,
 }: GolfPanelProps) {
   const faceOn = camera === 'face-on';
   const box = `rounded-md border p-2.5 ${
-    isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'
+    isFullscreen ? 'border-[var(--color-accent)]/15 bg-black/35' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]/40'
   }`;
+  const activeEventId = (() => {
+    if (!report || report.events.length === 0 || currentTime == null) return null;
+    const nearest = report.events.reduce((best, event) =>
+      Math.abs(event.time - currentTime) < Math.abs(best.time - currentTime) ? event : best,
+    );
+    return Math.abs(nearest.time - currentTime) <= 0.12 ? nearest.id : null;
+  })();
 
   return (
     <div className="mt-2 grid gap-2">
@@ -89,100 +104,60 @@ export function GolfPanel({
         </div>
       </div>
 
-      <p className="text-[11px] text-[var(--color-text-light)]">
-        {GOLF_CAMERA_LABEL[camera]}. Play or scrub to sample pose. Club head is a wrist-guided search —
-        the pose model only outputs body landmarks.
-      </p>
+      {!isFullscreen ? (
+        <p className="text-[11px] text-[var(--color-text-light)]">
+          {GOLF_CAMERA_LABEL[camera]}. Press Scrub next to play to mark address, top, impact, and finish, then get one
+          overall read — not per-frame tips.
+        </p>
+      ) : null}
 
       <div className={box}>
-        {!metrics ? (
-          <p className="text-xs text-[var(--color-text-light)]">Enable pose and play the video to collect golf samples.</p>
+        <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
+          Swing key points
+        </p>
+        {!report || report.events.length === 0 ? (
+          <p className="text-xs text-[var(--color-text-light)]">
+            {report?.summary ?? 'Scrub a swing to identify address, top, impact, and follow-through.'}
+          </p>
         ) : (
-          <>
-            <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
-              <Metric
-                label="Phase"
-                value={`${GOLF_PHASE_LABEL[metrics.phase]}${metrics.calibrated ? '' : ' · calibrating'}`}
-              />
-              <Metric label="Lead" value={`${metrics.leadSide} (${metrics.handedness}-handed)`} />
-              <Metric
-                label={faceOn ? 'Shoulder tilt' : 'Shoulder line'}
-                value={formatSignedAngle(metrics.shoulderTiltDeg)}
-                title="Anatomical left high is positive"
-              />
-              <Metric
-                label={faceOn ? 'Pelvic tilt' : 'Pelvic line'}
-                value={formatSignedAngle(metrics.pelvicTiltDeg)}
-              />
-              <Metric
-                label={faceOn ? 'Side-bend' : 'Spine vs vertical'}
-                value={formatSignedAngle(metrics.lateralTrunkFlexionDeg)}
-              />
-              <Metric
-                label={faceOn ? 'Head sway' : 'Head vs ball line'}
-                value={
-                  metrics.headSwayTowardLeadPct === null
-                    ? '—'
-                    : `${metrics.headSwayTowardLeadPct.toFixed(0)}% toward lead`
-                }
-              />
-              <Metric
-                label={faceOn ? 'Hip sway' : 'Hip vs ball line'}
-                value={
-                  metrics.hipSwayTowardLeadPct === null
-                    ? '—'
-                    : `${metrics.hipSwayTowardLeadPct.toFixed(0)}% toward lead`
-                }
-              />
-              <Metric label="Lead knee" value={formatAngle(metrics.leadKneeDeg)} />
-              <Metric label="Trail knee" value={formatAngle(metrics.trailKneeDeg)} />
-              <Metric label="Lead elbow" value={formatAngle(metrics.leadElbowDeg)} />
-              <Metric label="Trail elbow" value={formatAngle(metrics.trailElbowDeg)} />
-              <Metric
-                label="Shaft"
-                value={formatSignedAngle(metrics.shaftFromVerticalDeg)}
-                title="Club shaft vs downward vertical"
-              />
-              <Metric
-                label="Club"
-                value={
-                  !metrics.clubHead
-                    ? '—'
-                    : metrics.clubHead.method === 'image'
-                      ? 'tracked'
-                      : 'shaft prior'
-                }
-              />
-              <Metric
-                label="Club vs midline"
-                value={
-                  metrics.clubHeadTowardLeadPct === null
-                    ? '—'
-                    : `${metrics.clubHeadTowardLeadPct.toFixed(0)}% toward lead`
-                }
-              />
-              <Metric
-                label="Club speed"
-                value={
-                  metrics.clubHeadSpeedPxPerSec === null ? '—' : `${metrics.clubHeadSpeedPxPerSec.toFixed(0)} px/s`
-                }
-              />
-              <Metric
-                label="Stance / shoulders"
-                value={metrics.stanceToShoulderRatio === null ? '—' : `${metrics.stanceToShoulderRatio.toFixed(2)}×`}
-              />
-            </div>
-          </>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            {report.events.map((event) => (
+              <button
+                key={event.id}
+                type="button"
+                onClick={() => onJumpToTime?.(event.time)}
+                className={`rounded-md border p-2 text-left hover:border-[var(--color-accent)]/40 ${
+                  activeEventId === event.id
+                    ? 'border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10'
+                    : 'border-[var(--color-accent)]/15 bg-[var(--color-bg-dark)]/50'
+                }`}
+                title={`Jump to ${event.label}`}
+              >
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-accent)]">
+                  {event.label}
+                </p>
+                <p className="text-xs text-[var(--color-text-light)]">{formatEventTime(event.time)}</p>
+                <p className="mt-1 text-[11px] text-[var(--color-text-light)] opacity-80">
+                  {faceOn ? 'Shoulders' : 'Shoulder line'} {formatSignedAngle(event.metrics.shoulderTiltDeg)}
+                  {' · '}
+                  {faceOn ? 'pelvis' : 'pelvic line'} {formatSignedAngle(event.metrics.pelvicTiltDeg)}
+                </p>
+              </button>
+            ))}
+          </div>
         )}
       </div>
 
-      {metrics && metrics.cues.length > 0 ? (
-        <div className={box}>
-          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
-            Cues
-          </p>
-          <div className="grid gap-2 text-xs text-[var(--color-text-light)] md:grid-cols-2">
-            {metrics.cues.map((cue) => (
+      <div className={box}>
+        <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
+          Overall advice
+        </p>
+        {!report ? (
+          <p className="text-xs text-[var(--color-text-light)]">Scrub the swing first. Advice is based on the key points, not every frame.</p>
+        ) : (
+          <div className="grid gap-2 text-xs text-[var(--color-text-light)]">
+            <p className="opacity-80">{report.summary}</p>
+            {report.advice.map((cue) => (
               <div key={cue.id}>
                 <p
                   className={`font-medium ${
@@ -198,6 +173,20 @@ export function GolfPanel({
                 <p className="opacity-80">{cue.detail}</p>
               </div>
             ))}
+          </div>
+        )}
+      </div>
+
+      {metrics && !isFullscreen ? (
+        <div className={box}>
+          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-light)] opacity-70">
+            Current frame
+          </p>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-[var(--color-text-light)] sm:grid-cols-4">
+            <Metric label={faceOn ? 'Shoulder tilt' : 'Shoulder line'} value={formatSignedAngle(metrics.shoulderTiltDeg)} />
+            <Metric label={faceOn ? 'Pelvic tilt' : 'Pelvic line'} value={formatSignedAngle(metrics.pelvicTiltDeg)} />
+            <Metric label="Lead knee" value={formatAngle(metrics.leadKneeDeg)} />
+            <Metric label="Trail knee" value={formatAngle(metrics.trailKneeDeg)} />
           </div>
         </div>
       ) : null}

@@ -32,6 +32,10 @@ import {
   Video,
   Loader2,
   FastForward,
+  ChevronDown,
+  LineChart,
+  Boxes,
+  Check,
 } from 'lucide-react';
 import SettingsMenu from './SettingsMenu';
 import { useTheme } from './theme';
@@ -46,9 +50,11 @@ import {
   GolfSession,
   mapMetricsToOverlay,
   trackedPoseToCoco,
+  buildGolfSwingReport,
   type GolfCamera,
   type GolfFrontalMetrics,
   type GolfHandedness,
+  type GolfSwingReport,
 } from './golf';
 
 /** Toolbar icon: two rays meeting at a vertex (angle measure). */
@@ -1324,9 +1330,12 @@ export default function App() {
   const [primaryFacingDirection, setPrimaryFacingDirection] = useState<FacingDirection>('right');
   const [compareFacingDirection, setCompareFacingDirection] = useState<FacingDirection>('right');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('stride');
+  const [moduleMenuOpen, setModuleMenuOpen] = useState(false);
+  const moduleMenuRef = useRef<HTMLDivElement>(null);
   const [golfCamera, setGolfCamera] = useState<GolfCamera>('face-on');
   const [golfHandedness, setGolfHandedness] = useState<GolfHandedness>('right');
   const [golfMetrics, setGolfMetrics] = useState<GolfFrontalMetrics | null>(null);
+  const [golfSwingReport, setGolfSwingReport] = useState<GolfSwingReport | null>(null);
   const [rtmposeVariant, setRtmposeVariant] = useState<RtmposeVariant>('s');
   const [poseEngineLabel, setPoseEngineLabel] = useState('');
   const golfSessionRef = useRef(new GolfSession('right', 'face-on'));
@@ -2968,6 +2977,32 @@ export default function App() {
   }, [poseEnabled, poseStatus, videoSrc, graphAnalysisRequested, runFrameByFrameAnalysis, duration]);
 
   useEffect(() => {
+    if (analysisMode !== 'golf' || !poseScrubbed || isPoseAnalyzing) {
+      if (analysisMode !== 'golf') setGolfSwingReport(null);
+      return;
+    }
+    setGolfSwingReport(
+      buildGolfSwingReport(poseCacheRef.current, POSE_TRACKED_IDS, golfHandedness, golfCamera),
+    );
+  }, [analysisMode, poseScrubbed, isPoseAnalyzing, golfHandedness, golfCamera]);
+
+  useEffect(() => {
+    if (!moduleMenuOpen) return;
+    const onPointer = (event: PointerEvent) => {
+      if (!moduleMenuRef.current?.contains(event.target as Node)) setModuleMenuOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setModuleMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointer);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onPointer);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [moduleMenuOpen]);
+
+  useEffect(() => {
     setCompareCurrentTime(0);
     setCompareDuration(0);
     const video = compareVideoRef.current;
@@ -3080,6 +3115,7 @@ export default function App() {
     primarySmoothRef.current.reset();
     compareSmoothRef.current.reset();
     setGolfMetrics(null);
+    setGolfSwingReport(null);
   }, [videoSrc, imageSrc, compareVideoSrc, compareImageSrc]);
 
   useEffect(() => {
@@ -3220,6 +3256,7 @@ export default function App() {
       golfClubPrevRef.current = null;
       rtmposeClientRef.current?.resetClub();
       setGolfMetrics(null);
+      setGolfSwingReport(null);
     }
     setPoseEnabled(true);
     if (videoSrc) {
@@ -3770,6 +3807,8 @@ export default function App() {
   };
 
   const handleAnalysisModeSwitch = (mode: AnalysisMode) => {
+    setModuleMenuOpen(false);
+    if (mode === analysisMode) return;
     setAnalysisMode(mode);
     setShowAnalysis(true);
     if (mode === 'golf') {
@@ -3777,6 +3816,7 @@ export default function App() {
       golfClubPrevRef.current = null;
       rtmposeClientRef.current?.resetClub();
       setGolfMetrics(null);
+      setGolfSwingReport(null);
     } else if (mode === 'squat') {
       setAngleLowerBound(40);
       setAngleUpperBound(120);
@@ -3786,38 +3826,81 @@ export default function App() {
     }
   };
 
-  const renderAnalysisModeSwitcher = () => (
-    <div
-      className="flex overflow-hidden rounded-lg border border-[var(--color-accent)]/30"
-      role="group"
-      aria-label="Analysis mode"
-    >
-      <button
-        type="button"
-        onClick={() => handleAnalysisModeSwitch('stride')}
-        className={`px-3 py-1.5 text-sm transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-        title="Stride analysis — track extension peaks"
-      >
-        Stride
-      </button>
-      <button
-        type="button"
-        onClick={() => handleAnalysisModeSwitch('squat')}
-        className={`px-3 py-1.5 text-sm transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-        title="Squat analysis — track depth valleys and 90° threshold"
-      >
-        Squat
-      </button>
-      <button
-        type="button"
-        onClick={() => handleAnalysisModeSwitch('golf')}
-        className={`px-3 py-1.5 text-sm transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
-        title="Golf analysis — face-on or down-the-line, plus club-head tracking"
-      >
-        Golf
-      </button>
-    </div>
-  );
+  const jumpToVideoTime = (time: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    setIsPlaying(false);
+    video.currentTime = Math.max(0, time);
+    setCurrentTime(video.currentTime);
+  };
+
+  const ANALYSIS_MODE_OPTIONS: {value: AnalysisMode; label: string; hint: string}[] = [
+    {value: 'stride', label: 'Stride', hint: 'Running gait — extension peaks'},
+    {value: 'squat', label: 'Squat', hint: 'Depth valleys and 90° threshold'},
+    {value: 'golf', label: 'Golf', hint: 'Swing key points and overall advice'},
+  ];
+
+  const renderAnalysisModeSwitcher = () => {
+    const current = ANALYSIS_MODE_OPTIONS.find((o) => o.value === analysisMode);
+    return (
+      <div ref={moduleMenuRef} className="relative z-20 min-w-0">
+        <button
+          type="button"
+          onClick={() => setModuleMenuOpen((open) => !open)}
+          className="flex min-w-[12.5rem] max-w-full items-center gap-2.5 rounded-xl border border-[var(--color-accent)]/30 bg-[var(--color-bg-dark)] px-3 py-2 text-left shadow-sm outline-none transition hover:border-[var(--color-accent)]/55 focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]/30"
+          aria-haspopup="listbox"
+          aria-expanded={moduleMenuOpen}
+          aria-label={`Analysis module: ${current?.label ?? 'Stride'}`}
+          title={current?.hint}
+        >
+          <Boxes className="h-4 w-4 shrink-0 text-[var(--color-accent)]" aria-hidden />
+          <span className="min-w-0 flex-1">
+            <span className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--color-text-light)]">
+              Module
+            </span>
+            <span className="block truncate text-sm font-semibold leading-tight text-[var(--color-accent)]">
+              {current?.label ?? 'Stride'}
+            </span>
+          </span>
+          <ChevronDown
+            className={`h-4 w-4 shrink-0 text-[var(--color-accent)] transition-transform ${moduleMenuOpen ? 'rotate-180' : ''}`}
+            aria-hidden
+          />
+        </button>
+        {moduleMenuOpen ? (
+          <ul
+            role="listbox"
+            aria-label="Analysis modules"
+            className="absolute left-0 top-[calc(100%+0.4rem)] z-50 w-[min(18rem,calc(100vw-2rem))] overflow-hidden rounded-xl border border-[var(--color-accent)]/25 bg-[var(--color-chrome-bar)] py-1 shadow-xl"
+          >
+            {ANALYSIS_MODE_OPTIONS.map((option) => {
+              const selected = option.value === analysisMode;
+              return (
+                <li key={option.value} role="option" aria-selected={selected}>
+                  <button
+                    type="button"
+                    onClick={() => handleAnalysisModeSwitch(option.value)}
+                    className={`flex w-full items-start gap-2 px-3 py-2.5 text-left transition hover:bg-[var(--color-panel-hover)] ${
+                      selected ? 'bg-[var(--color-panel-hover)]/80' : ''
+                    }`}
+                  >
+                    <Check
+                      className={`mt-0.5 h-4 w-4 shrink-0 ${selected ? 'text-[var(--color-accent)]' : 'text-transparent'}`}
+                      aria-hidden
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-semibold text-[var(--color-accent)]">{option.label}</span>
+                      <span className="block text-[11px] leading-snug text-[var(--color-text-light)]">{option.hint}</span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        ) : null}
+      </div>
+    );
+  };
 
   const renderKneeAnglePanel = () => {
     if (!isMediaLoaded) return null;
@@ -3826,16 +3909,19 @@ export default function App() {
       return (
         <section
           ref={analysisPanelRef}
-          className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}
+          className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-transparent p-1 sm:p-2' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}
         >
           <h3 className="mb-2 shrink-0 text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
             Golf
           </h3>
           <GolfPanel
             metrics={golfMetrics}
+            report={golfSwingReport}
             camera={golfCamera}
             handedness={golfHandedness}
+            currentTime={currentTime}
             isFullscreen={isFullscreen}
+            onJumpToTime={jumpToVideoTime}
             onCameraChange={(next) => {
               setGolfCamera(next);
               golfSessionRef.current.setCamera(next);
@@ -4244,7 +4330,7 @@ export default function App() {
     return (
       <section
         ref={analysisPanelRef}
-        className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}
+        className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-transparent p-1 sm:p-2' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}
       >
         <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
           <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)] shrink-0">
@@ -5000,8 +5086,19 @@ export default function App() {
     );
   };
 
-  const mediaMaxClass =
-    'max-h-[min(88dvh,1400px)] md:max-h-[min(85dvh,1400px)] lg:max-h-[min(84dvh,1500px)]';
+  const mediaMaxClass = isFullscreen
+    ? 'max-h-full'
+    : 'max-h-[min(88dvh,1400px)] md:max-h-[min(85dvh,1400px)] lg:max-h-[min(84dvh,1500px)]';
+
+  const renderAnalysisDock = () => {
+    if (!showAnalysis) return null;
+    if (!isFullscreen) return renderKneeAnglePanel();
+    return (
+      <div className="z-40 shrink-0 max-h-[min(32dvh,22rem)] overflow-y-auto border-t border-[var(--color-accent)]/25 bg-[var(--color-bg-dark)] px-3 py-2">
+        {renderKneeAnglePanel()}
+      </div>
+    );
+  };
 
   const renderMeasurementOverlay = () => {
     const angleMs = measurements.filter(m => m.kind === 'angle' && m.angle !== null);
@@ -5040,28 +5137,18 @@ export default function App() {
     const drawingTool = activeTool === 'line' || activeTool === 'angle';
     const modelLoading = poseEnabled && poseStatus === 'loading';
     const analyzing = poseEnabled && isPoseAnalyzing;
-    const waitingForPose =
-      poseEnabled &&
-      poseStatus === 'ready' &&
-      !analyzing &&
-      !poseScrubbed &&
-      !trackedHasVisible(poseKeypoints, OVERLAY_POSE_VISIBILITY);
-    const showScrub =
-      !drawingTool && !analyzing && poseStatus !== 'loading' && (!poseScrubbed || poseStatus === 'error');
-    if (!showScrub && !modelLoading && !analyzing && !waitingForPose && !poseError && !drawingTool) return null;
+    if (!drawingTool && !modelLoading && !analyzing && !poseError) return null;
 
     const statusLabel =
       poseStatus === 'error'
-        ? 'Retry scrub'
+        ? 'Scrub failed — tap Scrub to retry'
         : modelLoading
           ? 'Loading pose model…'
           : analyzing
             ? analysisProgress !== null
               ? `Scrubbing ${analysisProgress}%`
               : 'Scrubbing…'
-            : waitingForPose
-              ? 'Looking for a person…'
-              : 'Scrub';
+            : 'Scrub';
 
     if (drawingTool) {
       return (
@@ -5075,52 +5162,31 @@ export default function App() {
       );
     }
 
-    if (showScrub) {
-      return (
-        <div className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/35">
-          <button
-            type="button"
-            onClick={startScrub}
-            className="pointer-events-auto flex flex-col items-center gap-2 text-white transition hover:scale-[1.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]"
-            title="Scrub the clip — precompute pose so playback stays fluid"
-            aria-label="Scrub the clip to precompute pose lines"
-          >
-            <span className="flex h-24 w-24 items-center justify-center rounded-full border-4 border-white/85 bg-[var(--color-accent)] shadow-xl shadow-black/40">
-              <FastForward className="h-12 w-12 fill-white" aria-hidden />
-            </span>
-            <span className="rounded-full bg-black/55 px-3 py-1 text-sm font-semibold uppercase tracking-wide">
-              {statusLabel}
-            </span>
-          </button>
-          {poseError ? (
-            <p className="max-w-sm rounded-md bg-black/70 px-3 py-2 text-center text-xs text-red-200">
-              {poseError}
-            </p>
-          ) : null}
-        </div>
-      );
-    }
-
     return (
       <div className="pointer-events-none absolute left-1/2 top-3 z-30 flex -translate-x-1/2 flex-col items-center gap-2">
         <div className="flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-white backdrop-blur-md">
-        {modelLoading || analyzing ? (
-          <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-        ) : null}
+          {modelLoading || analyzing ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : null}
           <span className="text-xs font-semibold uppercase tracking-wide">{statusLabel}</span>
         </div>
         {poseError ? (
-          <p className="max-w-sm rounded-md bg-black/70 px-3 py-2 text-center text-xs text-red-200">
-            {poseError}
-          </p>
+          <p className="max-w-sm rounded-md bg-black/70 px-3 py-2 text-center text-xs text-red-200">{poseError}</p>
         ) : null}
       </div>
     );
   };
 
   const renderOverlayToolbelt = () => (
-    <div className="pointer-events-none absolute inset-y-0 right-0 z-20 flex items-center">
+    <div className="pointer-events-none absolute inset-y-0 right-0 z-40 flex items-center pr-1">
       <div className="pointer-events-auto flex max-h-full flex-col gap-1 overflow-y-auto rounded-2xl border border-[var(--color-accent)]/15 bg-black/35 p-1.5 backdrop-blur-md">
+        <button
+          type="button"
+          onClick={() => setShowAnalysis((v) => !v)}
+          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${showAnalysis ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
+          title={showAnalysis ? 'Hide analysis panel' : 'Show analysis panel'}
+          aria-label={showAnalysis ? 'Hide analysis panel' : 'Show analysis panel'}
+        >
+          <LineChart className="w-5 h-5" />
+        </button>
         <button
           type="button"
           onClick={handleDeleteMeasurements}
@@ -5197,14 +5263,11 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[var(--color-bg-dark)] text-fg font-sans blueprint-bg">
-      <header className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
-        <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
-          Form Analyzer
-        </h1>
-        <div className="order-last flex w-full flex-col items-center gap-1 sm:order-none sm:w-auto sm:flex-1">
-          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--color-text-light)]">
-            Module
-          </span>
+      <header className="relative z-30 mb-5 flex items-center justify-between gap-3 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
+        <div className="flex min-w-0 items-center gap-3 sm:gap-5">
+          <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
+            Form Analyzer
+          </h1>
           {renderAnalysisModeSwitcher()}
         </div>
         <SettingsMenu
@@ -5314,11 +5377,11 @@ export default function App() {
           {videoSrc ? (
             <div
               ref={fullscreenTargetRef}
-              className={`flex w-full min-w-0 flex-col ${isFullscreen ? 'relative h-[100dvh] rounded-none' : 'gap-3'}`}
+              className={`flex w-full min-w-0 flex-col ${isFullscreen ? 'relative h-[100dvh] bg-[var(--color-bg-dark)]' : 'gap-3'}`}
             >
               {/* Tall phone media: no fixed 16:9 box; cap desktop height so the page fits the window */}
               <div
-                className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'h-full w-full rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
+                className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'min-h-0 w-full flex-1 rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
                 {renderOverlayToolbelt()}
                 {renderStartAnalysisOverlay()}
@@ -5332,13 +5395,13 @@ export default function App() {
                   >
                     <div
                       ref={mediaWrapRef}
-                      className={`relative inline-block min-w-0 max-w-full overflow-hidden ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                      className={`relative inline-block min-w-0 max-w-full overflow-hidden ${mediaMaxClass}`}
                     >
                       <div
                         className={
                           appliedZoom
                             ? 'relative inline-block'
-                            : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`
+                            : `relative inline-block max-w-full ${mediaMaxClass}`
                         }
                         style={
                           appliedZoom
@@ -5354,7 +5417,7 @@ export default function App() {
                           src={videoSrc}
                           preload="auto"
                           playsInline
-                          className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                          className={`block h-auto w-full max-w-full object-contain ${mediaMaxClass}`}
                         />
                       </div>
                       <canvas
@@ -5382,7 +5445,7 @@ export default function App() {
                           className={
                             compareAppliedZoom
                               ? 'relative inline-block'
-                              : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`
+                              : `relative inline-block max-w-full ${mediaMaxClass}`
                           }
                           style={
                             compareAppliedZoom
@@ -5399,13 +5462,13 @@ export default function App() {
                               src={compareVideoSrc}
                               preload="auto"
                               playsInline
-                              className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                              className={`block h-auto w-full max-w-full object-contain ${mediaMaxClass}`}
                             />
                           ) : compareImageSrc ? (
                             <img
                               ref={compareImageRef}
                               src={compareImageSrc}
-                              className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                              className={`block h-auto w-full max-w-full object-contain ${mediaMaxClass}`}
                               alt="Compare media"
                             />
                           ) : null}
@@ -5428,9 +5491,8 @@ export default function App() {
                   ) : null}
                 </div>
 
-                {/* Playback controls overlay at bottom of media container — hidden in fullscreen when analysis is open */}
-                {!(isFullscreen && showAnalysis) && (
-                <div className={`pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col gap-1 px-3 pb-3 pt-8 rounded-b-xl ${isFullscreen ? 'bg-transparent' : 'bg-gradient-to-t from-black/50 to-transparent'}`}>
+                {/* Playback stays on the media stage so tools stay reachable in fullscreen */}
+                <div className={`pointer-events-none absolute inset-x-0 bottom-0 z-30 flex flex-col gap-1 px-3 pr-14 pb-3 pt-8 rounded-b-xl ${isFullscreen ? 'bg-gradient-to-t from-black/70 to-transparent' : 'bg-gradient-to-t from-black/50 to-transparent'}`}>
                   <div className="pointer-events-auto flex items-center gap-1">
                     <button
                       type="button"
@@ -5523,22 +5585,16 @@ export default function App() {
                     ) : null}
                   </div>
                 </div>
-                )}
-                {isFullscreen && showAnalysis && (
-                  <div className="absolute inset-x-0 bottom-0 z-30 max-h-[50dvh] overflow-y-auto rounded-t-2xl bg-transparent p-4">
-                    {renderKneeAnglePanel()}
-                  </div>
-                )}
               </div>
-              {!isFullscreen && showAnalysis ? renderKneeAnglePanel() : null}
+              {renderAnalysisDock()}
             </div>
           ) : imageSrc ? (
             <div
               ref={fullscreenTargetRef}
-              className={`flex w-full min-w-0 flex-col ${isFullscreen ? 'relative h-[100dvh] rounded-none' : 'gap-3'}`}
+              className={`flex w-full min-w-0 flex-col ${isFullscreen ? 'relative h-[100dvh] bg-[var(--color-bg-dark)]' : 'gap-3'}`}
             >
               <div
-                className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'h-full w-full rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
+                className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'min-h-0 w-full flex-1 rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
                 {renderOverlayToolbelt()}
                 {renderStartAnalysisOverlay()}
@@ -5549,13 +5605,13 @@ export default function App() {
                   <div className={`min-w-0 ${hasCompareMedia ? 'flex flex-col items-end' : 'flex flex-col items-center'}`}>
                     <div
                       ref={mediaWrapRef}
-                      className={`relative inline-block min-w-0 max-w-full overflow-hidden ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                      className={`relative inline-block min-w-0 max-w-full overflow-hidden ${mediaMaxClass}`}
                     >
                     <div
                       className={
                           compareAppliedZoom
                           ? 'relative inline-block'
-                          : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`
+                          : `relative inline-block max-w-full ${mediaMaxClass}`
                       }
                       style={
                           compareAppliedZoom
@@ -5569,7 +5625,7 @@ export default function App() {
                       <img
                         ref={imageRef}
                         src={imageSrc}
-                        className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                        className={`block h-auto w-full max-w-full object-contain ${mediaMaxClass}`}
                         alt="Uploaded"
                         onLoad={() => { setMeasurements([]); setActiveMeasurementIdx(null); }}
                       />
@@ -5599,7 +5655,7 @@ export default function App() {
                         className={
                           appliedZoom
                             ? 'relative inline-block'
-                            : `relative inline-block max-w-full ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`
+                            : `relative inline-block max-w-full ${mediaMaxClass}`
                         }
                         style={
                           appliedZoom
@@ -5616,13 +5672,13 @@ export default function App() {
                             src={compareVideoSrc}
                             preload="auto"
                             playsInline
-                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                            className={`block h-auto w-full max-w-full object-contain ${mediaMaxClass}`}
                           />
                         ) : compareImageSrc ? (
                           <img
                             ref={compareImageRef}
                             src={compareImageSrc}
-                            className={`block h-auto w-full max-w-full object-contain ${isFullscreen ? 'max-h-[100dvh]' : mediaMaxClass}`}
+                            className={`block h-auto w-full max-w-full object-contain ${mediaMaxClass}`}
                             alt="Compare media"
                           />
                         ) : null}
@@ -5644,13 +5700,8 @@ export default function App() {
                     </div>
                   ) : null}
                 </div>
-                {isFullscreen && showAnalysis && (
-                  <div className="absolute inset-x-0 bottom-0 z-30 max-h-[50dvh] overflow-y-auto rounded-t-2xl bg-transparent p-4">
-                    {renderKneeAnglePanel()}
-                  </div>
-                )}
               </div>
-              {!isFullscreen && showAnalysis ? renderKneeAnglePanel() : null}
+              {renderAnalysisDock()}
             </div>
           ) : (
             <>
@@ -5661,7 +5712,7 @@ export default function App() {
                 <Video className="h-10 w-10" />
               </div>
               <p className="text-[var(--color-text-light)] max-w-sm">
-                Add media with the buttons above, pick Stride, Squat, or Golf in the header, then press Scrub. After scrubbing, play the video — pose lines are cached so playback stays fluid.
+                Add media with the buttons above, pick a module in the header, then press the small Scrub control next to play. After scrubbing, play the video — pose lines are cached so playback stays fluid.
               </p>
             </div>
             {showAnalysis ? renderKneeAnglePanel() : null}
