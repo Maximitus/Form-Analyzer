@@ -9,3 +9,4 @@ coverage/
 public/models/*.onnx
 public/ort/*.wasm
 public/ort/*.mjs
+.wrangler/

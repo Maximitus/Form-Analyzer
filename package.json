@@ -6,11 +6,12 @@
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
-    "preview": "vite preview",
+    "preview": "npm run build && wrangler dev",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "postinstall": "node scripts/copy-ort-wasm.mjs",
-    "download-models": "node scripts/download-models.mjs"
+    "download-models": "node scripts/download-models.mjs",
+    "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -33,6 +34,8 @@
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0",
-    "vite-plugin-static-copy": "^2.3.1"
+    "vite-plugin-static-copy": "^2.3.1",
+    "@cloudflare/vite-plugin": "^1.39.2",
+    "wrangler": "^4.97.0"
   }
 }
