@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import * as ort from 'onnxruntime-web/webgpu';
+import * as ort from 'onnxruntime-web/wasm';
 import { decodeSimcc, identifySimccOutputs } from '../utils/simcc';
 import { computeLetterbox, mapModelToSource, rgbaToNchwFloat32 } from '../utils/preprocess';
 import { estimateClubHead, landmarksFromCoco } from '../utils/clubHead';
@@ -42,7 +42,7 @@ function configureOrt(wasmPaths: string): void {
   ort.env.wasm.wasmPaths = wasmPaths.endsWith('/') ? wasmPaths : `${wasmPaths}/`;
   const isolated = Boolean((self as unknown as {crossOriginIsolated?: boolean}).crossOriginIsolated);
   // Threaded WASM needs COOP/COEP (SharedArrayBuffer). Stay single-threaded unless isolated.
-  // Do not request the JSEP (~26MB) binary; Cloudflare Workers assets cap files at 25 MiB.
+  // WASM-only: WebGPU/JSEP is ~26MB and cannot be hosted on Cloudflare Workers (25 MiB cap).
   ort.env.wasm.numThreads = isolated ? Math.min(4, self.navigator?.hardwareConcurrency ?? 1) : 1;
   ort.env.wasm.simd = true;
   // Already running inside a dedicated worker; nested ORT proxy workers are unnecessary.
@@ -100,22 +100,11 @@ async function createSession(model: ArrayBuffer): Promise<{
   session: ort.InferenceSession;
   executionProvider: string;
 }> {
-  try {
-    const session = await ort.InferenceSession.create(model, {
-      executionProviders: ['webgpu', 'wasm'],
-      graphOptimizationLevel: 'all',
-    });
-    const ep =
-      (session as unknown as { handler?: { backendHint?: string } }).handler?.backendHint ??
-      'webgpu';
-    return { session, executionProvider: ep };
-  } catch {
-    const session = await ort.InferenceSession.create(model, {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
-    });
-    return { session, executionProvider: 'wasm' };
-  }
+  const session = await ort.InferenceSession.create(model, {
+    executionProviders: ['wasm'],
+    graphOptimizationLevel: 'all',
+  });
+  return { session, executionProvider: 'wasm' };
 }
 
 function tensorShape(meta: ort.InferenceSession.ValueMetadata | undefined): number[] {

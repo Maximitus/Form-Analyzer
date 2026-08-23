@@ -30,8 +30,6 @@ import {
   Image as ImageGalleryIcon,
   Images,
   Video,
-  Activity,
-  LineChart,
   Loader2,
 } from 'lucide-react';
 import SettingsMenu from './SettingsMenu';
@@ -4278,17 +4276,6 @@ export default function App() {
               >
                 Guide
               </button>
-              {videoSrc ? (
-                <button
-                  type="button"
-                  onClick={runGraphAnalysis}
-                  className="rounded-md border border-[var(--color-accent)]/20 p-1.5 hover:bg-[var(--color-panel-hover)] text-[var(--color-accent)]"
-                  title="Analyze graph"
-                  aria-label="Analyze graph"
-                >
-                  <LineChart className="h-4 w-4" />
-                </button>
-              ) : null}
             </div>
           </div>
         </div>
@@ -4994,21 +4981,41 @@ export default function App() {
 
   const renderStartAnalysisOverlay = () => {
     if (!isMediaLoaded) return null;
+    const drawingTool = activeTool === 'line' || activeTool === 'angle';
     const modelLoading = poseEnabled && poseStatus === 'loading';
     const analyzing = poseEnabled && isPoseAnalyzing;
-    const showPlay = !poseEnabled || poseStatus === 'error';
-    if (!showPlay && !modelLoading && !analyzing && !poseError) return null;
+    const waitingForPose =
+      poseEnabled &&
+      poseStatus === 'ready' &&
+      !analyzing &&
+      !trackedHasVisible(poseKeypoints, OVERLAY_POSE_VISIBILITY);
+    const showPlay = !drawingTool && (!poseEnabled || poseStatus === 'error');
+    if (!showPlay && !modelLoading && !analyzing && !waitingForPose && !poseError && !drawingTool) return null;
 
     const statusLabel =
       poseStatus === 'error'
-        ? 'Retry analysis'
+        ? 'Retry pose lines'
         : modelLoading
           ? 'Loading pose model…'
           : analyzing
             ? analysisProgress !== null
               ? `Analyzing ${analysisProgress}%`
               : 'Analyzing…'
-            : 'Analyze';
+            : waitingForPose
+              ? 'Looking for a person…'
+              : 'Show pose lines';
+
+    if (drawingTool) {
+      return (
+        <div className="pointer-events-none absolute left-1/2 top-3 z-30 -translate-x-1/2">
+          <div className="rounded-full bg-black/75 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-white backdrop-blur-md">
+            {activeTool === 'line'
+              ? 'Click two points on the video to draw a line'
+              : 'Click three points on the video to measure an angle'}
+          </div>
+        </div>
+      );
+    }
 
     if (showPlay) {
       return (
@@ -5039,7 +5046,9 @@ export default function App() {
     return (
       <div className="pointer-events-none absolute left-1/2 top-3 z-30 flex -translate-x-1/2 flex-col items-center gap-2">
         <div className="flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-white backdrop-blur-md">
+        {modelLoading || analyzing ? (
           <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+        ) : null}
           <span className="text-xs font-semibold uppercase tracking-wide">{statusLabel}</span>
         </div>
         {poseError ? (
@@ -5056,20 +5065,11 @@ export default function App() {
       <div className="pointer-events-auto flex max-h-full flex-col gap-1 overflow-y-auto rounded-2xl border border-[var(--color-accent)]/15 bg-black/35 p-1.5 backdrop-blur-md">
         <button
           type="button"
-          onClick={() => setShowAnalysis((v) => !v)}
-          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${showAnalysis ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title={showAnalysis ? 'Hide analysis panel' : 'Show analysis panel'}
-          aria-label={showAnalysis ? 'Hide analysis panel' : 'Show analysis panel'}
-        >
-          <LineChart className="w-5 h-5" />
-        </button>
-        <button
-          type="button"
           onClick={handleDeleteMeasurements}
           disabled={measurements.length === 0}
           className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${measurements.length === 0 ? 'opacity-50 cursor-not-allowed' : 'text-red-300'}`}
-          title="Clear measurements"
-          aria-label="Clear measurements"
+          title="Clear drawn lines and angles"
+          aria-label="Clear drawn lines and angles"
         >
           <Trash className="w-5 h-5" />
         </button>
@@ -5078,8 +5078,8 @@ export default function App() {
           onClick={toggleAngleTool}
           disabled={!isMediaLoaded}
           className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'angle' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title="Angle measure (three points)"
-          aria-label="Angle measure"
+          title="Measure an angle — then click three points on the video"
+          aria-label="Measure an angle"
         >
           <AngleMeasureIcon className="w-5 h-5" />
         </button>
@@ -5088,20 +5088,10 @@ export default function App() {
           onClick={toggleLineTool}
           disabled={!isMediaLoaded}
           className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${activeTool === 'line' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title="Line measure (distance between two points)"
-          aria-label="Line measure"
+          title="Draw a line — then click two points on the video"
+          aria-label="Draw a line"
         >
           <Minus className="w-5 h-5" />
-        </button>
-        <button
-          type="button"
-          onClick={() => (poseEnabled ? setPoseEnabled(false) : startAnalysis())}
-          disabled={!isMediaLoaded}
-          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title={poseEnabled ? (poseEngineLabel || 'Stop pose overlay') : 'Start analysis (RTMPose overlay)'}
-          aria-label={poseEnabled ? 'Stop pose overlay' : 'Start analysis'}
-        >
-          <Activity className="w-5 h-5" />
         </button>
         <button
           type="button"
@@ -5153,7 +5143,10 @@ export default function App() {
         <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
           Form Analyzer
         </h1>
-        <div className="order-last flex w-full justify-center sm:order-none sm:w-auto sm:flex-1">
+        <div className="order-last flex w-full flex-col items-center gap-1 sm:order-none sm:w-auto sm:flex-1">
+          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--color-text-light)]">
+            Module
+          </span>
           {renderAnalysisModeSwitcher()}
         </div>
         <SettingsMenu
@@ -5391,8 +5384,8 @@ export default function App() {
                             ? 'Pause both videos'
                             : 'Play both videos'
                           : isPlaying
-                            ? 'Pause'
-                            : 'Play'
+                            ? 'Pause video'
+                            : 'Play video'
                       }
                       aria-label={
                         compareVideoSrc
@@ -5410,8 +5403,8 @@ export default function App() {
                       type="button"
                       onClick={() => stepBothFrames(-1)}
                       className="p-1.5 rounded-full hover:bg-white/15 text-white"
-                      title="Step back one frame"
-                      aria-label="Step back one frame"
+                      title="Go back one frame"
+                      aria-label="Go back one frame"
                     >
                       <ChevronLeft className="w-5 h-5" />
                     </button>
@@ -5419,8 +5412,8 @@ export default function App() {
                       type="button"
                       onClick={() => stepBothFrames(1)}
                       className="p-1.5 rounded-full hover:bg-white/15 text-white"
-                      title="Step forward one frame"
-                      aria-label="Step forward one frame"
+                      title="Go forward one frame"
+                      aria-label="Go forward one frame"
                     >
                       <ChevronRight className="w-5 h-5" />
                     </button>
@@ -5434,7 +5427,8 @@ export default function App() {
                       onChange={handleSeek}
                       step={SLIDER_SCRUB_STEP_SECONDS}
                       className="w-full accent-[var(--color-accent)]"
-                      aria-label="Primary video position"
+                      title="Drag to move through the video"
+                      aria-label="Drag to move through the video"
                     />
                     {compareVideoSrc ? (
                       <input
@@ -5448,7 +5442,8 @@ export default function App() {
                         onChange={handleCompareSeek}
                         step={SLIDER_SCRUB_STEP_SECONDS}
                         className="w-full accent-[var(--color-accent)]"
-                        aria-label="Compare video position"
+                        title="Drag to move through the compare video"
+                        aria-label="Drag to move through the compare video"
                       />
                     ) : null}
                   </div>
