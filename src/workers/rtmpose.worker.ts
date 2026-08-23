@@ -42,6 +42,7 @@ function configureOrt(wasmPaths: string): void {
   ort.env.wasm.wasmPaths = wasmPaths.endsWith('/') ? wasmPaths : `${wasmPaths}/`;
   const isolated = Boolean((self as unknown as {crossOriginIsolated?: boolean}).crossOriginIsolated);
   // Threaded WASM needs COOP/COEP (SharedArrayBuffer). Stay single-threaded unless isolated.
+  // Do not request the JSEP (~26MB) binary; Cloudflare Workers assets cap files at 25 MiB.
   ort.env.wasm.numThreads = isolated ? Math.min(4, self.navigator?.hardwareConcurrency ?? 1) : 1;
   ort.env.wasm.simd = true;
   // Already running inside a dedicated worker; nested ORT proxy workers are unnecessary.

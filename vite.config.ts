@@ -25,11 +25,11 @@ export default defineConfig(({mode}) => {
       viteStaticCopy({
         targets: [
           {
-            src: path.join(ortDist, 'ort-wasm*.wasm'),
+            src: path.join(ortDist, 'ort-wasm-simd-threaded.wasm'),
             dest: 'ort',
           },
           {
-            src: path.join(ortDist, 'ort-wasm*.mjs'),
+            src: path.join(ortDist, 'ort-wasm-simd-threaded.mjs'),
             dest: 'ort',
           },
         ],
