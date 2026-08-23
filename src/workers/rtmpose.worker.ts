@@ -49,26 +49,42 @@ function configureOrt(wasmPaths: string): void {
   ort.env.wasm.proxy = false;
 }
 
+/** SPA fallback can 200-return index.html for missing /models/*.onnx. */
+function isLikelyOnnx(buffer: ArrayBuffer): boolean {
+  if (buffer.byteLength < 1_000_000) return false;
+  const head = new Uint8Array(buffer, 0, Math.min(16, buffer.byteLength));
+  // HTML ('<'), JSON ('{'), UTF-8 BOM
+  if (head[0] === 0x3c || head[0] === 0x7b || head[0] === 0xef) return false;
+  return true;
+}
+
 async function fetchModelBuffer(url: string): Promise<ArrayBuffer> {
-  try {
-    const cache = await caches.open('rtmpose-onnx-v1');
-    const cached = await cache.match(url);
-    if (cached) {
-      return cached.arrayBuffer();
-    }
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} fetching ${url}`);
-    }
-    await cache.put(url, response.clone());
-    return response.arrayBuffer();
-  } catch {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} fetching ${url}`);
-    }
-    return response.arrayBuffer();
+  const cache = await caches.open('rtmpose-onnx-v2');
+  const cached = await cache.match(url);
+  if (cached) {
+    const cachedBuf = await cached.arrayBuffer();
+    if (isLikelyOnnx(cachedBuf)) return cachedBuf;
+    await cache.delete(url);
   }
+
+  const response = await fetch(url, {mode: 'cors', credentials: 'omit'});
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} fetching ${url}`);
+  }
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.includes('text/html') || contentType.includes('text/plain')) {
+    throw new Error(`Model URL returned ${contentType || 'text'} instead of ONNX (${url})`);
+  }
+  const buffer = await response.arrayBuffer();
+  if (!isLikelyOnnx(buffer)) {
+    throw new Error(`Invalid ONNX payload from ${url} (${buffer.byteLength} bytes)`);
+  }
+  try {
+    await cache.put(url, new Response(buffer.slice(0), {headers: {'content-type': 'application/octet-stream'}}));
+  } catch {
+    /* Cache Storage may be unavailable; inference can still proceed. */
+  }
+  return buffer;
 }
 
 async function loadModelBytes(primary: string, fallback?: string): Promise<ArrayBuffer> {

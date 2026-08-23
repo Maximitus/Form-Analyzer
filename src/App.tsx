@@ -32,7 +32,7 @@ import {
   Video,
   Activity,
   LineChart,
-  Flag,
+  Loader2,
 } from 'lucide-react';
 import SettingsMenu from './SettingsMenu';
 import { useTheme } from './theme';
@@ -154,7 +154,8 @@ const POSE_BODY_CONNECTIONS: [number, number][] = [
   [6, 8],
   [8, 10],
 ];
-const MIN_POSE_VISIBILITY = 0.25;
+const MIN_POSE_VISIBILITY = 0.15;
+const OVERLAY_POSE_VISIBILITY = 0.15;
 const KNEE_SAMPLE_EPSILON_SECONDS = 1 / 1000;
 const POSE_INFERENCE_HZ = 24;
 
@@ -1245,6 +1246,8 @@ export default function App() {
     });
   };
   const [poseEnabled, setPoseEnabled] = useState(false);
+  const [poseError, setPoseError] = useState<string | null>(null);
+  const [poseSessionId, setPoseSessionId] = useState(0);
   const [poseKeypoints, setPoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
   const [comparePoseKeypoints, setComparePoseKeypoints] = useState<{x: number; y: number; v: number}[]>([]);
   const [currentKneeAngle, setCurrentKneeAngle] = useState<number | null>(null);
@@ -1800,6 +1803,7 @@ export default function App() {
     compareSmoothRef.current.reset();
     setPoseStatus('idle');
     setPoseEngineLabel('');
+    setPoseError(null);
   }, [rtmposeVariant]);
 
   useEffect(() => {
@@ -1831,6 +1835,7 @@ export default function App() {
     const ensureClient = async () => {
       if (rtmposeClientRef.current) return rtmposeClientRef.current;
       setPoseStatus('loading');
+      setPoseError(null);
       const client = new RtmposeClient({
         variant: rtmposeVariant,
         onReady: ({executionProvider, inputWidth, inputHeight}) => {
@@ -1840,11 +1845,14 @@ export default function App() {
         },
         onError: (message) => {
           console.error('RTMPose worker:', message);
+          setPoseError(message);
+          setPoseStatus('error');
         },
       });
       await client.start();
       rtmposeClientRef.current = client;
       setPoseStatus('ready');
+      setPoseError(null);
       return client;
     };
 
@@ -1859,7 +1867,7 @@ export default function App() {
     ) => {
       const selected = poseFrameToTracked(pose, POSE_TRACKED_IDS);
       if (!trackedHasVisible(selected, MIN_POSE_VISIBILITY)) {
-        setter([]);
+        // Keep the last good skeleton instead of wiping lines on a weak frame.
         return;
       }
       setter(selected);
@@ -1992,8 +2000,10 @@ export default function App() {
         ) => {
           if (client.isBusy || submittingLive) return;
           if (video.readyState < 2) return;
-          if (video.currentTime === lastTime.value && video.paused) return;
           if (now - lastTs.value < minInferenceIntervalMs) return;
+          // Paused clips often decode a black first frame; keep sampling until a pose lands.
+          if (video.paused && video.currentTime === lastTime.value && now - lastTs.value < 400) return;
+          if (!video.paused && video.currentTime === lastTime.value) return;
           lastTime.value = video.currentTime;
           lastTs.value = now;
           submittingLive = true;
@@ -2113,7 +2123,11 @@ export default function App() {
         liveCleanup = removeMediaListeners;
       } catch (e) {
         console.error('RTMPose failed to start:', e);
-        if (!cancelled) setPoseStatus('error');
+        if (!cancelled) {
+          const message = e instanceof Error ? e.message : 'RTMPose failed to start';
+          setPoseError(message);
+          setPoseStatus('error');
+        }
       }
     };
 
@@ -2124,7 +2138,7 @@ export default function App() {
       stopLiveLoop();
       liveCleanup?.();
     };
-  }, [poseEnabled, videoSrc, imageSrc, compareVideoSrc, compareImageSrc, analysisMode, golfHandedness, rtmposeVariant]);
+  }, [poseEnabled, poseSessionId, videoSrc, imageSrc, compareVideoSrc, compareImageSrc, analysisMode, golfHandedness, rtmposeVariant]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -2171,9 +2185,11 @@ export default function App() {
       }
 
       const overlayTime = videoRef.current?.currentTime ?? 0;
-      let overlayKps = poseCacheRef.current.length > 0
-        ? findNearestCachedPose(poseCacheRef.current, overlayTime) ?? poseKeypoints
-        : poseKeypoints;
+      const cachedPose = findNearestCachedPose(poseCacheRef.current, overlayTime);
+      const overlayKps =
+        cachedPose && cachedPose.length === POSE_TRACKED_IDS.length && cachedPose.some((p) => p.v >= OVERLAY_POSE_VISIBILITY)
+          ? cachedPose
+          : poseKeypoints;
 
       if (poseEnabled && overlayKps.length === POSE_TRACKED_IDS.length) {
         const byId = new Map<number, {x: number; y: number; v: number}>();
@@ -2195,7 +2211,7 @@ export default function App() {
         for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
           const a = byId.get(aId);
           const b = byId.get(bId);
-          if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+          if (!a || !b || a.v < OVERLAY_POSE_VISIBILITY || b.v < OVERLAY_POSE_VISIBILITY) continue;
           const head = isHeadConnection(aId, bId);
           const arm = isArmConnection(aId, bId);
           const tracked = !arm && !head && isTrackedConnection(aId, bId);
@@ -2222,7 +2238,7 @@ export default function App() {
         }
         POSE_TRACKED_IDS.forEach((id, i) => {
           const p = overlayKps[i];
-          if (!p || p.v < 0.25) return;
+          if (!p || p.v < OVERLAY_POSE_VISIBILITY) return;
           const arm = POSE_ARM_IDS.has(id);
           const nose = id === POSE_NOSE_ID;
           const tracked = !arm && !nose && trackedIds.has(id);
@@ -2260,7 +2276,7 @@ export default function App() {
             mapPoseNormToCanvasOverlayPx(xn, yn, media, canvasRef.current);
           const overlayCoco = trackedPoseToCoco(overlayKps, POSE_TRACKED_IDS);
           for (const p of overlayCoco) {
-            if (p.score < 0.25) continue;
+            if (p.score < OVERLAY_POSE_VISIBILITY) continue;
             const o = mapper(p.x, p.y);
             p.x = o.x;
             p.y = o.y;
@@ -2374,9 +2390,13 @@ export default function App() {
 
       if (poseEnabled) {
         const overlayTime = compareVideoRef.current?.currentTime ?? 0;
-        const overlayKps = comparePoseCacheRef.current.length > 0
-          ? findNearestCachedPose(comparePoseCacheRef.current, overlayTime) ?? comparePoseKeypoints
-          : comparePoseKeypoints;
+        const cachedPose = findNearestCachedPose(comparePoseCacheRef.current, overlayTime);
+        const overlayKps =
+          cachedPose &&
+          cachedPose.length === POSE_TRACKED_IDS.length &&
+          cachedPose.some((p) => p.v >= OVERLAY_POSE_VISIBILITY)
+            ? cachedPose
+            : comparePoseKeypoints;
         if (overlayKps.length === POSE_TRACKED_IDS.length) {
           const media = (compareVideoRef.current ?? compareImageRef.current) as HTMLVideoElement | HTMLImageElement;
           const byId = new Map<number, {x: number; y: number; v: number}>();
@@ -2399,7 +2419,7 @@ export default function App() {
           for (const [aId, bId] of POSE_BODY_CONNECTIONS) {
             const a = byId.get(aId);
             const b = byId.get(bId);
-            if (!a || !b || a.v < 0.25 || b.v < 0.25) continue;
+            if (!a || !b || a.v < OVERLAY_POSE_VISIBILITY || b.v < OVERLAY_POSE_VISIBILITY) continue;
             const head = isHeadConnection(aId, bId);
             const arm = isArmConnection(aId, bId);
             const tracked = !arm && !head && isTrackedConnection(aId, bId);
@@ -2415,7 +2435,7 @@ export default function App() {
 
           POSE_TRACKED_IDS.forEach((id, i) => {
             const p = overlayKps[i];
-            if (!p || p.v < 0.25) return;
+            if (!p || p.v < OVERLAY_POSE_VISIBILITY) return;
             const arm = POSE_ARM_IDS.has(id);
             const nose = id === POSE_NOSE_ID;
             const tracked = !arm && !nose && trackedIds.has(id);
@@ -2736,7 +2756,11 @@ export default function App() {
 
         let normalized: {x: number; y: number; v: number}[] = [];
         try {
-          const bitmap = await mediaToBitmap(sourceVideo, analysisPoseCanvas);
+          let bitmap = await mediaToBitmap(sourceVideo, analysisPoseCanvas);
+          if (!bitmap && visibleVideo && visibleVideo !== sourceVideo) {
+            await seekAndWait(visibleVideo, t, localDuration);
+            bitmap = await mediaToBitmap(visibleVideo, analysisPoseCanvas);
+          }
           if (bitmap) {
             const pose = await client.inferOnce(bitmap, t, {trackClubHead: false});
             if (isStale()) break;
@@ -3120,6 +3144,36 @@ export default function App() {
     setIsKneeGraphLocked(false);
     if (!poseEnabled) setPoseEnabled(true);
     setGraphAnalysisRequested(true);
+  };
+
+  const startAnalysis = () => {
+    setShowAnalysis(true);
+    setPoseError(null);
+    if (poseStatus === 'error' || !rtmposeClientRef.current) {
+      rtmposeClientRef.current?.stop();
+      rtmposeClientRef.current = null;
+      setPoseStatus('idle');
+      setPoseSessionId((n) => n + 1);
+    }
+    if (analysisMode === 'golf') {
+      golfSessionRef.current.reset();
+      golfClubPrevRef.current = null;
+      rtmposeClientRef.current?.resetClub();
+      setGolfMetrics(null);
+    }
+    setPoseEnabled(true);
+    const video = videoRef.current;
+    if (video && video.readyState >= 2) {
+      const nudge = Math.min(video.duration || video.currentTime + 0.04, video.currentTime + 0.04);
+      if (Number.isFinite(nudge) && Math.abs(nudge - video.currentTime) > 0.001) {
+        video.currentTime = nudge;
+      }
+    }
+    if (videoSrc && analysisMode !== 'golf') {
+      analysisAbortRef.current = true;
+      setIsKneeGraphLocked(false);
+      setGraphAnalysisRequested(true);
+    }
   };
 
   const isMediaLoaded = !!videoSrc || !!imageSrc;
@@ -3665,7 +3719,6 @@ export default function App() {
     setAnalysisMode(mode);
     setShowAnalysis(true);
     if (mode === 'golf') {
-      setPoseEnabled(true);
       golfSessionRef.current.reset();
       golfClubPrevRef.current = null;
       rtmposeClientRef.current?.resetClub();
@@ -3677,21 +3730,18 @@ export default function App() {
       setAngleLowerBound(100);
       setAngleUpperBound(180);
     }
-    requestAnimationFrame(() => {
-      analysisPanelRef.current?.scrollIntoView({behavior: 'smooth', block: 'nearest'});
-    });
   };
 
-  const renderAnalysisModeSwitcher = (compact = false) => (
+  const renderAnalysisModeSwitcher = () => (
     <div
-      className={`flex overflow-hidden rounded-md border border-[var(--color-accent)]/20 ${compact ? 'flex-col' : ''}`}
+      className="flex overflow-hidden rounded-lg border border-[var(--color-accent)]/30"
       role="group"
       aria-label="Analysis mode"
     >
       <button
         type="button"
         onClick={() => handleAnalysisModeSwitch('stride')}
-        className={`${compact ? 'px-1.5 py-1' : 'px-2 py-1'} text-xs transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+        className={`px-3 py-1.5 text-sm transition-colors ${analysisMode === 'stride' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
         title="Stride analysis — track extension peaks"
       >
         Stride
@@ -3699,7 +3749,7 @@ export default function App() {
       <button
         type="button"
         onClick={() => handleAnalysisModeSwitch('squat')}
-        className={`${compact ? 'px-1.5 py-1' : 'px-2 py-1'} text-xs transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+        className={`px-3 py-1.5 text-sm transition-colors ${analysisMode === 'squat' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
         title="Squat analysis — track depth valleys and 90° threshold"
       >
         Squat
@@ -3707,7 +3757,7 @@ export default function App() {
       <button
         type="button"
         onClick={() => handleAnalysisModeSwitch('golf')}
-        className={`${compact ? 'px-1.5 py-1' : 'px-2 py-1'} text-xs transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
+        className={`px-3 py-1.5 text-sm transition-colors ${analysisMode === 'golf' ? 'bg-[var(--color-accent)] text-[var(--color-bg-dark)] font-semibold' : 'text-[var(--color-accent)] hover:bg-[var(--color-panel-hover)]'}`}
         title="Golf analysis — face-on or down-the-line, plus club-head tracking"
       >
         Golf
@@ -3716,37 +3766,7 @@ export default function App() {
   );
 
   const renderKneeAnglePanel = () => {
-    const modeSwitcher = renderAnalysisModeSwitcher();
-
-    if (!isMediaLoaded) {
-      if (analysisMode !== 'golf') return null;
-      return (
-        <section
-          ref={analysisPanelRef}
-          className="rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-3 sm:p-4"
-        >
-          <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-            <h3 className="shrink-0 text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
-              Golf
-            </h3>
-            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">{modeSwitcher}</div>
-          </div>
-          <GolfPanel
-            metrics={null}
-            camera={golfCamera}
-            handedness={golfHandedness}
-            onCameraChange={(next) => {
-              setGolfCamera(next);
-              golfSessionRef.current.setCamera(next);
-            }}
-            onHandednessChange={(next) => {
-              setGolfHandedness(next);
-              golfSessionRef.current.setHandedness(next);
-            }}
-          />
-        </section>
-      );
-    }
+    if (!isMediaLoaded) return null;
 
     if (analysisMode === 'golf') {
       return (
@@ -3754,12 +3774,9 @@ export default function App() {
           ref={analysisPanelRef}
           className={`rounded-xl border p-3 sm:p-4 ${isFullscreen ? 'border-transparent bg-black/50 backdrop-blur-md' : 'border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)]'}`}
         >
-          <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-            <h3 className="shrink-0 text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
-              Golf
-            </h3>
-            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">{modeSwitcher}</div>
-          </div>
+          <h3 className="mb-2 shrink-0 text-sm font-semibold uppercase tracking-wide text-[var(--color-text-light)]">
+            Golf
+          </h3>
           <GolfPanel
             metrics={golfMetrics}
             camera={golfCamera}
@@ -4261,7 +4278,6 @@ export default function App() {
               >
                 Guide
               </button>
-              {modeSwitcher}
               {videoSrc ? (
                 <button
                   type="button"
@@ -4976,6 +4992,65 @@ export default function App() {
     );
   };
 
+  const renderStartAnalysisOverlay = () => {
+    if (!isMediaLoaded) return null;
+    const modelLoading = poseEnabled && poseStatus === 'loading';
+    const analyzing = poseEnabled && isPoseAnalyzing;
+    const showPlay = !poseEnabled || poseStatus === 'error';
+    if (!showPlay && !modelLoading && !analyzing && !poseError) return null;
+
+    const statusLabel =
+      poseStatus === 'error'
+        ? 'Retry analysis'
+        : modelLoading
+          ? 'Loading pose model…'
+          : analyzing
+            ? analysisProgress !== null
+              ? `Analyzing ${analysisProgress}%`
+              : 'Analyzing…'
+            : 'Analyze';
+
+    if (showPlay) {
+      return (
+        <div className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/35">
+          <button
+            type="button"
+            onClick={startAnalysis}
+            className="pointer-events-auto flex flex-col items-center gap-2 text-white transition hover:scale-[1.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]"
+            title={statusLabel}
+            aria-label={statusLabel}
+          >
+            <span className="flex h-24 w-24 items-center justify-center rounded-full border-4 border-white/85 bg-[var(--color-accent)] shadow-xl shadow-black/40">
+              <Play className="h-12 w-12 translate-x-0.5 fill-white" aria-hidden />
+            </span>
+            <span className="rounded-full bg-black/55 px-3 py-1 text-sm font-semibold uppercase tracking-wide">
+              {statusLabel}
+            </span>
+          </button>
+          {poseError ? (
+            <p className="max-w-sm rounded-md bg-black/70 px-3 py-2 text-center text-xs text-red-200">
+              {poseError}
+            </p>
+          ) : null}
+        </div>
+      );
+    }
+
+    return (
+      <div className="pointer-events-none absolute left-1/2 top-3 z-30 flex -translate-x-1/2 flex-col items-center gap-2">
+        <div className="flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-white backdrop-blur-md">
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+          <span className="text-xs font-semibold uppercase tracking-wide">{statusLabel}</span>
+        </div>
+        {poseError ? (
+          <p className="max-w-sm rounded-md bg-black/70 px-3 py-2 text-center text-xs text-red-200">
+            {poseError}
+          </p>
+        ) : null}
+      </div>
+    );
+  };
+
   const renderOverlayToolbelt = () => (
     <div className="pointer-events-none absolute inset-y-0 right-0 z-20 flex items-center">
       <div className="pointer-events-auto flex max-h-full flex-col gap-1 overflow-y-auto rounded-2xl border border-[var(--color-accent)]/15 bg-black/35 p-1.5 backdrop-blur-md">
@@ -5020,23 +5095,13 @@ export default function App() {
         </button>
         <button
           type="button"
-          onClick={() => setPoseEnabled((v) => !v)}
+          onClick={() => (poseEnabled ? setPoseEnabled(false) : startAnalysis())}
           disabled={!isMediaLoaded}
           className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${!isMediaLoaded ? 'opacity-50 cursor-not-allowed' : ''} ${poseEnabled ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title={poseEnabled ? (poseEngineLabel || 'Toggle pose overlay') : 'Toggle pose overlay (RTMPose)'}
-          aria-label="Toggle pose overlay"
+          title={poseEnabled ? (poseEngineLabel || 'Stop pose overlay') : 'Start analysis (RTMPose overlay)'}
+          aria-label={poseEnabled ? 'Stop pose overlay' : 'Start analysis'}
         >
           <Activity className="w-5 h-5" />
-        </button>
-        <button
-          type="button"
-          onClick={() => handleAnalysisModeSwitch(analysisMode === 'golf' ? 'stride' : 'golf')}
-          className={`shrink-0 p-1.5 rounded-lg hover:bg-[var(--color-panel-hover)] ${analysisMode === 'golf' ? 'text-[var(--color-accent)] bg-[var(--color-panel-hover)]' : 'text-fg'}`}
-          title={analysisMode === 'golf' ? 'Golf analysis on — click for Stride' : 'Golf analysis'}
-          aria-label={analysisMode === 'golf' ? 'Switch from Golf to Stride' : 'Switch to Golf analysis'}
-          aria-pressed={analysisMode === 'golf'}
-        >
-          <Flag className="w-5 h-5" />
         </button>
         <button
           type="button"
@@ -5084,10 +5149,13 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[var(--color-bg-dark)] text-fg font-sans blueprint-bg">
-      <header className="mb-5 flex items-center justify-between gap-4 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
+      <header className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-[var(--color-accent)]/20 bg-[var(--color-chrome-bar)] px-4 py-4 shadow-md md:px-8">
         <h1 className="min-w-0 text-2xl font-semibold leading-tight tracking-tight text-[var(--color-accent)] brand-font">
           Form Analyzer
         </h1>
+        <div className="order-last flex w-full justify-center sm:order-none sm:w-auto sm:flex-1">
+          {renderAnalysisModeSwitcher()}
+        </div>
         <SettingsMenu
           rtmposeVariant={rtmposeVariant}
           onRtmposeVariantChange={setRtmposeVariant}
@@ -5099,7 +5167,6 @@ export default function App() {
           <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex min-w-0 flex-wrap items-center gap-3">
               <h2 className="text-xl font-semibold text-fg brand-font">Media Analysis</h2>
-              {renderAnalysisModeSwitcher()}
             </div>
             <div className="flex flex-wrap gap-2">
               <button
@@ -5203,6 +5270,7 @@ export default function App() {
                 className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'h-full w-full rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
                 {renderOverlayToolbelt()}
+                {renderStartAnalysisOverlay()}
                 {renderMeasurementOverlay()}
                 <div
                   className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'grid-cols-2 gap-0' : 'grid-cols-1 gap-0'}`}
@@ -5403,6 +5471,7 @@ export default function App() {
                 className={`relative flex w-full min-w-0 items-center justify-center overflow-hidden ${isFullscreen ? 'h-full w-full rounded-none border-0 p-0' : 'min-h-[min(60dvh,640px)] rounded-xl border border-[var(--color-accent)]/10 bg-[var(--color-bg-dark)] p-0'}`}
               >
                 {renderOverlayToolbelt()}
+                {renderStartAnalysisOverlay()}
                 {renderMeasurementOverlay()}
                 <div
                   className={`grid w-full min-w-0 items-stretch justify-items-stretch ${hasCompareMedia ? 'grid-cols-2 gap-0' : 'grid-cols-1 gap-0'}`}
@@ -5522,9 +5591,7 @@ export default function App() {
                 <Video className="h-10 w-10" />
               </div>
               <p className="text-[var(--color-text-light)] max-w-sm">
-                {analysisMode === 'golf'
-                  ? 'Golf mode is on. Add a swing video or photo, then play or scrub to sample pose and club.'
-                  : 'Add media with the buttons above: gallery (images or videos), take a photo, or record video. Use Stride, Squat, or Golf above to pick an analysis mode.'}
+                Add media with the buttons above, pick Stride, Squat, or Golf in the header, then press the big play button to run analysis and show pose lines.
               </p>
             </div>
             {showAnalysis ? renderKneeAnglePanel() : null}
@@ -5643,7 +5710,8 @@ export default function App() {
           preload="auto"
           playsInline
           muted
-          style={{ position: 'fixed', top: -9999, left: -9999, width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+          className="pointer-events-none fixed z-[-1] h-40 w-64 opacity-0"
+          aria-hidden
         />
       )}
       {compareVideoSrc && (
@@ -5653,7 +5721,8 @@ export default function App() {
           preload="auto"
           playsInline
           muted
-          style={{ position: 'fixed', top: -9999, left: -9999, width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+          className="pointer-events-none fixed z-[-1] h-40 w-64 opacity-0"
+          aria-hidden
         />
       )}
     </div>

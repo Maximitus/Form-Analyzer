@@ -30,6 +30,9 @@ for (const name of wanted) {
       throw new Error(`HTTP ${response.status}`);
     }
     const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length < 1_000_000 || buffer[0] === 0x3c || buffer[0] === 0x7b) {
+      throw new Error(`unexpected payload (${buffer.length} bytes)`);
+    }
     fs.writeFileSync(dest, buffer);
     console.log(`[download-models] wrote ${name} (${buffer.length} bytes)`);
   } catch (error) {
